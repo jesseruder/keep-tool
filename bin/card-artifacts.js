@@ -127,7 +127,7 @@ function dispositionOf(name, inline) {
 
 // Streams the artifact the request names from its checked descriptor, or answers
 // its refusal as JSON. The headers are the descriptor's size and the name's type.
-async function serveArtifact(res, root, card, name, { json, fsp = fs.promises } = {}) {
+async function serveArtifact(res, root, card, name, { json, fsp = fs.promises, attachment = false } = {}) {
   let found;
   try { found = await resolveArtifact(root, card, name, { fsp }); }
   catch (error) {
@@ -137,7 +137,7 @@ async function serveArtifact(res, root, card, name, { json, fsp = fs.promises } 
   res.writeHead(200, {
     'content-type': found.contentType,
     'content-length': found.size,
-    'content-disposition': dispositionOf(found.name, found.image),
+    'content-disposition': dispositionOf(found.name, found.image && !attachment),
     'content-security-policy': ARTIFACT_CSP,
     'x-content-type-options': 'nosniff',
     'cross-origin-resource-policy': 'same-origin',
@@ -151,6 +151,45 @@ async function serveArtifact(res, root, card, name, { json, fsp = fs.promises } 
   return undefined;
 }
 
+// One-time download links, for a shell that cannot save a file the console hands it
+// (the phone's WebView drops a blob download). The console asks for a link with its
+// usual header; the link is then fetched as a plain navigation that carries only the
+// session cookie, which the phone's WebView passes on to Android's DownloadManager,
+// and the grant is the proof the header otherwise gives that the console asked for
+// it. So a grant does not stand in for auth: the request still needs a session.
+// It names one card's one file, is 32 random bytes, and lasts a minute. It may be
+// used more than once in that minute, because the WebView's navigation and the
+// DownloadManager's own request each fetch it. Held in memory: a restart drops them.
+const DOWNLOAD_GRANT_TTL_MS = 60e3;
+const DOWNLOAD_GRANT_MAX = 256;
+const grants = new Map();
+
+function pruneGrants(now) {
+  for (const [token, grant] of grants) if (grant.expires <= now) grants.delete(token);
+}
+
+// { token } for card/name once the file is there to serve; throws ArtifactError.
+async function createDownloadGrant(root, card, name, { fsp = fs.promises, now = Date.now } = {}) {
+  const found = await resolveArtifact(root, card, name, { fsp });
+  await found.handle.close().catch(() => {});
+  const at = now();
+  pruneGrants(at);
+  if (grants.size >= DOWNLOAD_GRANT_MAX) throw new ArtifactError(429, 'too many download links outstanding; try again in a minute');
+  const token = require('node:crypto').randomBytes(32).toString('base64url');
+  grants.set(token, { card, name, expires: at + DOWNLOAD_GRANT_TTL_MS });
+  return { token };
+}
+
+// The grant a token names while it lasts, or null.
+function downloadGrant(token, { now = Date.now } = {}) {
+  if (typeof token !== 'string' || !/^[A-Za-z0-9_-]{43}$/.test(token)) return null;
+  const grant = grants.get(token);
+  if (!grant) return null;
+  if (grant.expires <= now()) { grants.delete(token); return null; }
+  return grant;
+}
+
 module.exports = {
+  createDownloadGrant, downloadGrant, DOWNLOAD_GRANT_TTL_MS,
   listArtifacts, resolveArtifact, serveArtifact, kindOf, ArtifactError, IMAGE_TYPES, FILE_TYPES, ARTIFACT_CSP, LIST_MAX, CARD_RE,
 };

@@ -385,6 +385,16 @@ test('the shell trades its token for a cookie once, and the cookie carries the w
   assert.equal((await request(f.port, '/api/action', { method: 'POST', headers: cookie, body: '{}' })).status, 403,
     'a same-site page cannot add x-keep without a preflight nothing here answers');
   assert.equal(f.seen.length, 0, 'none of that reached the daemon');
+  // A one-time download link is fetched as a plain navigation: the session alone
+  // reaches the daemon, which serves it only for a grant (bin/card-artifacts.js).
+  assert.equal((await request(f.port, '/api/card-artifact-download?t=x', { headers: lan })).status, 403,
+    'never without a session');
+  await request(f.port, '/api/card-artifact-download?t=x', { headers: cookie });
+  assert.equal(f.seen.length, 1, 'with a session it reaches the daemon');
+  assert.equal(f.seen[0].headers.cookie, undefined);
+  assert.equal((await request(f.port, '/api/card-artifact?card=c&name=n', { headers: cookie })).status, 403,
+    'the ordinary artifact route still needs the header');
+  f.seen.length = 0;
   assert.equal((await request(f.port, '/api/state')).status, 503,
     'loopback and header clients never meet the x-keep rule');
 

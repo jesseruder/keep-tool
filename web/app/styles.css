@@ -249,6 +249,9 @@ html.mobile .stage-artifacts .artifact-body { position: static; max-height: 30dv
 .artifact-link { color: var(--accent, var(--text)); text-decoration: underline; text-align: left; font-size: 12px; padding: 0; overflow-wrap: anywhere; }
 .artifact figcaption { display: flex; flex-direction: column; color: var(--faint); font-size: 11px; min-width: 0; }
 .artifact-name { color: var(--muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.artifact-save { color: var(--accent, var(--text)); text-decoration: underline; font-size: inherit; padding: 0; }
+.artifact-viewer .artifact-save { color: #fff; cursor: pointer; margin-left: 6px; }
+html.mobile .artifact-save { padding: 4px 0; }
 .qinbox-detail pre { max-height: 240px; overflow: auto; margin: 6px 0 10px; padding: 10px; white-space: pre-wrap; overflow-wrap: anywhere; background: var(--panel); border: 1px solid var(--line); border-radius: 5px; font: 11.5px/1.5 var(--mono); }
 .qinbox-acts { display: flex; flex-wrap: wrap; gap: 6px; }
 .qempty { padding: 40px 20px; color: var(--muted); text-align: center; } .qempty b { display: block; color: var(--text); font-size: 15px; margin-bottom: 6px; }

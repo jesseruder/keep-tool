@@ -166,3 +166,53 @@ test('a link planted in the artifacts directory is not listed', async (t) => {
   assert.equal(artifacts.some((entry) => entry.name === 'planted.png'), false);
   assert.equal(artifacts.length, 5);
 });
+
+async function post(list, pathname, body, headers = { 'x-keep': '1' }) {
+  const url = new URL(`http://x${pathname}`);
+  const req = { method: 'POST', headers };
+  const route = matchRoute(list, { req, url, body });
+  assert.ok(route, `POST ${url.pathname} matched no route`);
+  const answer = await route.handle({ req, res: response(), url, body });
+  return { route, status: answer.status, value: answer.value };
+}
+
+test('a one-time download link serves one artifact as an attachment for a minute, without the header', async (t) => {
+  const { root } = registry(t);
+  const list = ladder(root);
+  const { createDownloadGrant, downloadGrant, DOWNLOAD_GRANT_TTL_MS } = require('./card-artifacts.js');
+
+  // Asked for like every other artifact route: the console's callers, with the header.
+  const refused = await post(list, '/api/card-artifact-link', { card: 'some-card', name: 'shot.png' }, {});
+  assert.equal(refused.status, 403);
+  const link = await post(list, '/api/card-artifact-link', { card: 'some-card', name: 'shot.png' });
+  assert.equal(link.status, 200);
+  assert.deepEqual(routeDenial(link.route, { class: 'node', node: 'aws1' }), { status: 403, error: 'forbidden for node' });
+  assert.match(link.value.url, /^\/api\/card-artifact-download\?t=[A-Za-z0-9_-]{43}$/);
+  assert.equal(link.value.ttlMs, DOWNLOAD_GRANT_TTL_MS);
+  const missing = await post(list, '/api/card-artifact-link', { card: 'some-card', name: 'gone.png' });
+  assert.equal(missing.status, 404);
+  const traversal = await post(list, '/api/card-artifact-link', { card: 'some-card', name: '../x' });
+  assert.equal(traversal.status, 400);
+
+  // Fetched with no header, twice (the WebView's navigation, then the download
+  // manager's own request), and an image comes down as an attachment.
+  for (let i = 0; i < 2; i += 1) {
+    const served = await get(list, link.value.url, {});
+    assert.equal(served.status, 200);
+    assert.match(served.headers['content-disposition'], /^attachment; filename="shot\.png"/);
+    assert.equal(served.headers['content-security-policy'], ARTIFACT_CSP);
+    assert.deepEqual([...served.body], [0x89, 0x50, 0x4e, 0x47]);
+    assert.deepEqual(routeDenial(served.route, null), { status: 403, error: 'forbidden for unauthorized' }, 'still a session route');
+  }
+  const unknown = await get(list, `/api/card-artifact-download?t=${'A'.repeat(43)}`, {});
+  assert.equal(unknown.status, 404);
+  const malformed = await get(list, '/api/card-artifact-download?t=../../x', {});
+  assert.equal(malformed.status, 404);
+
+  // A grant lasts a minute.
+  let clock = 1_000_000;
+  const { token } = await createDownloadGrant(root, 'some-card', 'notes.txt', { now: () => clock });
+  assert.deepEqual(downloadGrant(token, { now: () => clock + DOWNLOAD_GRANT_TTL_MS - 1 }), { card: 'some-card', name: 'notes.txt', expires: clock + DOWNLOAD_GRANT_TTL_MS });
+  clock += DOWNLOAD_GRANT_TTL_MS;
+  assert.equal(downloadGrant(token, { now: () => clock }), null);
+});

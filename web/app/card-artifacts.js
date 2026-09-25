@@ -1,7 +1,9 @@
 // A card's artifacts in the console: the files `keep artifact` stored under
 // .keep/artifacts/<card>/, from this machine or from a node (bin/artifact-route.js).
-// Images show as thumbnails that open full size in an overlay on the console; any
-// other file is a link that downloads it.
+// Images show as thumbnails that open full size in an overlay on the console, each
+// with a Download button; any other file is a link that downloads it. On the phone a
+// download goes through a one-time link (downloadArtifact), since its WebView cannot
+// save a blob.
 //
 // The bytes are fetched with the x-keep header (api.fetchCardArtifact) and shown
 // from blob URLs, never by pointing an <img> or a link at the daemon route: a
@@ -14,7 +16,10 @@
 // The listing is fetched once per card version (the card's _detailVersion changes
 // when `keep artifact` logs to it), and an older daemon without the route leaves the
 // section out rather than showing an error.
-import { fetchCardArtifact, getCardArtifacts } from './api.js';
+import { fetchCardArtifact, getCardArtifactLink, getCardArtifacts } from './api.js';
+
+// shell.js isMobileShell, without importing a module that touches the page on load.
+const isMobileShell = () => Boolean(globalThis.window?.keepShell);
 
 // Thumbnails fetched per card; the rest are listed by name.
 export const THUMB_LIMIT = 24;
@@ -54,8 +59,9 @@ export function artifactsSectionHTML({ card, list, blobOf = () => null, esc = de
     : `<h4 class="artifacts-heading">Artifacts · ${esc(count)}</h4>`;
   if (!expanded) return `<section class="card-artifacts collapsed">${heading}</section>`;
   const attrs = (item) => `data-card="${esc(card)}" data-name="${esc(item.name)}"`;
+  const save = (item) => `<button type="button" class="artifact-save" data-artifact-download ${attrs(item)} title="Download ${esc(item.name)}" aria-label="Download ${esc(item.name)}">Download</button>`;
   const caption = (item, named = true) => `<figcaption>${named ? `<span class="artifact-name">${esc(item.name)}</span>` : ''}`
-    + `<span class="artifact-meta">${esc(humanSize(item.size))} · <time datetime="${esc(item.mtime)}">${esc(rel(item.mtime))}</time></span></figcaption>`;
+    + `<span class="artifact-meta">${esc(humanSize(item.size))} · <time datetime="${esc(item.mtime)}">${esc(rel(item.mtime))}</time>${named ? ` · ${save(item)}` : ''}</span></figcaption>`;
   const rows = artifacts.map((item, index) => {
     if (item.image && index < THUMB_LIMIT) {
       const url = blobOf(item);
@@ -154,7 +160,7 @@ function stepViewer(delta) {
   if (next && next.item.name !== viewer.name) showInViewer(next.item, next.url);
 }
 
-function openViewer(card, item, url) {
+function openViewer(ctx, card, item, url) {
   closeViewer();
   const overlay = document.createElement('div');
   overlay.className = 'artifact-viewer';
@@ -164,8 +170,20 @@ function openViewer(card, item, url) {
   const image = document.createElement('img');
   const caption = document.createElement('p');
   caption.className = 'artifact-viewer-caption';
+  const label = document.createElement('span');
+  const save = document.createElement('button');
+  save.type = 'button';
+  save.className = 'artifact-save';
+  save.textContent = 'Download';
+  // A click anywhere else closes the view; this one saves the image shown.
+  save.addEventListener('click', (event) => {
+    event.stopPropagation();
+    const shown = lists.get(viewer?.card)?.value?.artifacts?.find((entry) => entry.name === viewer?.name);
+    if (shown) downloadArtifact(viewer.ctx, viewer.card, shown);
+  });
+  caption.append(label, ' ', save);
   overlay.append(image, caption);
-  viewer = { card, name: item.name, overlay, image, caption, returnFocus: document.activeElement };
+  viewer = { ctx, card, name: item.name, overlay, image, caption: label, returnFocus: document.activeElement };
   showInViewer(item, url);
   overlay.addEventListener('click', closeViewer);
   window.addEventListener('keydown', viewerKey, true);
@@ -215,23 +233,37 @@ function install(ctx) {
     if (!item) return;
     if (target.hasAttribute('data-artifact-open')) {
       const url = blobs.get(blobKey(card, item))?.url;
-      if (url) openViewer(card, item, url);
+      if (url) openViewer(ctx, card, item, url);
       return;
     }
-    try {
-      const blob = await fetchCardArtifact(card, name);
-      const url = URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = url;
-      link.download = name;
-      document.body.append(link);
-      link.click();
-      link.remove();
-      setTimeout(() => URL.revokeObjectURL(url), 60e3);
-    } catch (error) {
-      ctx.toast?.(`Could not download ${name}: ${error.message}`);
-    }
+    downloadArtifact(ctx, card, item);
   });
+}
+
+// Saves one artifact. A browser or the desktop shell gets the bytes as a blob and
+// saves that. The phone's WebView cannot save a blob, so it is given a one-time link
+// instead (bin/card-artifacts.js createDownloadGrant): the WebView hands that
+// navigation to Android's download manager with the session cookie.
+async function downloadArtifact(ctx, card, item) {
+  const name = item.name;
+  try {
+    const link = document.createElement('a');
+    let revoke = null;
+    if (isMobileShell()) {
+      link.href = (await getCardArtifactLink(card, name)).url;
+    } else {
+      const blob = await fetchCardArtifact(card, name);
+      link.href = URL.createObjectURL(blob);
+      revoke = link.href;
+    }
+    link.download = name;
+    document.body.append(link);
+    link.click();
+    link.remove();
+    if (revoke) setTimeout(() => URL.revokeObjectURL(revoke), 60e3);
+  } catch (error) {
+    ctx.toast?.(`Could not download ${name}: ${error.message}`);
+  }
 }
 
 // The section for `task`, fetching what it needs. `collapsible` is the stage's form:

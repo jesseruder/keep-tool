@@ -20,6 +20,8 @@ test('images render as thumbnails from their blob URLs, other files as download 
   assert.match(html, /<h4 class="artifacts-heading">Artifacts · 2<\/h4>/);
   assert.match(html, /<button type="button" class="artifact-thumb" data-artifact-open data-card="some-card" data-name="shot\.png" title="Open shot\.png full size"><img src="blob:http:\/\/localhost:7777\/1234" alt="shot\.png"><\/button>/);
   assert.match(html, /2\.0 KB · <time datetime="2026-09-20T10:00:00.000Z">2h ago<\/time>/);
+  // An image has its own Download button next to its thumbnail.
+  assert.match(html, /<button type="button" class="artifact-save" data-artifact-download data-card="some-card" data-name="shot\.png" title="Download shot\.png" aria-label="Download shot\.png">Download<\/button>/);
   assert.match(html, /<button type="button" class="artifact-link" data-artifact-download data-card="some-card" data-name="run\.log" title="Download run\.log">run\.log<\/button>/);
   assert.match(html, /3\.0 MB/);
   // Never a link to the daemon route itself: the bytes come only through fetch.

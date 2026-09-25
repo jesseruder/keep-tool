@@ -35,8 +35,11 @@ const MAX_SESSIONS = 32;
 // this tree). That header is the only cross-site barrier there is: the body
 // readers parse JSON whatever the content type says, and a same-host page on
 // another port is same-site, so SameSite=Strict does not stop it.
+// /api/card-artifact-download is a navigation the phone's WebView and its download
+// manager make with the cookie alone; the daemon serves it only for a one-time grant
+// the console asked for with the header (bin/card-artifacts.js createDownloadGrant).
 const COOKIE_OPEN_PATHS = (pathname) => pathname === '/app' || pathname.startsWith('/app/')
-  || pathname.startsWith('/vendor/') || pathname === '/api/events';
+  || pathname.startsWith('/vendor/') || pathname === '/api/events' || pathname === '/api/card-artifact-download';
 
 function json(res, status, value, headers = {}) {
   const body = JSON.stringify(value);

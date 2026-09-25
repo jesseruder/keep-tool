@@ -244,6 +244,11 @@ export const resolvePortableTransfer = (transferId, destinationSessionId) => wri
 export const abandonAccountHandoff = (sessionId, pane, transactionId) => write('/api/abandon-account-handoff', { sessionId, pane, transactionId }, 'POST', { label: 'Abandoning handoff' });
 export const getAgentEvents = (name, limit = 20) => request(`/api/agents/${encodeURIComponent(name)}/events?limit=${encodeURIComponent(limit)}`);
 export const getCardArtifacts = (card) => request(`/api/card-artifacts?card=${encodeURIComponent(card)}`);
+// A one-time link that downloads one artifact with the session cookie alone, for the
+// phone's WebView, which cannot save a blob: { url, ttlMs }.
+export const getCardArtifactLink = (card, name) => request('/api/card-artifact-link', {
+  method: 'POST', headers: WRITE_HEADERS, body: JSON.stringify({ card, name }),
+});
 // One artifact's bytes, as a Blob. Fetched with the x-keep header like every other
 // request rather than put in an <img src>: a browser session's cookie alone reaches
 // only the console's own files (ui-request-server COOKIE_OPEN_PATHS), and the header

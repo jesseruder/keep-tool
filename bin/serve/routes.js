@@ -260,6 +260,31 @@ function routes(ctx) {
       },
     },
     {
+      // A one-time link to one artifact, for a shell that cannot save a blob (the
+      // phone's WebView). The GET below is the only artifact route that takes no
+      // x-keep: the grant is that proof, and the session is still required.
+      method: 'POST',
+      path: '/api/card-artifact-link',
+      handle: async ({ req, res, body }) => {
+        if (req.headers['x-keep'] !== '1') return json(res, 403, { error: 'missing x-keep header' });
+        const artifacts = require('../card-artifacts.js');
+        try {
+          const { token } = await artifacts.createDownloadGrant(keep.ROOT, body?.card, body?.name);
+          return json(res, 200, { url: `/api/card-artifact-download?t=${token}`, ttlMs: artifacts.DOWNLOAD_GRANT_TTL_MS });
+        } catch (error) { return json(res, error instanceof artifacts.ArtifactError ? error.status : 500, { error: error.message }); }
+      },
+    },
+    {
+      method: 'GET',
+      path: '/api/card-artifact-download',
+      handle: async ({ res, url }) => {
+        const artifacts = require('../card-artifacts.js');
+        const grant = artifacts.downloadGrant(url.searchParams.get('t'));
+        if (!grant) return json(res, 404, { error: 'this download link has expired' });
+        return artifacts.serveArtifact(res, keep.ROOT, grant.card, grant.name, { json, attachment: true });
+      },
+    },
+    {
       method: 'GET',
       path: '/api/portable-transfer-draft',
       handle: async ({ req, res, url }) => {
