@@ -192,6 +192,9 @@ export function mountTerminal(container, pane, options = {}) {
   // by its bare id, and `@` is outside the host's pane-id alphabet.
   const predictor = createTypingPredictor({
     terminal,
+    // The host records which agent a pane runs in its meta; a shell pane, or one
+    // with no agent on record, is never predicted or measured.
+    agent: () => paneState?.meta?.agent,
     remote: () => pane.includes('@'),
     now: () => performance.now(),
   });

@@ -8,6 +8,8 @@ import {
 } from './predict-typing.js';
 
 const { Terminal } = headless;
+// The agent is Claude unless a test says otherwise.
+const predict = (terminal, data, options = {}) => predictKeystroke(terminal, data, { agent: 'claude', ...options });
 
 function terminalWith(screen, { cols = 40, rows = 6 } = {}) {
   const terminal = new Terminal({ cols, rows, allowProposedApi: true });
@@ -32,32 +34,37 @@ test('only single printable characters and backspace are predictable keys', () =
   assert.equal(predictableKey('é'), 'char');
   assert.equal(predictableKey('\x7f'), 'backspace');
   assert.equal(predictableKey('\b'), 'backspace');
-  for (const key of ['\r', '\n', '\t', '\x1b', '\x03', '\x1b[A', '\x1bOA', 'ab', '', '\x9b', '\u0301', '中', '😀']) {
+  assert.equal(predictableKey('ß'), 'char');
+  assert.equal(predictableKey('ł'), 'char');
+  for (const key of ['\r', '\n', '\t', '\x1b', '\x03', '\x1b[A', '\x1bOA', 'ab', '', '\x9b', '\u00ad', '\u0301',
+    '\u05b0', '\u064e', '\u0710', 'Ω', '中', '😀']) {
     assert.equal(predictableKey(key), null, JSON.stringify(key));
   }
 });
 
 test('a character on the Claude and Codex prompt lines is predicted with the exact bytes', async () => {
   const claude = await terminalWith('\x1b[2;1H❯ hi');
-  assert.deepEqual(predictKeystroke(claude, 'x'), { kind: 'char', inputStart: 2, bytes: '\x1b7\x1b[2;4mx\x1b8\x1b[1C' });
+  assert.deepEqual(predict(claude, 'x'), { kind: 'char', inputStart: 2, bytes: '\x1b7\x1b[2;4mx\x1b8\x1b[1C' });
   const codex = await terminalWith('› hi');
-  assert.equal(predictKeystroke(codex, 'x').bytes, PREDICT_CHAR('x'));
+  assert.equal(predict(codex, 'x', { agent: 'codex' }).bytes, PREDICT_CHAR('x'));
+  assert.equal(predict(codex, 'x'), null, 'Claude is matched only by its own marker');
+  assert.equal(predict(claude, 'x', { agent: 'codex' }), null, 'Codex is matched only by its own marker');
   const padded = await terminalWith('❯\u00a0');
-  assert.equal(predictKeystroke(padded, 'x').bytes, PREDICT_CHAR('x'));
+  assert.equal(predict(padded, 'x').bytes, PREDICT_CHAR('x'));
 });
 
 test('backspace is predicted only past the first input column', async () => {
   const typed = await terminalWith('❯ hi');
-  assert.deepEqual(predictKeystroke(typed, '\x7f'), { kind: 'backspace', inputStart: 2, bytes: '\x1b7\x1b[1D \x1b8\x1b[1D' });
+  assert.deepEqual(predict(typed, '\x7f'), { kind: 'backspace', inputStart: 2, bytes: '\x1b7\x1b[1D \x1b8\x1b[1D' });
   assert.equal(PREDICT_BACKSPACE, '\x1b7\x1b[1D \x1b8\x1b[1D');
   const empty = await terminalWith('❯ ');
-  assert.equal(predictKeystroke(empty, '\x7f'), null);
-  assert.equal(predictKeystroke(empty, 'a').kind, 'char');
+  assert.equal(predict(empty, '\x7f'), null);
+  assert.equal(predict(empty, 'a').kind, 'char');
 });
 
 test('a dim placeholder after the cursor is cleared before the first predicted character', async () => {
   const terminal = await terminalWith('❯ \x1b[7mT\x1b[0m\x1b[2mry "fix the tests"\x1b[0m\x1b[1;3H');
-  const decision = predictKeystroke(terminal, 'f');
+  const decision = predict(terminal, 'f');
   assert.equal(decision.bytes, '\x1b7\x1b[K\x1b[2;4mf\x1b8\x1b[1C');
   await write(terminal, decision.bytes);
   const line = terminal.buffer.active.getLine(0).translateToString(true);
@@ -67,34 +74,34 @@ test('a dim placeholder after the cursor is cleared before the first predicted c
 
 test('nothing is predicted off the prompt, in menus, mid-line, near the margin, on the alternate screen or while composing', async () => {
   const shell = await terminalWith('$ ls');
-  assert.equal(predictKeystroke(shell, 'a'), null, 'a shell prompt has no agent marker');
+  assert.equal(predict(shell, 'a'), null, 'a shell prompt has no agent marker');
   const menu = await terminalWith('❯ 1. Yes, proceed');
-  assert.equal(predictKeystroke(menu, '2'), null, 'a highlighted menu choice is not the input line');
+  assert.equal(predict(menu, '2'), null, 'a highlighted menu choice is not the input line');
   const early = await terminalWith('❯ hi\x1b[1;2H');
-  assert.equal(predictKeystroke(early, 'a'), null, 'the cursor must be past the marker and its space');
+  assert.equal(predict(early, 'a'), null, 'the cursor must be past the marker and its space');
   const middle = await terminalWith('❯ hello\x1b[1;5H');
-  assert.equal(predictKeystroke(middle, 'a'), null, 'editing inside the text is left to the agent');
+  assert.equal(predict(middle, 'a'), null, 'editing inside the text is left to the agent');
   const margin = await terminalWith(`❯ ${'x'.repeat(35)}`, { cols: 40 });
   assert.equal(margin.buffer.active.cursorX, 37);
-  assert.equal(predictKeystroke(margin, 'a'), null, 'a prediction never wraps');
+  assert.equal(predict(margin, 'a'), null, 'a prediction never wraps');
   const room = await terminalWith(`❯ ${'x'.repeat(34)}`, { cols: 40 });
-  assert.equal(predictKeystroke(room, 'a').kind, 'char');
-  assert.equal(predictKeystroke(room, 'a', { extraColumns: 1 }), null, 'unparsed predictions count toward the margin');
+  assert.equal(predict(room, 'a').kind, 'char');
+  assert.equal(predict(room, 'a', { extraColumns: 1 }), null, 'unparsed predictions count toward the margin');
   const alternate = await terminalWith('\x1b[?1049h❯ hi');
   assert.equal(alternate.buffer.active.type, 'alternate');
-  assert.equal(predictKeystroke(alternate, 'a'), null);
+  assert.equal(predict(alternate, 'a'), null);
   const prompt = await terminalWith('❯ hi');
-  assert.equal(predictKeystroke(prompt, 'a', { composing: true }), null);
-  assert.equal(predictKeystroke(prompt, '\r'), null);
-  assert.equal(predictKeystroke(prompt, 'ab'), null, 'a paste goes through unpredicted');
+  assert.equal(predict(prompt, 'a', { composing: true }), null);
+  assert.equal(predict(prompt, '\r'), null);
+  assert.equal(predict(prompt, 'ab'), null, 'a paste goes through unpredicted');
   prompt.hasSelection = () => true;
-  assert.equal(predictKeystroke(prompt, 'a'), null, 'a selection is not disturbed');
+  assert.equal(predict(prompt, 'a'), null, 'a selection is not disturbed');
 });
 
 test('the prompt row is found below scrollback', async () => {
   const terminal = await terminalWith(`${'line\r\n'.repeat(20)}❯ hi`, { rows: 4 });
   assert.ok(terminal.buffer.active.baseY > 0);
-  assert.equal(predictKeystroke(terminal, 'a').kind, 'char');
+  assert.equal(predict(terminal, 'a').kind, 'char');
 });
 
 test('the setting defaults to auto and stores only its three values', () => {
@@ -113,7 +120,7 @@ test('on predicts everywhere, off nowhere, and auto only on a remote pane with a
   let clock = 0;
   const run = async ({ mode, remote, echo }) => {
     const terminal = await terminalWith('❯ ');
-    const predictor = createTypingPredictor({ terminal, remote: () => remote, mode: () => mode, now: () => clock });
+    const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => remote, mode: () => mode, now: () => clock });
     const drawn = [];
     for (const ch of 'abcdefgh') {
       drawn.push(predictor.keystroke(ch));
@@ -145,7 +152,7 @@ test('on predicts everywhere, off nowhere, and auto only on a remote pane with a
 test('the agent redraw replaces the prediction and leaves no dim cells', async () => {
   const terminal = await terminalWith('❯ ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'on', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
   assert.equal(predictor.keystroke('x'), true);
   await write(terminal, '');
   assert.deepEqual(dimCells(terminal), [2], 'the guess is dim until the echo lands');
@@ -163,7 +170,7 @@ test('the agent redraw replaces the prediction and leaves no dim cells', async (
 test('output elsewhere on the screen does not count as the echo', async () => {
   const terminal = await terminalWith('status\r\n❯ ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'auto', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'auto', now: () => clock });
   predictor.keystroke('x');
   await write(terminal, '');
   clock = 30;
@@ -189,7 +196,7 @@ function lineState(terminal) {
 test('a whole-line redraw for an earlier keystroke keeps the later guesses on screen', async () => {
   const terminal = await terminalWith('❯ ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'on', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
   predictor.keystroke('a');
   clock = 60;
   predictor.keystroke('b');
@@ -213,7 +220,7 @@ test('a whole-line redraw for an earlier keystroke keeps the later guesses on sc
 test('an agent that redraws only changed cells confirms each guess without a redraw', async () => {
   const terminal = await terminalWith('› ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'on', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'codex', remote: () => true, mode: () => 'on', now: () => clock });
   predictor.keystroke('a');
   predictor.keystroke('b');
   await write(terminal, '');
@@ -237,7 +244,7 @@ test('an agent that redraws only changed cells confirms each guess without a red
 test('one render that answers several keystrokes confirms them all', async () => {
   const terminal = await terminalWith('❯ ');
   let clock = 0;
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'auto', now: () => clock });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'auto', now: () => clock });
   for (const ch of 'abc') predictor.keystroke(ch);
   clock = 120;
   await write(terminal, '\r❯ abc\x1b[K');
@@ -249,7 +256,7 @@ test('one render that answers several keystrokes confirms them all', async () =>
 
 test('a render that is not an echo ends the chain without drawing anything', async () => {
   const terminal = await terminalWith('❯ ');
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'on', now: () => 0 });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0 });
   predictor.keystroke('/');
   predictor.keystroke('m');
   await write(terminal, '');
@@ -262,7 +269,7 @@ test('a render that is not an echo ends the chain without drawing anything', asy
 
 test('a split render is not read until its last chunk has parsed', async () => {
   const terminal = await terminalWith('❯ ');
-  const predictor = createTypingPredictor({ terminal, remote: () => true, mode: () => 'on', now: () => 0 });
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => 0 });
   predictor.keystroke('a');
   await write(terminal, '');
   await write(terminal, '\r\x1b[K');
@@ -271,4 +278,49 @@ test('a split render is not read until its last chunk has parsed', async () => {
   await write(terminal, '❯ a');
   predictor.outputParsed(true);
   assert.equal(predictor.pending, 0);
+});
+
+test('a shell pane, or a pane with no agent on record, is never predicted or measured', async () => {
+  for (const agent of ['shell', undefined, 'pi', '__proto__']) {
+    const terminal = await terminalWith('❯ ');
+    assert.equal(predictKeystroke(terminal, 'a', { agent }), null, String(agent));
+    let clock = 0;
+    const predictor = createTypingPredictor({ terminal, agent: () => agent, remote: () => true, mode: () => 'on', now: () => clock });
+    for (const ch of 'abcd') {
+      assert.equal(predictor.keystroke(ch), false);
+      assert.equal(predictor.pending, 0, 'nothing is recorded to measure');
+      await write(terminal, ch);
+      clock += 150;
+      predictor.outputParsed();
+    }
+    assert.equal(predictor.echoMs(), null);
+    assert.equal(terminal.buffer.active.getLine(0).translateToString(true), '❯ abcd', 'the shell echo is never doubled');
+  }
+});
+
+test('a burst that repeats a state is acknowledged in order and a deleted character never returns', async () => {
+  const terminal = await terminalWith('❯ ');
+  let clock = 0;
+  const predictor = createTypingPredictor({ terminal, agent: () => 'claude', remote: () => true, mode: () => 'on', now: () => clock });
+  for (const key of ['a', 'b', '\x7f']) predictor.keystroke(key);
+  await write(terminal, '');
+  // The Backspace guess blanks the b cell with a space.
+  assert.deepEqual(lineState(terminal), { text: '❯ a ', cursor: 3, marks: [2] });
+  const redraw = async (text) => {
+    clock += 50;
+    await write(terminal, `\r❯ ${text}\x1b[K`);
+    predictor.outputParsed();
+    await write(terminal, '');
+  };
+  await redraw('a');
+  assert.equal(predictor.pending, 2, 'only the first keystroke is acknowledged');
+  assert.deepEqual(lineState(terminal), { text: '❯ a', cursor: 3, marks: [] }, 'b is not drawn again');
+  await redraw('ab');
+  assert.equal(predictor.pending, 1);
+  await redraw('a');
+  assert.equal(predictor.pending, 0);
+  assert.deepEqual(lineState(terminal), { text: '❯ a', cursor: 3, marks: [] }, 'the deleted b stays deleted');
+  predictor.keystroke('c');
+  await write(terminal, '');
+  assert.deepEqual(lineState(terminal), { text: '❯ ac', cursor: 4, marks: [3] });
 });

@@ -772,7 +772,7 @@ test('observer fitting converges with rounded cell heights and grows only after 
 const hostOutput = (f, text) => f.socket.onmessage({ data: new TextEncoder().encode(text).buffer });
 
 test('a typed character is drawn as a prediction before it is sent, and the bytes sent are unchanged', async () => {
-  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]) });
+  const f = fixture({ storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'claude' } } });
   try {
     f.message({ t: 'replay-end' });
     await f.drain();
@@ -798,7 +798,7 @@ test('a typed character is drawn as a prediction before it is sent, and the byte
 });
 
 test('the default setting predicts nothing on a pane of the daemon node', async () => {
-  const f = fixture();
+  const f = fixture({ pane: { meta: { agent: 'claude' } } });
   try {
     f.message({ t: 'replay-end' });
     await f.drain();
@@ -812,7 +812,7 @@ test('the default setting predicts nothing on a pane of the daemon node', async 
 });
 
 test('auto starts predicting on a pane of another node once its echo is measured slow', async () => {
-  const f = fixture({ paneId: 'pane@remote' });
+  const f = fixture({ paneId: 'pane@remote', pane: { meta: { agent: 'claude' } } });
   try {
     f.message({ t: 'replay-end' });
     await f.drain();
@@ -837,5 +837,20 @@ test('auto starts predicting on a pane of another node once its echo is measured
     assert.deepEqual(drawn, [false, false, false, true], 'three slow echoes, then the fourth key is predicted');
     assert.deepEqual(f.socket.sent.filter(data => typeof data !== 'string').map(data => new TextDecoder().decode(data)),
       ['a', 'b', 'c', 'd'], 'every keystroke reached the pane unchanged');
+  } finally { f.mounted.dispose(); }
+});
+
+test('a shell pane on another node is not predicted even when prediction is on', async () => {
+  const f = fixture({ paneId: 'pane@remote', storage: new Map([['keep.console.predictTyping', 'on']]), pane: { meta: { agent: 'shell' } } });
+  try {
+    f.message({ t: 'replay-end' });
+    await f.drain();
+    hostOutput(f, '\x1b[2J\x1b[H❯ ');
+    await f.drain();
+    f.terminal.keyHandler({ type: 'keydown', key: 'a' });
+    f.terminal.input('a', true);
+    hostOutput(f, 'a');
+    await f.drain();
+    assert.equal(f.terminal.buffer.active.getLine(0).translateToString(true), '❯ a', 'the shell echo is the only copy');
   } finally { f.mounted.dispose(); }
 });

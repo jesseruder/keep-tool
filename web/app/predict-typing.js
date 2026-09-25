@@ -23,11 +23,15 @@ const MIN_SAMPLES = 3;
 const STALE_KEYSTROKE_MS = 5000;
 
 // Claude Code's input line starts with `❯`, Codex's with `›`, each followed by a
-// space (Claude pads the empty box with U+00A0).
-const PROMPT_LINE = /^(\s*)[❯›][ \u00a0]/;
-// A highlighted choice in either agent's selection menu also starts with the
-// marker (`❯ 1. Yes`). Typing there picks an option rather than editing text.
-const MENU_CHOICE = /^\s*[❯›][ \u00a0]+\d+\.\s/;
+// space (Claude pads the empty box with U+00A0). Each agent is matched only by its
+// own marker: a shell prompt can use either glyph, and a shell echoes at the
+// cursor a prediction has already advanced, which would double the character.
+const PROMPTS = {
+  claude: { line: /^(\s*)❯[ \u00a0]/, menu: /^\s*❯[ \u00a0]+\d+\.\s/ },
+  codex: { line: /^(\s*)›[ \u00a0]/, menu: /^\s*›[ \u00a0]+\d+\.\s/ },
+};
+// A highlighted choice in the agent's selection menu also starts with the marker
+// (`❯ 1. Yes`). Typing there picks an option rather than editing text.
 
 export const PREDICT_CHAR = (ch, clearPlaceholder = false) =>
   // DECSC keeps the agent's own SGR state and cursor; the dim underline marks the
@@ -53,17 +57,20 @@ export function setPredictTypingPreference(mode, storage) {
 
 // 'char' for one printable, single-cell character; 'backspace' for DEL or BS; null
 // for everything else, including control keys, escape sequences and pastes of more
-// than one character. Wide and combining characters are left to the real echo: a
-// prediction must advance the cursor by exactly one cell.
+// than one character. A prediction must advance the cursor by exactly one cell, as
+// xterm will when the echo lands. xterm's public API exposes no character-width
+// lookup, so rather than copy its tables this accepts only ranges it always draws
+// one cell wide: printable ASCII, the Latin-1 supplement without the soft hyphen
+// (which it draws at width 0), and Latin Extended-A and -B. Wide characters, emoji
+// and combining marks from any script are left to the real echo.
 export function predictableKey(data) {
   if (data === '\x7f' || data === '\b') return 'backspace';
   if (typeof data !== 'string' || !data) return null;
   const code = data.codePointAt(0);
   if (String.fromCodePoint(code) !== data) return null;
-  if (code < 0x20 || (code >= 0x7f && code < 0xa0)) return null;
-  if (code >= 0x300 && code < 0x370) return null;
-  if (code >= 0x1100) return null;
-  return 'char';
+  if (code >= 0x20 && code < 0x7f) return 'char';
+  if (code >= 0xa0 && code <= 0x24f && code !== 0xad) return 'char';
+  return null;
 }
 
 const blankCell = (cell) => !cell || cell.getChars() === '' || cell.getChars() === ' ';
@@ -71,9 +78,12 @@ const blankCell = (cell) => !cell || cell.getChars() === '' || cell.getChars() =
 // Decides whether one keystroke can be drawn ahead of the echo, and returns the
 // bytes to draw, or null. `extraColumns` counts predictions written but not yet
 // parsed, so the margin check sees where the cursor is about to be.
-export function predictKeystroke(terminal, data, { composing = false, extraColumns = 0 } = {}) {
+export function predictKeystroke(terminal, data, { agent, composing = false, extraColumns = 0 } = {}) {
+  // Only an agent's own input box is predicted; a shell pane, or a pane with no
+  // agent on record, never is.
+  const prompts = Object.hasOwn(PROMPTS, agent) ? PROMPTS[agent] : null;
   const kind = predictableKey(data);
-  if (!kind || composing) return null;
+  if (!prompts || !kind || composing) return null;
   if (terminal.hasSelection?.()) return null;
   const buffer = terminal.buffer?.active;
   if (!buffer || buffer.type !== 'normal') return null;
@@ -81,8 +91,8 @@ export function predictKeystroke(terminal, data, { composing = false, extraColum
   const line = buffer.getLine(buffer.baseY + buffer.cursorY);
   if (!line) return null;
   const text = line.translateToString(true);
-  const prompt = PROMPT_LINE.exec(text);
-  if (!prompt || MENU_CHOICE.test(text)) return null;
+  const prompt = prompts.line.exec(text);
+  if (!prompt || prompts.menu.test(text)) return null;
   const inputStart = prompt[1].length + 2;
   const cursorX = buffer.cursorX + extraColumns;
   if (cursorX < inputStart) return null;
@@ -113,9 +123,11 @@ function median(values) {
 // for the text of its input box.
 const predictedCell = (cell) => Boolean(cell && cell.isDim() && cell.isUnderline());
 
-// One per mounted terminal. `remote` says whether the pane is on another node,
-// `mode` reads the viewer's setting, and `now` is a monotonic clock.
-export function createTypingPredictor({ terminal, remote, mode = getPredictTypingPreference, now = () => Date.now() }) {
+// One per mounted terminal. `agent` names the pane's agent (`claude`, `codex`, or
+// anything else for a pane that is not predicted), `remote` says whether the pane
+// is on another node, `mode` reads the viewer's setting, and `now` is a monotonic
+// clock.
+export function createTypingPredictor({ terminal, agent, remote, mode = getPredictTypingPreference, now = () => Date.now() }) {
   const samples = [];
   // Keystrokes whose echo has not landed, oldest first, each with the input text it
   // should leave before the cursor. That text is what matches an echo to the
@@ -157,7 +169,7 @@ export function createTypingPredictor({ terminal, remote, mode = getPredictTypin
   const keystroke = (data, options = {}) => {
     const at = now();
     if (entries.length && at - entries[0].at > STALE_KEYSTROKE_MS) entries = [];
-    const decision = predictKeystroke(terminal, data, { ...options, extraColumns: unparsed });
+    const decision = predictKeystroke(terminal, data, { ...options, agent: agent(), extraColumns: unparsed });
     if (!decision) {
       // Enter, arrows, pastes and the like change the line in ways the expected
       // text cannot follow, so the keystrokes before them are no longer matched.
@@ -197,7 +209,7 @@ export function createTypingPredictor({ terminal, remote, mode = getPredictTypin
     }
     for (let x = cursorX; x < terminal.cols; x++) if (predictedCell(line.getCell(x))) return;
     if (cursorX + waiting.length > terminal.cols - 3) return;
-    const first = predictKeystroke(terminal, waiting[0].ch);
+    const first = predictKeystroke(terminal, waiting[0].ch, { agent: agent() });
     if (!first) return;
     const bytes = first.bytes + waiting.slice(1).map((entry) => PREDICT_CHAR(entry.ch)).join('');
     draw(bytes, waiting.length);
@@ -217,10 +229,13 @@ export function createTypingPredictor({ terminal, remote, mode = getPredictTypin
     // far: the cursor is where the predictions left it.
     for (let x = inputStart; x < cursorX; x++) if (predictedCell(line.getCell(x))) return;
     const current = inputBeforeCursor();
-    let confirmed = -1;
-    for (let i = entries.length - 1; i >= 0; i--) {
-      if (entries[i].expected === current) { confirmed = i; break; }
-    }
+    // Acknowledge in order: the oldest pending keystroke whose expected text is on
+    // the line, and everything before it. The same text can recur in a burst (`a`,
+    // `b`, Backspace expects `a`, `ab`, `a`), and matching a later keystroke would
+    // skip ones the agent has not drawn yet. When one render answers several, the
+    // earliest match is still the right one unless the text repeats, and then the
+    // next render confirms the rest.
+    const confirmed = entries.findIndex((entry) => entry.expected === current);
     if (confirmed < 0) {
       // The line is as it was before the first keystroke: the agent has not got to
       // it yet. Anything else (a completion, a submitted prompt) ends the chain.
