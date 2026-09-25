@@ -9563,7 +9563,7 @@ const DIALOG_CONFIRM_GRACE_MS = 600;
 // after the marker without a span of its own, which that part already refuses.
 const EMPTY_CLAUDE_PROMPT_RAW = new RegExp(
   '^(?:\\s|\\x1b\\[[0-?]*[ -/]*[@-~])*'
-  + '❯ *(?:\\x1b\\[2m[^\\x1b]*\\x1b\\[22m)?(?:\\s|\\x1b\\[[0-9;]*[mK])*$');
+  + '❯[ \\u00a0]*(?:\\x1b\\[2m[^\\x1b]*\\x1b\\[22m)?(?:\\s|\\x1b\\[[0-9;]*[mK])*$');
 
 //
 // The host's screen verb, though, renders text with every style dropped, so the dim
@@ -9575,8 +9575,9 @@ const EMPTY_CLAUDE_PROMPT_RAW = new RegExp(
 // (cursorLine, which the host names) in the column after the marker. An older host
 // answers no cursorLine at all; then the column alone decides, and only for text of
 // the placeholder's shape on the bottom-most prompt line. A cursor anywhere else, or
-// any other text, is a draft.
-const CLAUDE_PLACEHOLDER_LINE = /^(\s*)❯ (Try ".{1,114}")$/;
+// any other text, is a draft. The cell after the marker is a no-break space (U+00A0)
+// as the host's screen renders it, a plain one in a raw stream: both are the marker's.
+const CLAUDE_PLACEHOLDER_LINE = /^(\s*)❯[  ](Try ".{1,114}")$/;
 
 // Whether line `index` of the screen's lines is an empty Claude box, by its raw style
 // or by where the cursor is.

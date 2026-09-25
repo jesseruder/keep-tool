@@ -5805,6 +5805,13 @@ test('a real host screen carries no styles, so the placeholder is told by the cu
   // Under a named session's rule.
   const named = lines.map((line, index) => (index === 2 ? '──────────────────── fable-fleet-reviewer ─' : line));
   assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3, named)), true);
+  // The host renders the cell after the marker as a no-break space (what a live pane
+  // answered on 2026-09-24); the cursor still sits at column 2, and it is the same box.
+  const nbsp = lines.map((line) => (line.startsWith('❯') ? `❯ Try "fix typecheck errors"` : line));
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3, nbsp)), true, 'a no-break space after the marker');
+  assert.equal(claudeInputBoxEmpty(result({ x: 2, y: 3 }, 3, nbsp)), true);
+  assert.equal(agentPromptVisibleIn('claude', result({ x: '❯ Try "fix typecheck errors"'.length, y: 3 }, 3, nbsp)), false, 'typed after a no-break space');
+  assert.equal(agentPromptVisibleIn('claude', 'x\n' + rule + '\n\x1b[39m❯ \x1b[2mTry "it"\x1b[22m\x1b[K'), true, 'styled, with a no-break space');
 });
 
 function checkDeliveryFixture(fm, sessions, closed = []) {
