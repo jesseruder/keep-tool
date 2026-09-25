@@ -513,7 +513,7 @@ function shellProject(ctx) {
   const projectPath = item?.project || ctx.sessionFor(item)?.project;
   if (!projectPath) return fallback;
   const selected = ctx.projectOf(projectPath);
-  return projects.find((project) => project.key === selected.key) || (selected.path.startsWith('/') ? selected : fallback);
+  return projects.find((project) => project.key === selected.key) || (selected.root?.startsWith('/') ? { ...selected, path: selected.root } : fallback);
 }
 
 export function renderRail(ctx, items) {

@@ -456,7 +456,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     const holdDeadline = Date.now() + 2000;
     while (!releaseHeldState && Date.now() < holdDeadline) await new Promise((resolve) => setTimeout(resolve, 5));
     assert.ok(releaseHeldState, 'fixture must capture the pre-spawn state request');
-    await evaluate("document.querySelector('.qfocus').click(); [...document.querySelectorAll('#qlist .qtoggle')].find(x=>x.textContent.includes('Running & waiting')).click(); document.querySelector('#rail [data-shell]').click(); document.querySelector('.session-launch-card').requestSubmit()");
+    await evaluate("document.querySelector('.qfocus').click(); [...document.querySelectorAll('#qlist .qtoggle')].find(x=>x.textContent.includes('Running & waiting')).click(); document.querySelector('#rail [data-shell]').click(); ((k) => { k.value = 'shell'; k.dispatchEvent(new Event('change', { bubbles: true })); })(document.querySelector('[data-launch-kind]')); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#stage').dataset.pane === 'shell1' && document.activeElement?.matches('#stage .xterm-helper-textarea')");
     assert.ok(!layouts[0].ids.includes('shell1'), 'a shell opened from the rail is not pinned to Watch');
     assert.equal(await evaluate("document.querySelector('#toast .toast-body button')?.textContent"), 'Pin', 'the new shell is offered as a pin instead');
@@ -472,7 +472,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     assert.notEqual(await evaluate("document.querySelector('#stage').dataset.pane"), 'shell1', 'a later authoritative absence removes the optimistic pane');
     assert.equal(await evaluate("document.querySelector('#qlist [data-key=\"pinned:shell1\"]')"), null);
     assert.equal(await evaluate("document.querySelector('.qfocus').getAttribute('aria-pressed')"), 'false', 'new shell leaves waiting-only Focus mode');
-    await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('#spawnShell').click(); document.querySelector('.session-launch-card').requestSubmit()");
+    await evaluate("document.querySelector('[data-mode=watch]').click(); document.querySelector('#spawnShell').click(); ((k) => { k.value = 'shell'; k.dispatchEvent(new Event('change', { bubbles: true })); })(document.querySelector('[data-launch-kind]')); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.activeElement?.closest('.wpane')?.dataset.pane === 'shell2'");
     for (const client of terminalSockets.clients) {
       if (client.fixturePane === 'shell2') client.send(JSON.stringify({ t: 'exit', code: 0 }));
@@ -507,7 +507,7 @@ test('isolated browser: queue focus, history traversal, reload, Watch and immedi
     await wait("window.keepConsole.terminals.get('pa').terminal !== window.preRestartTerminal && document.activeElement?.matches('#stage .xterm-helper-textarea')");
     assert.equal(await evaluate("document.querySelector('#stage').dataset.pane"), 'pa', 'replacement retains selected pane');
     assert.ok(layouts[0].ids.includes('pa'), 'replacement retains pins');
-    await evaluate("document.querySelector('#rail [data-shell]').click(); document.querySelector('.session-launch-card').requestSubmit()");
+    await evaluate("document.querySelector('#rail [data-shell]').click(); ((k) => { k.value = 'shell'; k.dispatchEvent(new Event('change', { bubbles: true })); })(document.querySelector('[data-launch-kind]')); document.querySelector('.session-launch-card').requestSubmit()");
     await wait("document.querySelector('#stage').dataset.pane === 'shell3'");
     assert.ok(!layouts[0].ids.includes('shell3'), 'the second rail shell is not pinned either');
     await wait("new Promise(resolve => requestAnimationFrame(() => requestAnimationFrame(() => resolve(true))))");

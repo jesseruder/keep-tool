@@ -71,7 +71,10 @@ function projectOf(projectPath = '') {
   const name = known?.name || relative.split('/').filter(Boolean).pop() || 'Unknown';
   const settings = data.scopes || globalThis.KeepScopeRules.defaults;
   const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : clean), settings, settings.home) || settings.default;
-  return { key, path: clean, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
+  // The checkout a new session opens in: a worktree's own repo, never the worktree.
+  const home = clean.match(/^\/(?:Users|home)\/[^/]+\//)?.[0];
+  const root = worktree ? choice?.path || (home ? home + key : clean) : canonical;
+  return { key, path: clean, root, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 
 let restoredRunning = true;
@@ -392,7 +395,8 @@ function knownProjects() {
   const values = new Map();
   const add = (projectPath) => {
     if (!projectPath) return;
-    const project = projectOf(projectPath);
+    const found = projectOf(projectPath);
+    const project = { ...found, path: found.root };
     if (!values.has(project.key) || !values.get(project.key).path.startsWith('/')) values.set(project.key, project);
   };
   for (const session of data.sessions || []) add(session.project);
@@ -640,7 +644,7 @@ async function newSession(cwd, name, onOpened) {
   await openSessionChooser(ctx, {
     title: 'New session', description: 'Choose what to open and where.', project: cwd,
     directory: cwd, editableDirectory: true,
-    kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'shell', confirmLabel: 'Open session', chooseNode: true,
+    kinds: ['shell', 'claude', 'codex', 'pi'], initialKind: 'claude', confirmLabel: 'Open session', chooseNode: true,
     models: defaultModels(), defaultModels: true,
     async onSubmit(selection) {
       state.pendingFocus = true;

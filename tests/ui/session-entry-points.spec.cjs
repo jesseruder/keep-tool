@@ -28,7 +28,7 @@ async function openActions(root) {
 test('rail chooser cancels without spawning and freezes one explicit agent launch', async ({ page }) => {
   await page.locator('#rail [data-shell]').click();
   await expect(chooser(page)).toBeVisible();
-  await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('shell');
+  await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('claude');
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(fixture.state.sessions[0].project);
   await chooser(page).locator('[data-launch-cancel]').last().click();
   await expect(chooser(page)).not.toBeVisible();
@@ -41,7 +41,7 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
   await chooser(page).locator('[data-launch-directory]').fill(directory);
   await chooser(page).locator('[data-launch-kind]').selectOption('claude');
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(directory);
-  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
+  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-opus-5-5[1m]');
   await chooser(page).locator('[data-launch-account]').selectOption('claude-two');
   await chooser(page).locator('[data-launch-model]').selectOption('claude-sonnet-5');
   await chooser(page).locator('[data-launch-submit]').click();
@@ -58,6 +58,15 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
     agent: 'claude', accountId: 'claude-two', model: 'claude-sonnet-5' });
   expect(typeof requests('/api/open')[0].body.requestId).toBe('string');
   expect(requests('/api/panes/spawn')).toHaveLength(0);
+});
+
+test('a session in a worktree offers its main checkout, not the worktree', async ({ page }) => {
+  for (const session of fixture.state.sessions) session.project = '/home/tester/wt/proj/some-slug';
+  for (const pane of fixture.state.panes) pane.meta = { ...pane.meta, project: '/home/tester/wt/proj/some-slug' };
+  fixture.publish();
+  await page.reload();
+  await page.locator('#rail [data-shell]').click();
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/proj');
 });
 
 test('post-spawn setup error focuses its saved pane and retry cannot duplicate it', async ({ page }) => {
@@ -92,7 +101,7 @@ test('Watch new session keeps the selected project and Plain shell option', asyn
   await page.locator('[data-mode=watch]').click();
   const project = await page.locator('#shellProject').inputValue();
   await page.locator('#spawnShell').click();
-  await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('shell');
+  await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('claude');
   await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue(project);
   await chooser(page).locator('[data-launch-directory]').fill('   ');
   await chooser(page).locator('[data-launch-submit]').click();
@@ -243,7 +252,7 @@ test('card fallback and review actions send exact provider account and model cho
   await expect(page.locator('#stage')).toHaveAttribute('data-item-key', 'card-fresh');
   await (await openActions(page.locator('#stage'))).locator('[data-reopen]').click();
   await expect(chooser(page).locator('[data-launch-kind]')).toHaveValue('claude');
-  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-fable-5-1');
+  await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('claude-opus-5-5[1m]');
   await chooser(page).locator('[data-launch-kind]').selectOption('codex');
   await chooser(page).locator('[data-launch-account]').selectOption('codex-two');
   await expect(chooser(page).locator('[data-launch-model]')).toHaveValue('');
