@@ -49,6 +49,15 @@ const REGISTRY_COMMANDS = Object.freeze([
   // restarts the daemon, the node asks it to bring every node, itself included, up
   // to origin (bin/node-update.js). It can only fast-forward to what origin has.
   'nodes',
+  // `compact` asks the daemon to compact a session. A bare one is an agent asking for
+  // its own session at the next idle moment: the daemon's CLI runs it under the
+  // caller's verified session (IDENTITY_VARS in registry-route.js), which is the
+  // session its request names, and the daemon compacts a Claude session on a node on
+  // its current model. With an id it compacts that session now, as on the daemon node.
+  'compact',
+  // `verify <card>` delivers the card's check recipe into a session now (/api/run), as
+  // a scheduled check would; nothing in the request is run as a command.
+  'verify',
   // An agent's own feed (AGENTS_ALLOWED): a card agent or responder on a node says
   // what it found with `emit`, and reads its feed with `events` or the bare list.
   // The daemon's CLI runs an emit under the caller's verified session and writes it
@@ -163,7 +172,29 @@ const SESSION_REFUSALS = Object.freeze({
     .map((command) => [command, `a node's ${command} is the reviewer's; run it inside the reviewer's session`])),
   // An outcome is the working session's (or Owner's), never the reviewer's.
   'review-outcome': "a node's review-outcome names the session recording it; run it inside that session",
+  // A bare compact names no session but the caller's, and from a node shell with none
+  // the daemon's CLI would take its own environment's instead.
+  compact: "a node's compact names the session it is from; run it inside an agent session",
 });
+
+// `keep compact <id>` without --when-idle compacts now, and the daemon's CLI waits for
+// it: up to KEEP_COMPACT_TIMEOUT_MS (four minutes by default), past the minute a
+// forwarded command is given, so the node would be told of a timeout while the daemon
+// carried on. A node asks for the idle-time form, which files a request and returns.
+const COMPACT_NOW_REFUSAL = "a node's keep compact <id> would compact now and outlast a forwarded command; add --when-idle, or run it on the daemon node";
+function compactRefusal(args) {
+  let named = false;
+  let idle = false;
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (typeof arg !== 'string') continue;
+    if (arg === '--') { named ||= i + 1 < args.length; break; }
+    if (arg === '-m') { i += 1; continue; }
+    if (arg === '--when-idle') idle = true;
+    else if (!arg.startsWith('--')) named = true;
+  }
+  return named && !idle ? COMPACT_NOW_REFUSAL : null;
+}
 
 const MAX_ARG_BYTES = 4 * 1024;
 const MAX_ARGS_BYTES = 64 * 1024;
@@ -214,6 +245,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   'review-ack': ['probe-safe'],
   'review-outcome': ['json'],
   alert: ['dry', 'force'],
+  compact: ['when-idle'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -271,6 +303,7 @@ function argumentRefusal(command, args, identity = {}) {
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   if (command === 'agents' && agentsRefusal(args, identity)) return agentsRefusal(args, identity);
+  if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -427,6 +460,7 @@ function nodeSideRefusal(command, args) {
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   if (command === 'agents' && agentsRefusal(args)) return agentsRefusal(args);
+  if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];

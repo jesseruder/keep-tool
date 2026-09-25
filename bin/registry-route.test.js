@@ -401,6 +401,36 @@ test('arguments are checked the way the CLI will read them', (t) => {
   assert.match(argumentRefusal('decide', ['t', '--session=other'], { session: 'me', node: 'aws1' }), /caller's own session/);
 });
 
+// A bare `keep compact` is an agent asking for its own session: the daemon's CLI runs
+// it under the node session's identity, which is the session its request names. An id
+// without --when-idle would compact now and outlast a forwarded command, so a node asks
+// for the idle-time form. `keep verify <card>` needs no session at all.
+test('a node forwards keep compact under its own session in its request forms, and keep verify', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('compact'));
+  assert.ok(REGISTRY_COMMANDS.includes('verify'));
+  for (const args of [[], ['-m', 'card done'], ['sess-aws1', '--when-idle'], ['--when-idle', 'sess-aws1', '-m', 'x']]) {
+    assert.equal(argumentRefusal('compact', args, ME), null, args.join(' '));
+    assert.equal(nodeSideRefusal('compact', args), null, args.join(' '));
+  }
+  const now = "a node's keep compact <id> would compact now and outlast a forwarded command; add --when-idle, or run it on the daemon node";
+  for (const args of [['sess-aws1'], ['-m', 'x', 'sess-aws1'], ['--', 'sess-aws1']]) {
+    assert.equal(argumentRefusal('compact', args, ME), now, args.join(' '));
+    assert.equal(nodeSideRefusal('compact', args), now, args.join(' '));
+  }
+  const { svc, root, calls } = service(t);
+  const asked = await svc.handle(AWS1, body(root, { command: 'compact', args: ['-m', 'card done'], idempotencyKey: `${KEY}-compact` }));
+  assert.equal(asked.status, 200, JSON.stringify(asked.body));
+  assert.deepEqual(calls[0].args.slice(1), ['compact', '-m', 'card done']);
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the bare compact is the node session\'s own');
+  const anonymous = "a node's compact names the session it is from; run it inside an agent session";
+  const bare = await svc.handle(AWS1, body(root, { command: 'compact', args: [], session: null, agent: null, idempotencyKey: `${KEY}-bare` }));
+  assert.deepEqual(bare, { status: 400, body: { error: anonymous } });
+  const verified = await svc.handle(AWS1, body(root, { command: 'verify', args: ['some-card'], session: null, agent: null, idempotencyKey: `${KEY}-verify` }));
+  assert.equal(verified.status, 200, JSON.stringify(verified.body));
+  assert.deepEqual(calls.at(-1).args.slice(1), ['verify', 'some-card']);
+  assert.equal(calls.length, 2);
+});
+
 test('a node\'s keep tell runs under its own session, and a message file it names on the node is refused', async (t) => {
   assert.ok(REGISTRY_COMMANDS.includes('tell'));
   assert.equal(argumentRefusal('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry'], ME), null);
