@@ -37,48 +37,67 @@ test('manual close rechecks process identity after graceful attempt', async () =
   await assert.rejects(manualClose(body, f.deps), /identity/);
   assert.deepEqual(f.calls, ['exit']);
 });
-// A node pane is a shell with the agent inside: SIGTERM runs the agent's SessionEnd
-// hook, which hands the pane back (agent 'shell', no sessionId) before the pane dies.
-for (const [label, releasedAlive, calls, forced] of [
-  ['and the pane then exits', false, ['exit', 'SIGTERM'], false],
-  ['while its shell lives on', true, ['exit', 'SIGTERM', 'SIGKILL'], true],
-]) test(`manual close accepts a pane its own session released on exit, ${label}`, async () => {
+// An agent's SessionEnd hook hands its pane back (agent 'shell', no sessionId) as it
+// exits. On a node the pane is the agent under a shell and dies just after; a pane
+// Owner opened as a shell keeps its shell. Either way the close is done, and a shell
+// left alive is never signalled.
+function releasing({ gracefulReleases = false, paneDies = true, rebind = null } = {}) {
   let released = false;
   let alive = true;
-  const calls_ = [];
+  const calls = [];
   const deps = {
-    getPane: async () => ({ id: 'pane', pid: 123, alive,
-      meta: released ? { agent: 'shell' } : { agent: 'claude', sessionId: 'session' } }),
-    graceful: async () => { calls_.push('exit'); throw new Error('a graceful close reads the transcript on aws1'); },
-    signal: async (_pane, signal) => {
-      calls_.push(signal);
+    getPane: async () => ({ id: 'pane', pid: 123, createdAt: 'c1', alive,
+      meta: rebind && released ? { agent: 'claude', sessionId: rebind }
+        : released ? { agent: 'shell' } : { agent: 'claude', sessionId: 'session' } }),
+    graceful: async () => {
+      calls.push('exit');
+      if (!gracefulReleases) throw new Error('a graceful close reads the transcript on aws1');
       released = true;
-      if (!releasedAlive || signal === 'SIGKILL') alive = false;
+    },
+    signal: async (_pane, signal) => {
+      calls.push(signal);
+      released = true;
+      if (paneDies) alive = false;
     },
     sleep: async () => {},
   };
-  assert.equal((await manualClose(body, deps)).forced, forced);
-  assert.deepEqual(calls_, calls);
+  return { deps, calls };
+}
+test('manual close accepts a node pane its session released on SIGTERM', async () => {
+  const f = releasing();
+  assert.equal((await manualClose(body, f.deps)).forced, false);
+  assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
 });
-test('manual close still refuses a released pane another session has bound', async () => {
-  let bound = false;
-  const calls = [];
+test('manual close stops at a released pane whose shell lives on and never signals it again', async () => {
+  const f = releasing({ paneDies: false });
+  assert.equal((await manualClose(body, f.deps)).forced, false);
+  assert.deepEqual(f.calls, ['exit', 'SIGTERM']);
+});
+test('manual close signals nothing when /exit releases a shell pane Owner opened', async () => {
+  const f = releasing({ gracefulReleases: true, paneDies: false });
+  assert.equal((await manualClose(body, f.deps)).forced, false);
+  assert.deepEqual(f.calls, ['exit']);
+});
+test('manual close refuses a pane another session bound after release', async () => {
+  const f = releasing({ gracefulReleases: true, paneDies: false, rebind: 'other' });
+  await assert.rejects(manualClose(body, f.deps), /identity changed/);
+  assert.deepEqual(f.calls, ['exit']);
+});
+test('manual close refuses a pane already released before it started', async () => {
   const deps = {
-    getPane: async () => ({ id: 'pane', pid: 123, alive: true,
-      meta: bound ? { agent: 'claude', sessionId: 'other' } : { agent: 'claude', sessionId: 'session' } }),
-    graceful: async () => { calls.push('exit'); bound = true; },
-    signal: async (_pane, signal) => { calls.push(signal); },
+    getPane: async () => ({ id: 'pane', pid: 123, createdAt: 'c1', alive: true, meta: { agent: 'shell' } }),
+    graceful: async () => { throw new Error('must not type'); },
+    signal: async () => { throw new Error('must not signal'); },
     sleep: async () => {},
   };
   await assert.rejects(manualClose(body, deps), /identity changed/);
-  assert.deepEqual(calls, ['exit']);
 });
-test('manual close does not accept a released pane on a different process', async () => {
+test('manual close does not take a released pane with a different createdAt as its own', async () => {
   let reads = 0;
   const deps = {
     getPane: async () => (++reads === 1
-      ? { id: 'pane', pid: 123, alive: true, meta: { agent: 'claude', sessionId: 'session' } }
-      : { id: 'pane', pid: 456, alive: true, meta: { agent: 'shell' } }),
+      ? { id: 'pane', pid: 123, createdAt: 'c1', alive: true, meta: { agent: 'claude', sessionId: 'session' } }
+      : { id: 'pane', pid: 123, createdAt: 'c2', alive: true, meta: { agent: 'shell' } }),
     graceful: async () => { throw new Error('refused'); },
     signal: async () => { throw new Error('must not signal'); },
     sleep: async () => {},

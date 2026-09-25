@@ -34,15 +34,22 @@ async function manualClose(body, deps) {
   }
   let expectedInputCount = null;
   let expectedOutputCount = null;
-  // A session ending in a pane that outlives it (a node's panes are a shell with the
-  // agent inside) has its SessionEnd hook hand the pane back: sessionId cleared, agent
-  // 'shell'. On the same process that is this close taking effect, not a new identity;
-  // any other session binding the pane still refuses below.
+  // An agent's SessionEnd hook hands its pane back as it exits: sessionId cleared,
+  // agent 'shell'. A node's panes run the agent under a shell, so a close there sees
+  // this between the signal and the pane's exit; a pane Owner opened as a shell and
+  // typed `claude` into keeps that shell alive afterwards. On the same pane process
+  // it means the session has ended, so the close is done: nothing further is signalled,
+  // least of all a shell someone may be typing into. Any other session binding the
+  // pane, or a different process, still refuses.
   const releasedBySession = (pane) => pane !== initial && Boolean(initial?.pid) && pane.pid === initial.pid
-    && pane.meta?.agent === 'shell' && !pane.meta?.sessionId;
+    && pane.createdAt === initial.createdAt && pane.meta?.agent === 'shell' && !pane.meta?.sessionId;
+  const ended = (pane) => !pane.alive || releasedBySession(pane);
   const verify = (pane) => {
-    if (!pane || pane.id !== body.pane || (!releasedBySession(pane) && (pane.meta?.sessionId !== body.sessionId
-        || !['claude', 'codex', 'pi'].includes(pane.meta?.agent))) || (initial?.pid && pane.pid !== initial.pid)) {
+    if (!pane || pane.id !== body.pane || (initial?.pid && pane.pid !== initial.pid)) {
+      throw new Error('Session/pane identity changed; nothing terminated');
+    }
+    if (releasedBySession(pane)) return pane;
+    if (pane.meta?.sessionId !== body.sessionId || !['claude', 'codex', 'pi'].includes(pane.meta?.agent)) {
       throw new Error('Session/pane identity changed; nothing terminated');
     }
     if (deps.protectInput && expectedInputCount !== null && pane.inputCount !== expectedInputCount) {
@@ -90,7 +97,7 @@ async function manualClose(body, deps) {
       // exited. Keep polling for an affirmative host observation within this phase.
       if (pane) {
         confirmed = true;
-        if (!verify(pane).alive) return { closed: true, confirmed, lastError, waitedMs: now() - started };
+        if (ended(verify(pane))) return { closed: true, confirmed, lastError, waitedMs: now() - started };
       }
       await sleep(delay);
     }
@@ -120,7 +127,7 @@ async function manualClose(body, deps) {
   await gracefulResult?.beforeSignal?.();
   // The identity reads around each signal get one phase's budget too; nothing has
   // been signalled yet here, so a timeout simply fails the close.
-  verify(await withinBudget(deps.getPane(body.pane), readBudgetMs));
+  if (ended(verify(await withinBudget(deps.getPane(body.pane), readBudgetMs)))) return result();
   const guard = () => ({
     expectedPid: initial.pid,
     expectedSessionId: body.sessionId,
@@ -136,7 +143,7 @@ async function manualClose(body, deps) {
   try { beforeKill = await withinBudget(deps.getPane(body.pane), readBudgetMs); }
   catch (error) { if (timedOut(error)) throw unconfirmed('SIGTERM', term.waitedMs, error); throw error; }
   if (!beforeKill) throw unconfirmed('SIGTERM', term.waitedMs);
-  verify(beforeKill);
+  if (ended(verify(beforeKill))) return result();
   await deps.signal(body.pane, 'SIGKILL', deps.requireSignalGuard ? guard() : null);
   const killed = await wait(100);
   if (killed.closed) return result(true);
