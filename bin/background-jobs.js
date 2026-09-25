@@ -439,7 +439,7 @@ function retainForReplay(state, gap) {
       launches: { ...(prior.launches || {}) }, mapped: { ...(prior.mapped || {}) } } };
 }
 
-function sync({ root, agent, sid, file, instance = null, classify = () => 'unknown', inspectAgent, childTranscriptFor, includeSidechain = false, now = Date.now(), budget = 4 * 1024 * 1024, maxRecord = 32 * 1024 * 1024, staleAfter = 30 * 60e3, coldReplay = false, abandonAfter = 3 * 3600e3 }) {
+function sync({ root, agent, sid, file, node = null, instance = null, classify = () => 'unknown', inspectAgent, childTranscriptFor, includeSidechain = false, now = Date.now(), budget = 4 * 1024 * 1024, maxRecord = 32 * 1024 * 1024, staleAfter = 30 * 60e3, coldReplay = false, abandonAfter = 3 * 3600e3 }) {
   const dir = directory(root, agent, sid);
   fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
   const snapshot = path.join(dir, 'state.json'), lock = path.join(dir, 'writer.lock');
@@ -717,7 +717,9 @@ function sync({ root, agent, sid, file, instance = null, classify = () => 'unkno
       if (finished || !held || remarked) delete state.coldReplay;
     }
     state.lastReconciledAt = now;
-    state.source = { agent, sid, file, instance, includeSidechain };
+    // `node`: the file is the daemon's mirror of a session on another node, so the
+    // target re-registered from this at startup still resolves children on mirrors.
+    state.source = { agent, sid, file, instance, includeSidechain, ...(typeof node === 'string' && node ? { node } : {}) };
     state.recovering = recovering;
     const tmp = path.join(dir, `state.${process.pid}.tmp`);
     fs.writeFileSync(tmp, JSON.stringify(state), { mode: 0o600 }); fs.renameSync(tmp, snapshot);

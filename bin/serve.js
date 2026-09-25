@@ -382,8 +382,10 @@ const REVIEW_INSTRUCTION = "These items are awaiting the developer's decision. F
 const SESSION_INSTRUCTION = "Write 2 to 4 short lines, newest first, each naming one thing this coding session worked on recently (feature, bug, file area) and its outcome or current state. Plain text, one item per line, no bullets, no preamble. Output only those lines.";
 const dashboardSessionSources = new WeakMap();
 function associateDashboardSessionFiles(state, targets, store = dashboardSessionSources) {
+  // A node session's ledger target reads its mirror; which file its summary reads is
+  // sessionSummaryFile's own rule for a row on another node, not the ledger's.
   const files = new Map((targets || [])
-    .filter((target) => target?.agent && target?.sid && target?.file)
+    .filter((target) => target?.agent && target?.sid && target?.file && !target.node)
     .map((target) => [`${target.agent}:${target.sid}`, target.file]));
   for (const session of state?.sessions || []) {
     const file = files.get(`${session.kind}:${session.id}`);
@@ -12071,6 +12073,43 @@ function registerBackgroundTarget(target) {
   backgroundJobScheduler?.register(target);
 }
 
+// A session on another node has no transcript here; its ledger reads the daemon's
+// mirror of it (bin/transcript-mirror.js), which the node's hook client appends to.
+// Answers { file, stat } for a mirror that is a plain file, or null.
+function backgroundMirrorSource(root, node, sid) {
+  try {
+    const file = require('./transcript-mirror').paths(root, node, sid).file;
+    const stat = fs.lstatSync(file);
+    return stat.isFile() ? { file, stat } : null;
+  } catch { return null; }
+}
+
+// The node whose mirror a background-job target reads, or null for a transcript on
+// this machine. Where the file is decides, not the target's `node` label: a target
+// re-registered at startup from any persisted ledger is told apart the same way, and
+// a label that outlived a rebind onto a local file cannot send its children to a mirror.
+function backgroundTargetNode(target, root = keep.ROOT) {
+  if (typeof target?.file !== 'string' || !target.file) return null;
+  const parts = path.relative(require('./transcript-mirror').mirrorRoot(root), path.resolve(target.file)).split(path.sep);
+  return parts.length === 2 && parts[0] !== '..' && nodes.NODE_NAME_RE.test(parts[0]) ? parts[0] : null;
+}
+
+// Where a background-job target's child agent writes, for inspection and for the
+// abandonment check's last-write time. Locally: a Claude subagent file beside the
+// parent transcript, a Codex child's own rollout. For a target on another node only
+// the mirror counts, never this machine's profiles: a Codex child's rollout is
+// mirrored under the child's id (bin/hook-route.js `child`), and a Claude subagent's
+// transcript is not mirrored at all (the node's hook sends the session's own
+// transcript only), so a Claude child there has no file and stays uncertain.
+function backgroundChildFile(target, id, root = keep.ROOT, deps = {}) {
+  if (typeof id !== 'string' || !/^[a-zA-Z0-9_-]{1,160}$/.test(id) || !target?.file) return null;
+  const node = backgroundTargetNode(target, root);
+  if (node) return target.agent === 'codex' ? backgroundMirrorSource(root, node, id)?.file || null : null;
+  return target.agent === 'claude'
+    ? path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`)
+    : (deps.findRolloutFile || codex.findRolloutFile)(id);
+}
+
 function cacheClaudeSessionLookup(cache, key, value) {
   if (cache.has(key)) cache.delete(key);
   cache.set(key, value);
@@ -13188,11 +13227,17 @@ function buildState(options = {}) {
   });
   for (const session of sessions) {
     if (['claude', 'codex'].includes(session.kind) && options.hostPanes) {
-      const file = dashboardSourceFiles.get(`${session.kind}:${session.id}`)
+      // A session on another node is read from its mirror here and never from a local
+      // file: one a move left behind is where the session was, not what it is doing.
+      const node = session.node && session.node !== daemonNodeName() ? session.node : null;
+      const mirrored = node ? backgroundMirrorSource(keep.ROOT, node, session.id) : null;
+      const file = node ? mirrored?.file : dashboardSourceFiles.get(`${session.kind}:${session.id}`)
         || (session.kind === 'claude' ? claudeSessionPathCache.get(session.id) : codex.rolloutFileFor(session.id));
       if (file) {
         const hosted = options.hostPanes.find(p => p.id === session.runtime?.paneId);
-        const sourceEvidence = dashboardSourceEvidence.get(`${session.kind}:${session.id}`)?.stat;
+        // The mirror's own stat for a node session: an append or a reset (a new
+        // generation truncates it in place) moves the fingerprint and wakes the target.
+        const sourceEvidence = node ? mirrored.stat : dashboardSourceEvidence.get(`${session.kind}:${session.id}`)?.stat;
         const jobs = settledBackgroundJobs.get(`${session.kind}:${session.id}`)
           || require('./background-jobs').read(keep.ROOT, session.kind, session.id, now);
         const live = session.runtime?.state === 'live' ? true : session.runtime?.state === 'exited' ? false : null;
@@ -13200,7 +13245,8 @@ function buildState(options = {}) {
           ...(sourceEvidence ? { sourceFingerprint: [sourceEvidence.dev, sourceEvidence.ino,
             sourceEvidence.size, sourceEvidence.mtimeMs, sourceEvidence.ctimeMs] } : {}),
           ...(coldReplayDue(session, jobs, sourceEvidence?.mtimeMs ?? session.mtime, live, now) ? { coldReplay: true } : {}),
-          instance: { id: require('./background-jobs').processInstance(hosted), processScoped: true, live } };
+          instance: { id: require('./background-jobs').processInstance(hosted), processScoped: true, live },
+          ...(node ? { node } : {}) };
         if (workerMode) options.collectBackgroundTargets?.push(target);
         else registerBackgroundTarget(target);
         session.backgroundJobs = jobs;
@@ -16860,13 +16906,10 @@ function start(deps = {}) {
     if (!selected) return;
     const { key, target } = selected;
     // The same child transcript paths restart-ledger resolves: inspection reads
-    // them, abandonment needs their mtime as the child's last writing evidence.
-    const childTranscriptFor = (id) => {
-      if (!/^[a-zA-Z0-9_-]{1,160}$/.test(id)) return null;
-      return target.agent === 'claude'
-        ? path.join(path.dirname(target.file), path.basename(target.file, '.jsonl'), 'subagents', `agent-${id}.jsonl`)
-        : codex.findRolloutFile(id);
-    };
+    // them, abandonment needs their mtime as the child's last writing evidence. A
+    // target on another node resolves them on its mirrors only (backgroundChildFile).
+    const onNode = backgroundTargetNode(target, keep.ROOT);
+    const childTranscriptFor = (id) => backgroundChildFile(target, id, keep.ROOT);
     try {
       const result = jobLedger.sync({ root: keep.ROOT, ...target,
         classify: (name, input) => isBoundedBackgroundWatcher('Bash', { ...input, command: input?.command || input?.cmd, run_in_background: true }) ? 'finite'
@@ -16877,6 +16920,12 @@ function start(deps = {}) {
             if (!file) return null;
             const child = scanChildTranscript(file);
             return { at: child.attentionAt || 0, done: child.explicitEndTurn && !child.pendingOther && !child.pendingBackground };
+          }
+          // A node's Codex child is read from its mirror, or not at all: codex-lifecycle
+          // would otherwise look for the rollout in this machine's Codex homes.
+          if (onNode) {
+            const file = childTranscriptFor(id);
+            return file ? require('./codex-lifecycle').inspectChild(id, target.sid, Date.now(), file) : null;
           }
           return require('./codex-lifecycle').inspectChild(id, target.sid);
         },
@@ -17276,6 +17325,8 @@ module.exports = {
   priorForcedSurvivors,
   applyHostedExitState,
   coldReplayDue,
+  backgroundChildFile,
+  backgroundTargetNode,
   closeExitedCodexShell,
   scanSessions,
   invalidateDashboardSources,

@@ -70,6 +70,8 @@ const {
   checkDeliveryIds,
   deliverCheckToThread,
   coldReplayDue,
+  backgroundChildFile,
+  backgroundTargetNode,
   compactRefusal,
   compactCommand,
   chunkForTyping,
@@ -4864,6 +4866,49 @@ test('a gapped ledger is replayed only on an idle live session, and at most hour
   for (const patch of [{ endedTurn: false }, { toolRunning: true }, { pendingQuestion: {} }, { pendingPlan: {} }]) {
     assert.equal(coldReplayDue({ ...session, ...patch }, jobs, mtime, true, now), false);
   }
+});
+
+test('a node session\'s background children resolve on its mirrors, never on local profiles', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-bg-child-'));
+  try {
+    const mirror = require('./transcript-mirror');
+    const node = 'workera';
+    const sid = `parent-${process.pid}-${Date.now()}`;
+    const child = `child-${process.pid}-${Date.now()}`;
+    const parent = mirror.paths(root, node, sid).file;
+    fs.mkdirSync(path.dirname(parent), { recursive: true });
+    fs.writeFileSync(parent, '');
+    let localLookups = 0;
+    const localRollout = path.join(root, 'local-codex', `rollout-${child}.jsonl`);
+    const deps = { findRolloutFile: () => { localLookups++; return localRollout; } };
+    // Told by where the file is, whatever label the target carries.
+    assert.equal(backgroundTargetNode({ agent: 'codex', sid, file: parent }, root), node);
+    assert.equal(backgroundTargetNode({ agent: 'codex', sid, file: path.join(root, 'elsewhere', `${sid}.jsonl`), node }, root), null);
+    assert.equal(backgroundTargetNode({ agent: 'codex', sid, file: path.join(root, '.keep', 'transcript-mirrors', `${sid}.jsonl`) }, root), null);
+
+    // A Codex child with no mirror yet has no file; with one, the mirror is its file.
+    const codexTarget = { agent: 'codex', sid, file: parent, node };
+    assert.equal(backgroundChildFile(codexTarget, child, root, deps), null);
+    const childMirror = mirror.paths(root, node, child).file;
+    fs.writeFileSync(childMirror, '');
+    assert.equal(backgroundChildFile(codexTarget, child, root, deps), childMirror);
+    assert.equal(localLookups, 0, 'a node target never searches this machine\'s Codex homes');
+
+    // A Claude subagent transcript is not mirrored: no file, even one placed where a
+    // local layout would put it beside the mirror.
+    const claudeTarget = { agent: 'claude', sid, file: parent, node };
+    fs.mkdirSync(path.join(path.dirname(parent), sid, 'subagents'), { recursive: true });
+    fs.writeFileSync(path.join(path.dirname(parent), sid, 'subagents', `agent-${child}.jsonl`), '');
+    assert.equal(backgroundChildFile(claudeTarget, child, root, deps), null);
+    assert.equal(backgroundChildFile(codexTarget, '../outside', root, deps), null);
+
+    // A local target keeps the local paths.
+    const local = path.join(root, 'projects', `${sid}.jsonl`);
+    assert.equal(backgroundChildFile({ agent: 'claude', sid, file: local }, child, root, deps),
+      path.join(root, 'projects', sid, 'subagents', `agent-${child}.jsonl`));
+    assert.equal(backgroundChildFile({ agent: 'codex', sid, file: local }, child, root, deps), localRollout);
+    assert.equal(localLookups, 1);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
 });
 
 test('a refused compaction is recognised from the screen instead of waiting out the timeout', () => {

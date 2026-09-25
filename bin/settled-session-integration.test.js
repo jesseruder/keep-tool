@@ -273,3 +273,61 @@ test('actual dashboard build preserves exact source targets for more than 300 ol
     assert.deepEqual(JSON.parse(child.stdout), expected);
   } finally { fs.rmSync(home, { recursive: true, force: true }); }
 });
+
+test('a session on another node reads its background-job ledger from the daemon\'s mirror', () => {
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-node-mirror-ledger-'));
+  try {
+    const root = path.join(home, 'keep');
+    fs.mkdirSync(path.join(root, 'tasks'), { recursive: true });
+    fs.mkdirSync(path.join(root, 'archive'), { recursive: true });
+    const mirror = require('./transcript-mirror');
+    const node = 'workera';
+    const stamp = `${process.pid}-${Date.now()}`;
+    const mirrored = `node-mirrored-${stamp}`, bare = `node-bare-${stamp}`;
+    const at = new Date().toISOString();
+    const file = mirror.paths(root, node, mirrored).file;
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, [
+      { type: 'user', sessionId: mirrored, timestamp: at, cwd: '/work', message: { content: 'Start the build' } },
+      { type: 'assistant', sessionId: mirrored, timestamp: at,
+        message: { stop_reason: 'end_turn', content: [{ type: 'text', text: 'Started' }] } },
+    ].map(JSON.stringify).join('\n') + '\n');
+    // A ledger holding one open job, as the tick leaves it for a live background shell.
+    writeCleanLedger(root, 'claude', mirrored, file);
+    const ledger = path.join(root, '.keep', 'background-jobs', 'claude', mirrored, 'state.json');
+    const state = JSON.parse(fs.readFileSync(ledger, 'utf8'));
+    state.jobs = { 'job:shell1': { id: 'shell1', kind: 'finite', status: 'running', eventAt: Date.now(), lastCorroboratedAt: Date.now() } };
+    fs.writeFileSync(ledger, JSON.stringify(state));
+    const pane = (id, sid, pid) => ({ id, node, pid, agentPid: pid + 1, alive: true, agentAlive: true, createdAt: at,
+      meta: { sessionId: sid, agent: 'claude', accountId: 'claude/default' } });
+    const panes = [pane(`${node}:pane-1`, mirrored, 10), pane(`${node}:pane-2`, bare, 20)];
+    const script = `
+      require('./bin/summarize').getSummary=()=>({text:null}); require('./bin/titles').applyLiveTitles=()=>{};
+      const serve=require('./bin/serve'),targets=[];
+      const state=serve.buildState({dashboard:true,dashboardWorker:true,hostPanes:${JSON.stringify(panes)},collectBackgroundTargets:targets,
+        collectSummaryRequests:[],collectHealthErrors:[],dashboardRuntime:{health:{},runs:[],usage:null,digest:null}});
+      const row=(id)=>{const s=state.sessions.find(x=>x.id===id);return s&&{node:s.node,backgroundJobs:s.backgroundJobs||null,pendingBackground:s.pendingBackground};};
+      process.stdout.write(JSON.stringify({targets,mirrored:row(${JSON.stringify(mirrored)}),bare:row(${JSON.stringify(bare)})}));
+    `;
+    const child = spawnSync(process.execPath, ['-e', script], { cwd: path.join(__dirname, '..'),
+      env: { ...process.env, HOME: home, KEEP_DIR: root, KEEP_CONFIG: '', KEEP_DAEMON_NODE: 'main' }, encoding: 'utf8', timeout: 20000 });
+    assert.equal(child.status, 0, child.stderr);
+    const result = JSON.parse(child.stdout);
+    const target = result.targets.find((entry) => entry.sid === mirrored);
+    assert.ok(target, 'the node session gets a ledger target');
+    assert.equal(target.file, file, 'the target reads the mirror');
+    assert.equal(target.node, node);
+    assert.equal(target.agent, 'claude');
+    const stat = fs.statSync(file);
+    assert.deepEqual(target.sourceFingerprint, [stat.dev, stat.ino, stat.size, stat.mtimeMs, stat.ctimeMs],
+      'the fingerprint is the mirror\'s own, so an append or a reset wakes the target');
+    assert.equal(target.instance.id, `${node}:pane-1:10:11`);
+    assert.equal(result.mirrored.node, node);
+    assert.equal(result.mirrored.backgroundJobs.pending, true, 'the open job is visible');
+    assert.deepEqual(result.mirrored.backgroundJobs.jobs.map((job) => job.id), ['shell1']);
+    assert.equal(result.mirrored.pendingBackground, true);
+    assert.equal(result.targets.some((entry) => entry.sid === bare), false, 'no mirror, no target');
+    assert.equal(result.bare.node, node);
+    assert.equal(result.bare.backgroundJobs, null);
+  } finally { fs.rmSync(home, { recursive: true, force: true }); }
+});

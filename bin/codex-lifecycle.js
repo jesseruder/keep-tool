@@ -30,11 +30,13 @@ function record(root, input, now = Date.now()) {
 // rollout under the child's id (bin/hook-route.js `child`), and a hook reads it there,
 // but this lookup scans only the local Codex homes. It then finds nothing, and state()
 // falls back on the lifecycle events alone, which expire a SubagentStart the
-// transcript never confirmed after 120 s.
-function childState(id, parent, now) {
+// transcript never confirmed after 120 s. A caller that already knows the child's file
+// (the daemon's background-job tick, which finds a node child's mirror) passes it as
+// `known`, and this machine's Codex homes are not searched.
+function childState(id, parent, now, known) {
   const codex = require('./codex');
-  let resolved = childPaths.get(id);
-  if (!resolved || now - resolved.at >= 30000 || now < resolved.at) {
+  let resolved = known ? { file: known } : childPaths.get(id);
+  if (!known && (!resolved || now - resolved.at >= 30000 || now < resolved.at)) {
     resolved = { file: codex.findRolloutFile(id), at: now };
     childPaths.delete(id);
     childPaths.set(id, resolved);
@@ -79,8 +81,8 @@ function state(root, info, now = Date.now()) {
     lifecycleAgents: pending, pendingBackground: pending.length > 0 };
 }
 
-function inspectChild(id, parent, now = Date.now()) {
-  const child = childState(id, parent, now);
+function inspectChild(id, parent, now = Date.now(), file = null) {
+  const child = childState(id, parent, now, file);
   return child ? { at: child.attentionAt || 0, done: child.endedTurn && !child.toolRunning && !child.pendingBackground } : null;
 }
 module.exports = { record, state, inspectChild };
