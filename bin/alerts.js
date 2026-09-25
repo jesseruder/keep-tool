@@ -463,7 +463,9 @@ async function pollReceipts(options = {}) {
 // inbox entry — appended after delivery — is not in the number it carries.
 function badgeFromState(state) {
   if (!state || typeof state !== 'object') return null;
-  const attention = Array.isArray(state.attention) ? state.attention.length : 0;
+  // A finished unattended turn is listed, not counted: nothing about it waits on Owner.
+  const attention = (Array.isArray(state.attention) ? state.attention : [])
+    .filter((item) => !(item && item.kind === 'finished')).length;
   const unread = (Array.isArray(state.notifications) ? state.notifications : [])
     .filter((entry) => entry && entry.read !== true).length;
   return attention + unread;

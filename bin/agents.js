@@ -146,6 +146,10 @@ function normalizeRecord(name, value = {}) {
     // and markSeen — which rewrites the file anyway — recomputes them from it,
     // which is also how a count that drifted is repaired.
     lastEvent: eventSummary(value.lastEvent),
+    // The newest unseen needs-you, kept beside lastEvent for the same reason: the
+    // "Waiting on you" row it feeds is built on every dashboard pass. Set by emit,
+    // null again once markSeen finds no needs-you unseen.
+    lastNeedsYou: eventSummary(value.lastNeedsYou),
     unseen: {
       count: Math.max(0, Number(unseen.count || 0) || 0),
       needsYou: unseen.needsYou === true,
@@ -233,6 +237,8 @@ function normalizeEvent(event = {}, now = Date.now()) {
     needsYou: value.needsYou === true,
     seenAt: Number(value.seenAt || 0) || 0,
   };
+  // A forced badge is stored only as `true`: absent means "by kind".
+  if (value.badge === true) entry.badge = true; else delete entry.badge;
   for (const field of ['text', 'title', 'signature', 'area', 'permalink']) {
     if (entry[field] != null) entry[field] = oneLine(entry[field], TEXT_MAX);
   }
@@ -429,9 +435,61 @@ function readAfterSeq(name, afterSeq = 0, options = {}) {
   } finally { if (handle !== undefined) { try { fs.closeSync(handle); } catch {} } }
 }
 
+// Which events carry the badge. An agent's feed is its whole log — every pass
+// leaves a `watching` or a `noise` line — and a count that rose on all of them
+// rose every turn, so it said nothing and the one red event that asked for Owner
+// was lost among the grey. The badge counts what the agent DID (an action on
+// production, a diagnosis, a card closed, a fix landed) and what it NEEDS; the
+// rest stays on the feed for the log and never lights the row. `needsYou` always
+// badges, and an emit may pass `badge: true` for a kind outside this list.
+const BADGE_KINDS = new Set(['diagnosed', 'mitigated', 'fixed', 'escalated', 'closed', 'landed', 'decided', 'filed', 'opened', 'needs-you']);
+
+function badges(event) {
+  if (!event || typeof event !== 'object') return false;
+  if (event.needsYou === true || event.badge === true) return true;
+  return BADGE_KINDS.has(String(event.kind || ''));
+}
+
 function unseenSummary(events) {
-  const unseen = (events || []).filter((event) => !event.seenAt);
+  const unseen = (events || []).filter((event) => !event.seenAt && badges(event));
   return { count: unseen.length, needsYou: unseen.some((event) => event.needsYou === true) };
+}
+
+// The newest unseen event that asked for Owner: the text his "Waiting on you"
+// row carries. Null once every needs-you is seen.
+function lastNeedsYou(events) {
+  const pending = (events || []).filter((event) => !event.seenAt && event.needsYou === true);
+  if (!pending.length) return null;
+  return eventSummary(pending.reduce((best, event) => (Number(event.seq || 0) >= Number(best.seq || 0) ? event : best)));
+}
+
+// The rows an agent's unanswered needs-you puts in "Waiting on you". An agent's
+// session never takes a slot there for an ended turn (its row under Agents is its
+// listing) — but a question it asked is exactly the case for one: it is the row
+// Owner triages, it notifies the way a session's question does, and it counts in
+// the badge. `record.lastNeedsYou` is the feed's summary, so no feed is opened
+// here; the row leaves when the feed is marked seen or the row is dismissed.
+function attentionItems(records, options = {}) {
+  const rows = [];
+  for (const record of records || []) {
+    const event = record && record.unseen && record.unseen.needsYou === true ? eventSummary(record.lastNeedsYou) : null;
+    if (!event) continue;
+    const card = event.card || record.card || '';
+    const since = event.at || Number(options.now) || Date.now();
+    rows.push({
+      kind: 'input', pri: 0, agent: record.name,
+      key: `agent:${record.name}:${card}:${event.seq}`,
+      id: `agent:${record.name}`,
+      ...(record.session && record.session.id ? { sessionId: record.session.id } : {}),
+      ...(card ? { taskId: card } : {}),
+      project: record.project || '',
+      title: `${record.name} needs you`,
+      attentionLabel: `Needs you · ${record.name}`,
+      detail: event.text || `${record.name} asked for you${card ? ` on ${card}` : ''}`,
+      since,
+    });
+  }
+  return rows;
 }
 
 function eventLine(event) {
@@ -548,8 +606,12 @@ function emit(name, event = {}, options = {}) {
         const unseen = tail.truncated
           ? { ...summary, needsYou: summary.needsYou || record.unseen.needsYou, truncated: true }
           : summary;
+        // This event when it asks for Owner, else the newest unseen one in the tail;
+        // a needs-you older than the window is carried forward with the colour.
+        const needsYou = entry.needsYou ? eventSummary(entry) : (lastNeedsYou(tail.events) || record.lastNeedsYou || null);
         writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
           ...record, lastEvent: tail.events[0] || entry, unseen, nextSeq: entry.seq + 1,
+          lastNeedsYou: unseen.needsYou ? needsYou : null,
         }));
       } catch (error) { return { ok: true, recordError: error, seqStalled: true }; }
       return { ok: true };
@@ -614,11 +676,13 @@ function markSeen(name, until = Date.now(), options = {}) {
       const rebuilt = eventSummary(last);
       // A `truncated` flag is always cleared here even when the numbers agree:
       // this read saw every event, so the count is exact from now on.
+      const pendingNeedsYou = lastNeedsYou(events);
       if (record.unseen.count !== summary.count || record.unseen.needsYou !== summary.needsYou
           || record.unseen.truncated === true
-          || JSON.stringify(current) !== JSON.stringify(rebuilt)) {
+          || JSON.stringify(current) !== JSON.stringify(rebuilt)
+          || JSON.stringify(eventSummary(record.lastNeedsYou)) !== JSON.stringify(pendingNeedsYou)) {
         writeJsonAtomic(recordFile(name, root), normalizeRecord(name, {
-          ...record, unseen: summary, lastEvent: last,
+          ...record, unseen: summary, lastEvent: last, lastNeedsYou: pendingNeedsYou,
         }));
         markPending(root, name);
       }
@@ -878,6 +942,7 @@ module.exports = {
   validName, nameFromPath, agentsDir, agentDir, recordFile, eventsFile, notesFile,
   readRecord, records, writeRecord, ensure, normalizeRecord, lastFeedSeq,
   emit, markSeen, readEvents, readTail, readAfterSeq, loadEvents, unseenSummary, eventLine, eventSummary, alertText, normalizeEvent,
+  BADGE_KINDS, badges, lastNeedsYou, attentionItems,
   flushCommits, pendingNames,
   areaAgent, incidentEmitter,
   applySessions, agentView, reviewerView, dashboardAgents,

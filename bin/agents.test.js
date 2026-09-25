@@ -153,12 +153,14 @@ test('emit appends, markSeen stamps only what it was asked for, and the feed rea
     assert.deepEqual(agents.readEvents('sandboxes', { root }).map((event) => event.kind),
       ['noise', 'watching', 'diagnosed'], 'newest first');
     assert.deepEqual(agents.readEvents('sandboxes', { root, limit: 1 }).map((event) => event.kind), ['noise']);
-    assert.deepEqual(agents.unseenSummary(agents.loadEvents('sandboxes', root)), { count: 3, needsYou: false });
+    // Only the diagnosis badges: watching and noise are the log, not news.
+    assert.deepEqual(agents.unseenSummary(agents.loadEvents('sandboxes', root)), { count: 1, needsYou: false });
 
     // Everything at or before the cutoff is stamped; the newer event is not.
     const marked = agents.markSeen('sandboxes', 2000, { root, now: 4000 });
     assert.equal(marked.marked, 2);
-    assert.deepEqual({ count: marked.count, needsYou: marked.needsYou }, { count: 1, needsYou: false });
+    assert.deepEqual({ count: marked.count, needsYou: marked.needsYou }, { count: 0, needsYou: false },
+      'the unseen noise event stays on the feed but never counted');
     const after = lines(root, 'sandboxes');
     assert.deepEqual(after.map((event) => event.seenAt), [4000, 4000, 0]);
     assert.deepEqual(agents.readEvents('sandboxes', { root, unseen: true }).map((event) => event.kind), ['noise']);
@@ -166,6 +168,53 @@ test('emit appends, markSeen stamps only what it was asked for, and the feed rea
     assert.equal(agents.markSeen('sandboxes', 2000, { root, now: 5000 }).marked, 0);
     assert.deepEqual(lines(root, 'sandboxes').map((event) => event.seenAt), [4000, 4000, 0]);
     assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 6000 }).marked, 1);
+  } finally { cleanup(root); }
+});
+
+test('the badge counts what the agent did or needs, and a needs-you puts a row in Waiting on you', () => {
+  const root = makeRoot();
+  try {
+    // Kinds: the log never badges, actions and needs do, and --badge forces one.
+    assert.equal(agents.badges({ kind: 'watching' }), false);
+    assert.equal(agents.badges({ kind: 'noise' }), false);
+    assert.equal(agents.badges({ kind: 'delivery-uncertain' }), false);
+    assert.equal(agents.badges({ kind: 'mitigated' }), true);
+    assert.equal(agents.badges({ kind: 'fixed' }), true);
+    assert.equal(agents.badges({ kind: 'anything', needsYou: true }), true);
+    assert.equal(agents.badges({ kind: 'anything', badge: true }), true);
+    assert.equal(agents.normalizeEvent({ kind: 'note', badge: 'yes' }).badge, undefined, 'only a real true is stored');
+    assert.equal(agents.normalizeEvent({ kind: 'note', badge: true }).badge, true);
+
+    agents.ensure('sandboxes', { role: 'incident-responder', project: '/repo', session: { id: 'sid-1' } }, { root });
+    const quiet = () => {};
+    agents.emit('sandboxes', { kind: 'watching', card: 'inc-one', text: 'polling' }, { root, now: 1000, sendAlert: quiet });
+    assert.equal(agents.readRecord('sandboxes', root).unseen.count, 0, 'a watching event lights nothing');
+    assert.equal(agents.readRecord('sandboxes', root).lastNeedsYou, null);
+    assert.deepEqual(agents.attentionItems(agents.records(root)), []);
+
+    agents.emit('sandboxes', { kind: 'needs-you', card: 'inc-one', needsYou: true, text: 'drain the host?' }, { root, now: 2000, sendAlert: quiet });
+    agents.emit('sandboxes', { kind: 'watching', card: 'inc-one', text: 'still waiting' }, { root, now: 3000, sendAlert: quiet });
+    const record = agents.readRecord('sandboxes', root);
+    assert.deepEqual({ count: record.unseen.count, needsYou: record.unseen.needsYou }, { count: 1, needsYou: true });
+    assert.equal(record.lastEvent.kind, 'watching');
+    assert.equal(record.lastNeedsYou.text, 'drain the host?', 'the question survives a later log line');
+    const rows = agents.attentionItems(agents.records(root), { now: 5000 });
+    assert.equal(rows.length, 1);
+    assert.equal(rows[0].kind, 'input');
+    assert.equal(rows[0].pri, 0);
+    assert.equal(rows[0].agent, 'sandboxes');
+    assert.equal(rows[0].sessionId, 'sid-1');
+    assert.equal(rows[0].taskId, 'inc-one');
+    assert.equal(rows[0].detail, 'drain the host?');
+    assert.equal(rows[0].since, 2000);
+    assert.equal(rows[0].key, `agent:sandboxes:inc-one:${record.lastNeedsYou.seq}`);
+
+    // Seen: the row leaves with the colour.
+    agents.markSeen('sandboxes', 9000, { root, now: 9000 });
+    const seen = agents.readRecord('sandboxes', root);
+    assert.equal(seen.unseen.needsYou, false);
+    assert.equal(seen.lastNeedsYou, null);
+    assert.deepEqual(agents.attentionItems(agents.records(root)), []);
   } finally { cleanup(root); }
 });
 
@@ -389,7 +438,9 @@ test('a feed read parses only the end of the file', () => {
 // One line of a feed, exactly `lineBytes` long including its newline, so a test
 // can put the tail window's start on a byte it chose.
 function paddedFeedLine(index, lineBytes) {
-  const event = { at: 1000 + index, kind: `e${index}`, card: '', severity: 'med', needsYou: false, seenAt: 0, text: '' };
+  // `badge: true` so the filler counts: the tests around the tail window are about
+  // a count that is a lower bound, which only badging events can show.
+  const event = { at: 1000 + index, kind: `e${index}`, card: '', severity: 'med', needsYou: false, seenAt: 0, badge: true, text: '' };
   const pad = lineBytes - 1 - JSON.stringify(event).length;
   assert.ok(pad >= 0, `line ${index} does not fit in ${lineBytes} bytes`);
   event.text = 'x'.repeat(pad);
@@ -520,7 +571,8 @@ test('an event that landed keeps its alert and heals the summary on the next emi
     // from the stale record, so it heals instead of drifting further.
     agents.emit('sandboxes', { kind: 'watching', card: 'inc-two', text: 'waiting for the next scrape' }, { root, now: 3000 });
     const record = agents.readRecord('sandboxes', root);
-    assert.deepEqual(record.unseen, { count: 3, needsYou: true }, 'three unseen, not the stale one plus one');
+    assert.deepEqual(record.unseen, { count: 2, needsYou: true },
+      'the diagnosis and the needs-you, rebuilt from the feed rather than the stale one plus one; watching never counts');
     assert.equal(record.lastEvent.kind, 'watching');
     assert.equal(record.lastEvent.at, 3000);
   } finally { cleanup(root); }
@@ -581,8 +633,8 @@ test('a rebuild that saw the whole feed is authority, and clears a stale colour'
 
     agents.emit('sandboxes', { kind: 'watching', card: 'inc-one', text: 'waiting' }, { root, now: 2000 });
     const record = agents.readRecord('sandboxes', root);
-    assert.deepEqual(record.unseen, { count: 2, needsYou: false },
-      'this read saw the whole feed, so it is not carrying anything forward');
+    assert.deepEqual(record.unseen, { count: 1, needsYou: false },
+      'this read saw the whole feed, so it is not carrying anything forward (the watching line never counts)');
     assert.equal(Object.hasOwn(record.unseen, 'truncated'), false);
   } finally { cleanup(root); }
 });
@@ -600,13 +652,13 @@ test('markSeen rewrites and emit appends under one lock each, losing neither wri
       holds.push('enter');
       try { return fn(); } finally { depth -= 1; holds.push('exit'); }
     };
-    agents.emit('sandboxes', { kind: 'one', at: 1000 }, { root, withLock });
-    agents.emit('sandboxes', { kind: 'two', at: 2000 }, { root, withLock });
+    agents.emit('sandboxes', { kind: 'one', at: 1000, badge: true }, { root, withLock });
+    agents.emit('sandboxes', { kind: 'two', at: 2000, badge: true }, { root, withLock });
     // The whole load-stamp-rewrite is one hold: an emit that landed between the
     // read and the rewrite would be erased by it, which is why they share a lock.
     assert.equal(agents.markSeen('sandboxes', 9000, { root, now: 3000, withLock }).marked, 2);
     // A third event arrives after the rewrite and is not lost by it.
-    agents.emit('sandboxes', { kind: 'three', at: 4000 }, { root, withLock });
+    agents.emit('sandboxes', { kind: 'three', at: 4000, badge: true }, { root, withLock });
 
     assert.equal(nested, false, 'no write takes the registry lock twice');
     assert.equal(holds.length, 8, 'one enter/exit pair per write, read-modify-write included');

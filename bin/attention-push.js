@@ -50,8 +50,11 @@ function projectName(state, projectPath) {
 // The console's condition: a top-priority row someone has to answer, that Owner
 // has not set aside. Health, stalled, unblocked and overdue rows are watched in
 // the console, not pushed to a phone.
+// An agent's needs-you row is not pushed from here: `keep agents emit --needs-you`
+// already raised its alert through bin/alerts.js (with that module's quiet hours,
+// dedupe and daily cap), and one question is one push.
 function notifiable(item) {
-  return Boolean(item) && Number(item.pri) === 0 && KINDS.has(item.kind) && !item.setAside;
+  return Boolean(item) && Number(item.pri) === 0 && KINDS.has(item.kind) && !item.setAside && !item.agent;
 }
 
 function notification(state, item) {

@@ -82,6 +82,10 @@ test('only a top-priority answerable row that is not set aside is pushed', (t) =
   assert.deepEqual(sent.map((message) => message.sessionId),
     ['s-question', 's-permission', 's-plan', 's-input']);
   assert.equal(notifiable(waiting({ pri: '0' })), true, 'pri is compared as a number, as the console does');
+  // An agent's needs-you row already pushed through keep alert when it was emitted.
+  assert.equal(notifiable(waiting({ kind: 'input', agent: 'sandboxes' })), false, 'one question is one push');
+  // A finished unattended turn is listed and never pushed.
+  assert.equal(notifiable(waiting({ kind: 'finished', pri: 1 })), false);
 });
 
 test('a key that leaves and returns waits out the dedupe window', (t) => {

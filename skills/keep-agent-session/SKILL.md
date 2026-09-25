@@ -27,7 +27,10 @@ Read all three before you do anything, in that order.
   [--severity low|med|high] -m "one line"`. Event text is a pointer, not a transcript: one
   line, no message bodies.
 - Use `--needs-you` only when Owner must decide or act, and end that turn with the
-  question, because `--needs-you` raises a real alert.
+  question, because `--needs-you` raises a real alert and puts a row in his Waiting on
+  you list. Only what you did (`diagnosed`, `mitigated`, `fixed`, `escalated`, `closed`,
+  `landed`, `decided`, `filed`) or need (`--needs-you`, `--badge`) lights your row;
+  `watching` and `noise` are the log. Your own ended turns never reach Waiting on you.
 
 ## Events arrive by themselves
 

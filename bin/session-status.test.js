@@ -123,6 +123,32 @@ test('historical idle, completed, rate-limited and background work never imply h
   }
 });
 
+test('an unattended session that ends on a statement is finished, not waiting for input', () => {
+  for (const kind of ['claude', 'codex']) {
+    const done = { ...session, kind, pane: 'pane', alive: true, unattended: true, taskStatus: 'active',
+      lastAssistantFull: 'Checked in: nothing moved overnight.' };
+    const status = activity(done);
+    assert.equal(status.state, 'idle');
+    assert.equal(status.label, 'Finished');
+    assert.equal(status.decision.rule, 'unattended-finished');
+    const item = attention(done);
+    assert.equal(item.kind, 'finished');
+    assert.equal(item.pri, 1, 'listed for its result, never pushed or counted');
+    assert.equal(item.attentionLabel, 'Finished');
+    assert.equal(item.detail, 'Checked in: nothing moved overnight.');
+    // What still needs Owner is still pri 0: a prose question, a --handoff needs-input, a pending question.
+    const asked = attention({ ...done, lastAssistantFull: 'Should I drain the host now?' });
+    assert.equal(asked.pri, 0);
+    assert.equal(asked.kind, 'input');
+    assert.equal(asked.attentionLabel, 'Needs an answer');
+    assert.equal(attention({ ...done, pendingQuestion: { question: 'Drain?' } }).kind, 'question');
+    // Nothing changes for a session Owner opened himself.
+    assert.equal(attention({ ...done, unattended: false }).attentionLabel, 'Ready for next instruction');
+    assert.equal(attention({ ...done, endedTurn: false }), null);
+    assert.equal(attention({ ...done, agentName: 'sandboxes' }), null, 'an agent session is still listed only under Agents');
+  }
+});
+
 test('live stopped sessions need a next instruction without a prose question', () => {
   for (const kind of ['claude', 'codex']) {
     const stopped = { ...session, kind, taskStatus: 'active', lastAssistant: 'Reload Keep once with Cmd-R.' };

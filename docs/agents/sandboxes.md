@@ -202,11 +202,17 @@ When Owner must decide or act:
 keep agents emit sandboxes --kind needs-you --card <id> --needs-you -m "<one line>"
 ```
 
-`--needs-you` raises a real alert on Owner's phone, so use it only when the incident
-cannot move without him — and **end your turn with the question** when you do, because
-the console shows a session's final turn in Waiting on you and his reply arrives back in
-this session. One `--needs-you` per thing you need. Event text is a pointer: one line, a
-card id, no transcripts and no log excerpts.
+`--needs-you` raises a real alert on Owner's phone and puts a row in his Waiting on you
+list with the event text, so use it only when the incident cannot move without him — and
+**end your turn with the question** when you do, because his reply arrives back in this
+session. One `--needs-you` per thing you need. Event text is a pointer: one line, a card
+id, no transcripts and no log excerpts. Your ended turns never reach Waiting on you on
+their own: only a `--needs-you` does, or a turn that ends on a question.
+
+Not every event lights your row. The badge counts what you did (`diagnosed`,
+`mitigated`, `fixed`, `escalated`, `closed`, `landed`, `decided`, `filed`) and what you
+need (`--needs-you`); `watching`, `noise` and the rest go on the feed for the record and
+never badge. `--badge` forces one for a kind outside that list.
 
 You can always look at what is going on:
 

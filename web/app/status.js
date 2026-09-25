@@ -1,7 +1,13 @@
-const HUMAN_KINDS = new Set(['question', 'permission', 'plan', 'input']);
+// `finished` is an unattended session's ended turn: listed for what it said, and
+// excluded from the badge and every notification (those key on pri 0).
+const HUMAN_KINDS = new Set(['question', 'permission', 'plan', 'input', 'finished']);
 
 export function humanAttention(data) {
   return (data.attention || []).filter((item) => (item.sessionId || item.taskId || item.pane) && HUMAN_KINDS.has(item.kind));
+}
+
+export function countsTowardBadge(item) {
+  return Boolean(item) && item.kind !== 'finished';
 }
 
 // The daemon publishes hostStatus.ok === false when the terminal host did not

@@ -13019,9 +13019,16 @@ function buildState(options = {}) {
   if (!workerMode) require('./stop-classifier').request(sessions, { onChange });
   const attention = [];
   for (const s of sessions) {
+    // Whether Keep opened this session for a program rather than for Owner, read
+    // off the pane here as addHostSessionState reads it later: the status rules
+    // list such a session's ended turn as finished, not as waiting for input.
+    if (s.unattended === undefined) s.unattended = Boolean(panesBySession.get(s.id)?.meta?.unattended);
     const item = sessionAttentionItem(s, now);
     if (item) attention.push(item);
   }
+  // An agent's unanswered needs-you is the one thing its session puts here: the
+  // row Owner triages, notified and counted like a session's own question.
+  try { attention.push(...agents.attentionItems(agentRecords, { now })); } catch {}
   // A message-less console launch is actionable before Codex registers its session
   // id. Include the pane row before acknowledgement and set-aside reconciliation so
   // Dismiss/Snooze use the same durable lifecycle as session-backed attention.

@@ -287,7 +287,7 @@ keep incidents close <card-id|signature> -m "why"  # close one that will never r
 keep incidents session <area> [--dry] [--json]   # one area-session tick by hand
 keep agents [--json]   # agent records: lifecycle, current session, unseen events
 keep agents events <name> [--unseen] [--limit N] [--json]
-keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"
+keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] [--badge] -m "text"
 keep agents seen <name>
 keep verify <id>       # run a check recipe now, in its thread or a fresh session (needs keep serve)
                        # Owner-initiated: never refused by, and never counted against,
@@ -446,9 +446,17 @@ transcripts when completion hooks are missing and falls back to existing transcr
 tracking for sessions that have not loaded the hooks. Existing Claude sessions may
 need to restart/resume before newly configured hooks take effect.
 
-An agent that needs the owner ends its turn with the question: the console shows every
+An agent that needs the owner ends its turn with the question: the console shows a
 pane's final turn in Waiting on you, and a reply typed there is the answer. Something
 only the owner can supply, and that must outlive the session, is a `keep needs` block.
+A session Keep opened for a program (its pane carries `unattended`: a scheduled check, a
+delegated task, a repair) is the exception since 2026-09-25: its ended turn is listed as
+**Finished** (`kind: finished`, `pri: 1`, the last message as detail) and neither notified,
+pushed nor counted in the badge, because a row that said "waiting for your input" on every
+one of its turns hid the turn that really asked something. A turn that ends on a
+question, a `--handoff needs-input`, or a pending AskUserQuestion is still `pri: 0` and
+still notifies. A standing agent's session is not listed at all; its needs-you is
+(**Needs you**, below).
 
 `when`: `YYYY-MM-DD`, `YYYY-MM-DDTHH:MM`, `+15m`, `+3d`, `+12h`, `+2w`, `tomorrow`.
 
@@ -2020,8 +2028,25 @@ them real has landed, so a feed never holds an event for state that was discarde
 `keep agents emit <name> --needs-you` raises one alert through `bin/alerts.js`:
 `level: 'attention'`, `key: agent:<name>:<card>`, `from: agent:<name>`. Quiet hours and
 the per-key dedupe window are already that module's job, and nothing here adds a second
-throttle. The badge in triage is a summary, not the only channel: a needs-you event both
-alerts and shows up in the row.
+throttle. The badge in triage is a summary, not the only channel: a needs-you event
+alerts, shows up in the row, and — since 2026-09-25 — puts a row in **Waiting on you**
+(`agents.attentionItems`: `kind: input`, `pri: 0`, `agent: <name>`, keyed
+`agent:<name>:<card>:<seq>`, carrying the event text and the agent's session). That row
+notifies on the desktop and counts in the badge like a session's own question; the phone
+push for it is the alert above, not a second one (`attention-push.js` skips rows with
+`agent`). It leaves when the feed is marked seen (opening the agent's row, `keep agents
+seen`) or when it is dismissed. The record keeps `lastNeedsYou`, the newest unseen
+needs-you's summary, for this; markSeen nulls it.
+
+### What badges
+
+An agent's feed is its log, so not every event lights its row. `unseen.count` counts
+only events that badge: any `needsYou`, any kind in `agents.BADGE_KINDS` (`diagnosed`,
+`mitigated`, `fixed`, `escalated`, `closed`, `landed`, `decided`, `filed`, `opened`,
+`needs-you`), and any event emitted with `--badge`. `watching`, `noise`,
+`delivery-uncertain` and every other kind stay on the feed and in the log without
+touching the count — a badge that rose every turn said nothing, and the one red event
+among the grey was the one Owner missed.
 
 ### The Agents section in triage
 

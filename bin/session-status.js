@@ -87,7 +87,16 @@ function activity(session, context = {}) {
   add(model.conversation.waiting, 'conversation-wait', model.conversation.source, 'waiting', `Waiting: ${model.conversation.reason}`, model.conversation.reason, null, model.conversation.confidence, model.conversation.handoff?.at ?? model.foreground.at);
   add(!model.identity.interactive && model.background.pending, 'background-pending', 'background', 'waiting', `Waiting: ${reason}`, reason);
   add(taskStatus !== 'done' && model.task.needs, 'task-needs', 'registry', 'needs-input', 'Needs input', 'requested input', { kind: 'input', detail: (task.needs || []).map((need) => need.text).filter(Boolean).join('\n') });
-  const ready = ended && model.identity.interactive && !model.identity.reviewer;
+  // A session Keep opened for a program (a check, a delegated task, an agent) ends
+  // its turns on statements nobody is meant to answer. Its ended turn is "finished",
+  // listed with what it said but never "waiting for your input": that row notified
+  // on every turn and made a real question, which the rules above still catch
+  // (a prose question, a --handoff needs-input, a pending AskUserQuestion), look
+  // exactly like the last twenty turns that needed nothing.
+  const unattended = session.unattended === true;
+  add(ended && unattended && !model.identity.reviewer, 'unattended-finished', 'conversation', 'idle', 'Finished', 'finished',
+    { kind: 'finished', detail: text }, 'inferred');
+  const ready = ended && model.identity.interactive && !model.identity.reviewer && !unattended;
   const readyRequest = { kind: 'input', detail: 'Ready for your next instruction.' };
   add(ready, 'conversation-ready', 'conversation', 'needs-input', 'Ready for next instruction', 'next instruction', readyRequest, 'inferred');
   add(taskStatus === 'done' && ready, 'completed-task-ready', 'conversation', 'needs-input', 'Ready for next instruction', 'next instruction', readyRequest, 'inferred');
@@ -121,10 +130,13 @@ function attention(session, context) {
       || ((session.exited || session.state === 'exited') && session.retirement?.automatic !== true)) return null;
   const status = context ? activity(session, context) : session.activity || activity(session);
   if (!status.needsInput) return null;
+  // A finished unattended turn is listed for its result and never pushed, counted
+  // or notified: the console, the phone and the badge all key on pri 0.
+  const finished = status.request && status.request.kind === 'finished';
   return {
-    pri: 0, ...status.request, sessionId: session.id, project: session.project,
+    pri: finished ? 1 : 0, ...status.request, sessionId: session.id, project: session.project,
     title: session.title, taskId: session.taskId || undefined, since: session.attentionAt ?? session.mtime,
-    attentionLabel: status.reason === 'next instruction' ? 'Ready for next instruction' : 'Needs an answer',
+    attentionLabel: finished ? 'Finished' : status.reason === 'next instruction' ? 'Ready for next instruction' : 'Needs an answer',
     ...(Number.isFinite(session.lastUserAt) ? { lastUserAt: session.lastUserAt } : {}),
     ...(session.kind === 'codex' ? { codex: true } : {}),
   };

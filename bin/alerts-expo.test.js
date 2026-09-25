@@ -160,6 +160,8 @@ test('the badge is the console formula, and the provider is what the daemon plug
   assert.equal(alerts.badgeFromState(state), 5);
   assert.equal(alerts.badgeFromState(null), null);
   assert.equal(alerts.badgeFromState({}), 0);
+  assert.equal(alerts.badgeFromState({ ...state, attention: [...state.attention, { key: 'd', kind: 'finished' }] }), 5,
+    'a finished unattended turn is listed but not counted');
 
   t.after(() => alerts.setBadgeProvider(null));
   alerts.setBadgeProvider(() => alerts.badgeFromState(state));

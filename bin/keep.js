@@ -3025,8 +3025,8 @@ commands.agents = (argv) => {
   }
 
   if (subcommand === 'emit') {
-    const o = parseArgs(rest, { kind: 'str', card: 'str', severity: 'str', 'needs-you': 'bool' });
-    if (o._.length !== 1) die('usage: keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] -m "text"');
+    const o = parseArgs(rest, { kind: 'str', card: 'str', severity: 'str', 'needs-you': 'bool', badge: 'bool' });
+    if (o._.length !== 1) die('usage: keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] [--badge] -m "text"');
     const name = o._[0];
     if (!agents.validName(name)) die(`bad agent name: ${name}`);
     if (!o.kind) die('keep agents emit needs --kind');
@@ -3034,6 +3034,8 @@ commands.agents = (argv) => {
     const event = agents.emit(name, {
       kind: o.kind, card: o.card || '', severity: o.severity || 'med',
       needsYou: Boolean(o['needs-you']), text: o.m || '',
+      // Only the kinds in agents.BADGE_KINDS light the row; --badge does it for another.
+      ...(o.badge ? { badge: true } : {}),
     }, { root: ROOT });
     if (!event) die(`no agent record for ${name}; nothing was written`);
     agents.flushCommits(ROOT);

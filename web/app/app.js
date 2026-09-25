@@ -8,7 +8,7 @@ import { applyTheme, getPalette, getPreference, onThemeChange, resolvedTheme, se
 import * as api from './api.js';
 import { installActionFeedback } from './action.js';
 import { statusChipState } from './status-chip.js';
-import { humanAttention, sessionLabel, hostOutage, hostOutageText } from './status.js';
+import { humanAttention, countsTowardBadge, sessionLabel, hostOutage, hostOutageText } from './status.js';
 import { createClosingSessions } from './closing-sessions.js';
 import { installInteractionGuard } from './interaction-guard.js';
 import { captureFocusIntent } from './focus-intent.js';
@@ -416,7 +416,7 @@ function projectHTML(projectPath, large = false) {
 function tagsHTML(task) {
   return (task?.fm?.tags || []).map((tag) => `<span class="tagc ${(data.scopes || globalThis.KeepScopeRules.defaults).names.includes(tag) ? 'scope-tag' : ''}">${esc(tag)}</span>`).join('');
 }
-function kindLabel(kind) { return ({ question: 'question', permission: 'permission', rateLimit: 'limit', complete: 'done', input: 'input', plan: 'plan', running: 'running', pinned: 'pinned', recent: 'recent' })[kind] || kind; }
+function kindLabel(kind) { return ({ question: 'question', permission: 'permission', rateLimit: 'limit', complete: 'done', input: 'input', finished: 'finished', plan: 'plan', running: 'running', pinned: 'pinned', recent: 'recent' })[kind] || kind; }
 function limitResumeFor(sessionId) {
   return [...(data.limitResume?.waiting || []), ...(data.limitResume?.stalled || [])].find((row) => row.id === sessionId);
 }
@@ -972,7 +972,7 @@ function renderTop() {
   renderMeters();
   renderNodeStrip();
   renderHealth();
-  const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
+  const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item)) && countsTowardBadge(item)).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
   if (attentionSeeded) attentionSound.update(queueItems()
     .filter((item) => !state.dismissed.has(itemKey(item))).map((item) => soundEventKey(item, sessionFor(item))));
@@ -1378,7 +1378,7 @@ function selectAttention(key) {
 
 function applyStateEffects() {
   const current = new Set((data.attention || []).map(attentionKey));
-  const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item))).length;
+  const count = queueItems().filter((item) => !state.dismissed.has(itemKey(item)) && countsTowardBadge(item)).length;
   setBadge(count + (data.notifications || []).filter((entry) => !entry.read).length);
   if (!attentionSeeded) {
     attentionKeys = current;
