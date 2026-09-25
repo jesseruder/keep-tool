@@ -204,6 +204,11 @@ test('a one-time download link serves one artifact as an attachment for a minute
     assert.deepEqual([...served.body], [0x89, 0x50, 0x4e, 0x47]);
     assert.deepEqual(routeDenial(served.route, null), { status: 403, error: 'forbidden for unauthorized' }, 'still a session route');
   }
+  // An apostrophe is escaped in filename*, or Android drops the whole header.
+  fs.writeFileSync(path.join(root, '.keep', 'artifacts', 'some-card', "it's (1).png"), 'x');
+  const quoted = await post(list, '/api/card-artifact-link', { card: 'some-card', name: "it's (1).png" });
+  const named = await get(list, quoted.value.url, {});
+  assert.equal(named.headers['content-disposition'], `attachment; filename="it's (1).png"; filename*=UTF-8''it%27s%20%281%29.png`);
   const unknown = await get(list, `/api/card-artifact-download?t=${'A'.repeat(43)}`, {});
   assert.equal(unknown.status, 404);
   const malformed = await get(list, '/api/card-artifact-download?t=../../x', {});

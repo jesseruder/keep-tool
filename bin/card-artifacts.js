@@ -122,7 +122,10 @@ async function resolveArtifact(root, card, name, { fsp = fs.promises } = {}) {
 
 function dispositionOf(name, inline) {
   const ascii = name.replace(/[^\x20-\x7e]|["\\]/g, '_');
-  return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encodeURIComponent(name)}`;
+  // RFC 5987 leaves ' ( ) * out of attr-char too; encodeURIComponent does not escape
+  // them, and Android's parser drops a whole header with a bare apostrophe in it.
+  const encoded = encodeURIComponent(name).replace(/['()*]/g, (c) => `%${c.charCodeAt(0).toString(16).toUpperCase()}`);
+  return `${inline ? 'inline' : 'attachment'}; filename="${ascii}"; filename*=UTF-8''${encoded}`;
 }
 
 // Streams the artifact the request names from its checked descriptor, or answers
@@ -201,17 +204,20 @@ function getDestination(name, out, cwd) {
 
 // Writes fetched bytes to a new file, or over one with `force`. Never through a link.
 function writeFetched(destination, bytes, { force = false } = {}) {
+  // O_NONBLOCK: a FIFO named as the destination fails the open instead of hanging it.
   const flags = force
-    ? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW || 0)
+    ? fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_TRUNC | (fs.constants.O_NOFOLLOW || 0) | (fs.constants.O_NONBLOCK || 0)
     : fs.constants.O_WRONLY | fs.constants.O_CREAT | fs.constants.O_EXCL;
   let fd;
   try { fd = fs.openSync(destination, flags, 0o644); }
   catch (error) {
     if (error.code === 'EEXIST') throw new ArtifactError(409, `${destination} already exists; pass --force to replace it`);
     if (error.code === 'ELOOP') throw new ArtifactError(409, `${destination} is a link; refusing to write through it`);
+    if (error.code === 'EISDIR') throw new ArtifactError(409, `${destination} is a directory`);
+    if (error.code === 'ENXIO') throw new ArtifactError(409, `${destination} is not a regular file`);
     throw error;
   }
-  try { fs.writeSync(fd, bytes); } finally { fs.closeSync(fd); }
+  try { fs.writeFileSync(fd, bytes); } finally { fs.closeSync(fd); }
 }
 
 // One artifact's bytes, read from its checked descriptor. Throws ArtifactError.

@@ -4402,7 +4402,7 @@ if (require.main === module) {
       }
       // Its files are on this node: they are read here and their bytes posted to the
       // daemon, which stores them with its own CLI (bin/artifact-route.js).
-      if (remote && cmd === 'artifact' && rest.includes('--get')) {
+      if (remote && cmd === 'artifact' && parseArgs(rest, ARTIFACT_FLAGS).get != null) {
         const result = await artifactGetRemote(rest, remote);
         if (result.stdout) process.stdout.write(result.stdout);
         if (result.stderr) process.stderr.write(result.stderr);
