@@ -342,14 +342,16 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
   const request = deps.request || require('./remote-cli.js').nodeApiRequest;
   const now = deps.now || Date.now;
   const sid = identity.sessionId;
-  // A child's event goes without bytes: the daemon reads the parent's mirror for it,
-  // so the event names its child, which is how the daemon's Codex handlers tell a
-  // child's stop or tool from the parent's when the rollout they read is the parent's.
-  const child = childRollout(event, sid, transcriptPath);
-  if (child) {
-    snapshot = null;
-    if (input && !input.agent_id && /^[A-Za-z0-9_-]{1,160}$/.test(child)) input = { ...input, agent_id: child };
-  }
+  // A child's rollout goes up as the child's own mirror, named in `child` and never
+  // over the parent's, and the event names the child as its agent_id, which is how the
+  // daemon's Codex handlers tell a child's stop or tool from the parent's. An id the
+  // daemon would not take (it takes session-shaped ones) goes without bytes instead.
+  let child = childRollout(event, sid, transcriptPath);
+  if (child && !/^[A-Za-z0-9_-]{1,128}$/.test(child)) { child = ''; snapshot = null; }
+  if (child && input && input.agent_id && input.agent_id !== child) { child = ''; snapshot = null; }
+  if (child && input && !input.agent_id) input = { ...input, agent_id: child };
+  const mirrorId = child || sid;
+  const named = child ? { child } : {};
   const send = async (payload) => {
     const left = deadline - now();
     if (left <= 0) throw new Error('out of time');
@@ -365,19 +367,20 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       if (generation !== snapshot.generation) {
         return { ok: false, retry: false, stale: true, why: 'the transcript was replaced after the event fired' };
       }
-      const cursor = readCursor(env, sid);
+      const cursor = readCursor(env, mirrorId);
       if (from === null) {
         const usable = cursor && cursor.generation === generation && cursor.sent <= stat.size;
         from = usable ? cursor.sent : 0;
         // No cursor to go by (a fresh node home, a lost state directory) and more to
         // send than a first chunk: the daemon's mirror may already hold most of it,
         // so it is asked before the whole transcript goes up again.
-        if (!usable && Math.min(stat.size, snapshot.size) > CHUNK_FIRST) {
+        // The daemon answers that only for a session of its own: a child starts over.
+        if (!usable && !child && Math.min(stat.size, snapshot.size) > CHUNK_FIRST) {
           const held = await mirrorOffset({ request, where, token, sid, generation, size: stat.size,
             timeoutMs: Math.min(MIRROR_ASK_MS, deadline - now()) });
           if (held !== null) {
             from = held;
-            try { writeAtomic(cursorFile(env, sid), { generation, sent: held }); } catch {}
+            try { writeAtomic(cursorFile(env, mirrorId), { generation, sent: held }); } catch {}
           }
         }
       }
@@ -393,7 +396,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       if (from > end) {
         // Never backwards: another hook may have moved it past this one meanwhile.
         if (!cursor || cursor.generation !== generation || cursor.sent < from) {
-          try { writeAtomic(cursorFile(env, sid), { generation, sent: from }); } catch {}
+          try { writeAtomic(cursorFile(env, mirrorId), { generation, sent: from }); } catch {}
         }
         plan = null;
       }
@@ -402,7 +405,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       path: plan.path, generation: plan.generation, fromOffset: start, size: plan.size, mtimeMs: plan.mtimeMs,
       bytes: readRange(plan.path, start, end).toString('base64'),
     });
-    const advance = (sent) => { try { writeAtomic(cursorFile(env, sid), { generation: plan.generation, sent }); } catch {} };
+    const advance = (sent) => { try { writeAtomic(cursorFile(env, mirrorId), { generation: plan.generation, sent }); } catch {} };
     let response;
     try {
       // Every chunk of a long delta but the last goes on its own, each sized to what
@@ -415,7 +418,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
         if (left < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
         const timeoutMs = chunkTimeout(env, size, left, now());
         // Read before the clock starts: a failure here is not the link's.
-        const payload = { event: 'transcript', identity, transcript: piece(from, from + size) };
+        const payload = { event: 'transcript', identity, transcript: piece(from, from + size), ...named };
         const began = now();
         let chunk;
         try {
@@ -453,7 +456,7 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       // The event's own post, when it carries bytes, keeps the chunks' floor: cut off
       // at the deadline it would read as a daemon that does not answer.
       if (plan && plan.end > from && deadline - now() < CHUNK_FLOOR_MS) return { ok: false, retry: true, why: 'out of time' };
-      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key });
+      response = await send({ event, input, identity, transcript: plan ? piece(from, plan.end) : null, idempotencyKey: key, ...named });
     } catch (error) {
       // The request itself failed: the daemon did not answer at all (refused, reset,
       // timed out), which `link` tells apart from a daemon that answered a failure.

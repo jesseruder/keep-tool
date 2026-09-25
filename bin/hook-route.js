@@ -524,9 +524,19 @@ function validateRequest(body, caller, deps) {
   }
   const transcript = cleanTranscript(body.transcript);
   if (agent === 'pi' && transcript) refuse(400, 'a Pi hook carries no transcript');
+  // A Codex child agent's hooks carry its parent's session id. `child` names the child
+  // whose own rollout the post's transcript is: it is mirrored under that id, never over
+  // the parent's, and the hook reads it there, as the daemon node reads the child's
+  // rollout itself. It is never a session the daemon knows as a session of its own.
+  let child = null;
+  if (body.child !== undefined && body.child !== null) {
+    if (agent !== 'codex' || sessionless) refuse(400, 'only a Codex session\'s hook names a child agent');
+    child = matching(body.child, SESSION_RE, 'child');
+    if (child === sessionId) refuse(400, 'a child agent is not its own parent');
+  }
   if (event === TRANSCRIPT_ONLY) {
     if (!transcript) refuse(400, 'a transcript post carries a transcript');
-    return { event, agent, sessionId, accountId, pane, transcript, firedAt, env };
+    return { event, agent, sessionId, accountId, pane, transcript, firedAt, env, child };
   }
   if (sessionless && transcript) refuse(400, 'a client-end without a session carries no transcript');
   if (typeof body.idempotencyKey !== 'string' || !KEY_RE.test(body.idempotencyKey)) {
@@ -536,7 +546,8 @@ function validateRequest(body, caller, deps) {
     ? cleanCodexInput(event, body.input, sessionId, { home: deps.home })
     : agent === 'pi' ? cleanPiInput(event, body.input, sessionId, { home: deps.home })
     : cleanInput(event, body.input, sessionId, { home: deps.home });
-  return { event, agent, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey };
+  if (child && input.agent_id !== child) refuse(400, 'a child agent\'s hook names it as input.agent_id');
+  return { event, agent, sessionId, accountId, pane, transcript, firedAt, env, input, idempotencyKey: body.idempotencyKey, child };
 }
 
 // The transcript is left out: its bytes are applied before the journal is read,
@@ -621,7 +632,7 @@ function createHookService(options = {}) {
     let result;
     try {
       result = mirror.append({
-        root, node: caller, sessionId: request.sessionId, generation: transcript.generation,
+        root, node: caller, sessionId: request.child || request.sessionId, generation: transcript.generation,
         fromOffset: transcript.fromOffset, bytes: transcript.bytes, size: transcript.size,
         mtimeMs: transcript.mtimeMs, sourcePath: transcript.sourcePath, now,
       });
@@ -666,6 +677,11 @@ function createHookService(options = {}) {
           ...(piStart ? { pi: { instance: checked.input.instance, pid: checked.input.pid } } : {}) });
       }
       const request = validateRequest(body, caller, deps);
+      if (request.child) {
+        let located = null;
+        try { located = shared.location(request.child); } catch { located = null; }
+        if (located) refuse(403, `${request.child} is a session of its own, not a child agent`);
+      }
       if (stopping()) return { status: 503, body: { error: 'daemon restarting' } };
       pruneMirrors();
       const scope = request.sessionId || '\0client-end';
@@ -679,7 +695,7 @@ function createHookService(options = {}) {
         // or not this post carried bytes for it. A client-end names no session and
         // reads no transcript, and a Pi hook has none.
         const input = request.sessionId && request.agent !== 'pi'
-          ? { ...request.input, transcript_path: mirror.paths(root, caller, request.sessionId).file } : request.input;
+          ? { ...request.input, transcript_path: mirror.paths(root, caller, request.child || request.sessionId).file } : request.input;
         const hookRequest = { ...request, input };
         const argv = request.agent === 'codex' ? ['hook', 'codex', request.event.slice('codex-'.length)]
           : request.agent === 'pi' ? ['hook', 'pi', request.event.slice('pi-'.length)]

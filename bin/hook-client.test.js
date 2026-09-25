@@ -984,7 +984,7 @@ test('each Codex action is posted as codex-<action> for the Codex session, and t
   assert.equal(daemon.posts.at(-1).body.identity.env, undefined);
 });
 
-test('a Codex child agent\'s event goes without its rollout, and leaves the parent\'s mirror cursor alone', async (t) => {
+test('a Codex child agent\'s rollout goes up as its own mirror, named, and leaves the parent\'s cursor alone', async (t) => {
   const f = fixture(t);
   fs.writeFileSync(f.transcript, `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-aws1' } })}\n`);
   const child = path.join(f.base, 'rollout-child.jsonl');
@@ -992,6 +992,7 @@ test('a Codex child agent\'s event goes without its rollout, and leaves the pare
   const daemon = await stubDaemon(t, () => ran('{}\n'));
   await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { hook_event_name: 'UserPromptSubmit', turn_id: 't1' }));
   assert.equal(daemon.posts[0].body.transcript.path, f.transcript);
+  assert.equal(daemon.posts[0].body.child, undefined, 'the parent\'s own event names no child');
   const cursorFile = path.join(f.home, '.keep-node', 'mirror', 'codex-aws1.json');
   const cursor = fs.readFileSync(cursorFile, 'utf8');
   const result = await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { transcript_path: child, hook_event_name: 'PostToolUse', turn_id: 't2' }));
@@ -999,15 +1000,22 @@ test('a Codex child agent\'s event goes without its rollout, and leaves the pare
   const post = daemon.posts.at(-1).body;
   assert.equal(post.event, 'codex-lifecycle');
   assert.equal(post.identity.sessionId, 'codex-aws1');
-  assert.equal(post.input.agent_id, 'codex-child', 'the daemon reads the parent\'s rollout for it, so the event names its child');
-  assert.equal(post.transcript ?? null, null, 'a child\'s rollout never goes up under its parent\'s id');
+  assert.equal(post.child, 'codex-child', 'the child\'s bytes are named as the child\'s, never the parent\'s');
+  assert.equal(post.input.agent_id, 'codex-child', 'and so is the event');
+  assert.equal(post.transcript.path, child);
+  assert.equal(Buffer.from(post.transcript.bytes, 'base64').toString(), fs.readFileSync(child, 'utf8'));
   assert.equal(fs.readFileSync(cursorFile, 'utf8'), cursor);
+  assert.equal(JSON.parse(fs.readFileSync(path.join(f.home, '.keep-node', 'mirror', 'codex-child.json'), 'utf8')).sent, fs.statSync(child).size);
   // The parent's next event has nothing new to send, rather than its whole rollout again.
   await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { hook_event_name: 'Stop', turn_id: 't1' }));
   const next = daemon.posts.at(-1).body.transcript;
   assert.equal(next.path, f.transcript);
   assert.equal(next.fromOffset, fs.statSync(f.transcript).size);
   assert.equal(next.bytes, '');
+  // A hook that already names another agent is not the child's rollout's: no bytes, no child.
+  await codexRun(f, 'lifecycle', daemon.url, codexInput(f, { transcript_path: child, hook_event_name: 'PostToolUse', agent_id: 'someone-else', turn_id: 't3' }));
+  assert.equal(daemon.posts.at(-1).body.child, undefined);
+  assert.equal(daemon.posts.at(-1).body.transcript ?? null, null);
 });
 
 test('a Codex answer on the node is always JSON: {} for anything else and when the daemon is not there', async (t) => {

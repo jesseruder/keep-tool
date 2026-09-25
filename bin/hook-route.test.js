@@ -1132,6 +1132,50 @@ test('each Codex event runs the daemon\'s keep hook codex <action> on its rebuil
   assert.equal(fs.readFileSync(mirrorFile, 'utf8'), rollout, 'the rollout is mirrored under the node\'s own directory');
 });
 
+test('a Codex child agent\'s rollout is mirrored under its own id, and its hook reads it there', async (t) => {
+  const { hooks, calls, root } = services(t, { answer: () => ({ code: 0, stdout: '{}\n' }) });
+  const dir = path.join(root, '.keep', 'transcript-mirrors', 'aws1');
+  const parentRollout = `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-aws1' } })}\n`;
+  const childRollout = `${JSON.stringify({ type: 'session_meta', payload: { id: 'codex-child', parent_thread_id: 'codex-aws1' } })}\n`;
+  const childPath = '/home/node/.codex/sessions/rollout-codex-child.jsonl';
+  let answer = await hooks.handle(AWS1, codexBody('codex-lifecycle', { hook_event_name: 'UserPromptSubmit', turn_id: 't1' },
+    { transcript: { ...transcript(parentRollout), path: CODEX_ROLLOUT } }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  const post = { hook_event_name: 'PostToolUse', tool_name: 'shell', tool_use_id: 'call-9', agent_id: 'codex-child',
+    tool_input: { command: 'ls' }, repo_facts: NO_FACTS, tool_response: { stdout: '', exit_code: 0 } };
+  answer = await hooks.handle(AWS1, codexBody('codex-post-tool', post,
+    { child: 'codex-child', transcript: { ...transcript(childRollout, { generation: '11:21:31' }), path: childPath } }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(JSON.parse(calls.at(-1).stdin).transcript_path, path.join(dir, 'codex-child.jsonl'), 'the hook reads the child\'s rollout');
+  assert.equal(fs.readFileSync(path.join(dir, 'codex-child.jsonl'), 'utf8'), childRollout);
+  assert.equal(fs.readFileSync(path.join(dir, 'codex-aws1.jsonl'), 'utf8'), parentRollout, 'the parent\'s mirror is untouched');
+  // A child's chunk goes to the child's mirror too.
+  answer = await hooks.handle(AWS1, { event: 'transcript', identity: { agent: 'codex', sessionId: 'codex-aws1', pane: 'p2@aws1' }, child: 'codex-child',
+    transcript: { ...transcript('{"n":2}\n', { generation: '11:21:31', fromOffset: Buffer.byteLength(childRollout), size: Buffer.byteLength(childRollout) + 8 }), path: childPath } });
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(fs.readFileSync(path.join(dir, 'codex-child.jsonl'), 'utf8'), `${childRollout}{"n":2}\n`);
+  // The parent's own event still reads the parent's.
+  answer = await hooks.handle(AWS1, codexBody('codex-lifecycle', { hook_event_name: 'Stop', turn_id: 't1' }, { idempotencyKey: `${KEY}-parent-stop` }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.equal(JSON.parse(calls.at(-1).stdin).transcript_path, path.join(dir, 'codex-aws1.jsonl'));
+
+  const refused = [
+    [{ ...body(), child: 'codex-child' }, 400, /only a Codex session's hook names a child/],
+    [codexBody('codex-post-tool', { ...post, agent_id: 'codex-aws1' }, { child: 'codex-aws1' }), 400, /not its own parent/],
+    [codexBody('codex-post-tool', { ...post, agent_id: 'other' }, { child: 'codex-child' }), 400, /names it as input.agent_id/],
+    [codexBody('codex-post-tool', { ...post, agent_id: 'sess-aws1' }, { child: 'sess-aws1' }), 403, /is a session of its own/],
+    [codexBody('codex-post-tool', post, { child: 'bad id!' }), 400, /invalid child/],
+  ];
+  const ran = calls.length;
+  for (const [request, status, message] of refused) {
+    answer = await hooks.handle(AWS1, request);
+    assert.equal(answer.status, status, JSON.stringify(answer.body));
+    assert.match(answer.body.error, message);
+  }
+  assert.equal(calls.length, ran, 'nothing ran');
+  assert.equal(fs.existsSync(path.join(dir, 'sess-aws1.jsonl')), false, 'another session\'s mirror is never written as a child\'s');
+});
+
 test('a Codex client-end names no session: only its token reaches the hook, and nothing is mirrored', async (t) => {
   const { hooks, calls, root } = services(t, { answer: () => ({ code: 0, stdout: '{}\n' }) });
   const answer = await hooks.handle(AWS1, {
