@@ -61,12 +61,13 @@ test('rail chooser cancels without spawning and freezes one explicit agent launc
 });
 
 test('a session in a worktree offers its main checkout, not the worktree', async ({ page }) => {
+  fixture.state.projectCatalog = { 'castle/proj': { name: 'Proj' } };
   for (const session of fixture.state.sessions) session.project = '/home/tester/wt/proj/some-slug';
   for (const pane of fixture.state.panes) pane.meta = { ...pane.meta, project: '/home/tester/wt/proj/some-slug' };
   fixture.publish();
   await page.reload();
   await page.locator('#rail [data-shell]').click();
-  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/proj');
+  await expect(chooser(page).locator('[data-launch-directory]')).toHaveValue('/home/tester/castle/proj');
 });
 
 test('post-spawn setup error focuses its saved pane and retry cannot duplicate it', async ({ page }) => {
@@ -97,7 +98,7 @@ test('post-spawn setup error focuses its saved pane and retry cannot duplicate i
   expect(fixture.state.sessions.filter(session => session.id.startsWith('opened-'))).toHaveLength(1);
 });
 
-test('Watch new session keeps the selected project and Plain shell option', async ({ page }) => {
+test('Watch new session keeps the selected project and offers Plain shell', async ({ page }) => {
   await page.locator('[data-mode=watch]').click();
   const project = await page.locator('#shellProject').inputValue();
   await page.locator('#spawnShell').click();

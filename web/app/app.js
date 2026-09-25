@@ -73,7 +73,8 @@ function projectOf(projectPath = '') {
   const scope = globalThis.KeepScopeRules.scopeForProject(choice ? canonical : (worktree && known ? '~/' + key : clean), settings, settings.home) || settings.default;
   // The checkout a new session opens in: a worktree's own repo, never the worktree.
   const home = clean.match(/^\/(?:Users|home)\/[^/]+\//)?.[0];
-  const root = worktree ? choice?.path || (home ? home + key : clean) : canonical;
+  // Without the daemon's answer only a catalog key names the repo's own directory.
+  const root = !worktree ? canonical : choice?.path || (!known ? clean : home ? home + key : `~/${key}`);
   return { key, path: clean, root, name, scope, h: known?.h ?? choice?.h ?? hashHue(canonical), icon: known?.icon || choice?.icon, wt: worktree?.[2] || null };
 }
 
@@ -396,7 +397,7 @@ function knownProjects() {
   const add = (projectPath) => {
     if (!projectPath) return;
     const found = projectOf(projectPath);
-    const project = { ...found, path: found.root };
+    const project = { ...found, source: found.path, path: found.root };
     if (!values.has(project.key) || !values.get(project.key).path.startsWith('/')) values.set(project.key, project);
   };
   for (const session of data.sessions || []) add(session.project);
@@ -1052,7 +1053,7 @@ async function refreshProjectChoices() {
       const filteredProject = state.filter && knownProjects().find((project) => project.key === state.filter);
       projectChoices = result.projects;
       // Canonicalizing a newly discovered worktree must preserve the active filter.
-      if (filteredProject) state.filter = projectOf(filteredProject.path).key;
+      if (filteredProject) state.filter = projectOf(filteredProject.source).key;
       refresh();
     }
   } catch { /* Older/offline daemons keep the immediate folder fallback. */ }

@@ -198,16 +198,23 @@ export function renderWatch(ctx) {
   const currentValues = [...projectSelect.options].map((option) => option.value);
   if (values.join('\n') !== currentValues.join('\n')) {
     projectSelect.innerHTML = projects.map((project) => `<option value="${ctx.esc(project.path)}">${ctx.esc(project.name)}</option>`).join('');
-    const restored = [selected, savedShellProject(), values[0]].find((value) => values.includes(value));
+    // A remembered worktree, or a path the daemon has since resolved, stays on its project.
+    const restored = [selected, savedShellProject()].map((value) => shellProjectPath(ctx, projects, value)).find(Boolean) || values[0];
     if (restored) projectSelect.value = restored;
   }
   renderEditor(ctx, layout);
   renderGrid(ctx, layout);
 }
 
+function shellProjectPath(ctx, projects, value) {
+  if (!value) return '';
+  const key = ctx.projectOf(value).key;
+  return projects.find((project) => project.path === value || project.key === key)?.path || '';
+}
+
 export function installWatchControls(ctx) {
   const projectSelect = document.querySelector('#shellProject');
-  const savedProject = savedShellProject();
+  const savedProject = shellProjectPath(ctx, ctx.knownProjects(), savedShellProject());
   if ([...projectSelect.options].some((option) => option.value === savedProject)) projectSelect.value = savedProject;
   projectSelect.addEventListener('change', () => {
     try { localStorage.setItem(SHELL_PROJECT_KEY, projectSelect.value); } catch {}
