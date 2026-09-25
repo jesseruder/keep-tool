@@ -233,10 +233,36 @@ test('renderScreen reads viewport, scrollback, cursor, title, and alternate buff
     const screen = renderScreen(term, { lines: 2, scrollback: 1, title: 'unit' });
     assert.deepEqual(screen.lines, ['one', 'three', 'four']);
     assert.deepEqual(screen.cursor, { x: 4, y: 2 });
+    assert.equal(screen.cursorLine, 2, 'the cursor is on "four", after one scrollback row and "three"');
+    assert.equal(screen.lines[screen.cursorLine], 'four');
     assert.equal(screen.title, 'unit');
     assert.equal(screen.alt, false);
     await writeTerminal(term, '\x1b[?1049hALT');
     assert.equal(renderScreen(term).alt, true);
+  } finally {
+    term.dispose();
+  }
+});
+
+test('renderScreen names the line the cursor is on, and none when that row is not rendered', async () => {
+  const term = new Terminal({ cols: 20, rows: 4, scrollback: 10, allowProposedApi: true });
+  try {
+    // A prompt with a line drawn under it, the cursor back up after the marker, the
+    // way Claude parks it in an empty box.
+    await writeTerminal(term, 'h1\r\nh2\r\nh3\r\nh4\r\nh5\r\nh6\r\n❯ Try it\r\n---\x1b[1A\r\x1b[2C');
+    const screen = renderScreen(term, { scrollback: 2 });
+    assert.equal(screen.lines[screen.cursorLine], '❯ Try it');
+    assert.equal(screen.cursor.x, 2);
+    // Only the last row asked for: the cursor's row is not among the lines.
+    assert.equal(renderScreen(term, { lines: 1 }).cursorLine, null);
+    // A viewport scrolled up into history leaves the cursor below everything rendered.
+    term.scrollLines(-3);
+    const scrolled = renderScreen(term, { scrollback: 1 });
+    assert.equal(scrolled.cursorLine, null);
+    term.scrollToBottom();
+    // The compact snapshot counts from the rows it kept.
+    const compact = renderScreen(term, { scrollback: 2, compact: true });
+    assert.equal(compact.lines[compact.cursorLine], '❯ Try it');
   } finally {
     term.dispose();
   }

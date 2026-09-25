@@ -237,7 +237,7 @@ function createRemoteNodeFleet(t, options = {}) {
           if (type === 'transcript') return nodeTranscriptAnswer(node, params);
           if (type === 'list') return { panes: panesOn(node) };
           if (type === 'get') return { pane: panesOn(node).find((pane) => pane.id === params.pane) || null };
-          if (type === 'screen') return { text: '\u276f \n', cursor: { x: 2, y: 0 } };
+          if (type === 'screen') return { text: '\u276f \n', cursor: { x: 2, y: 0 }, cursorLine: 0 };
           return {};
         },
       };

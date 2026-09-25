@@ -288,10 +288,20 @@ function renderScreen(term, options = {}) {
   const rows = [];
   for (let index = first; index < viewportStart; index += 1) rows.push(trimLine(buffer, index));
   for (let index = visibleStart; index < viewportEnd; index += 1) rows.push(trimLine(buffer, index));
+  // Which of `lines` the cursor is on, or null when its row is not among them. The
+  // rendered text carries no styles, so the cursor is how a reader tells Claude's dim
+  // placeholder in an empty box (cursor right after the marker) from typed text
+  // (cursor at its end); it needs the row as well as the column to know which line.
+  // cursorY counts from the buffer's base, not from a scrolled viewport.
+  const cursorRow = buffer.baseY + buffer.cursorY;
+  let cursorLine = null;
+  if (cursorRow >= first && cursorRow < viewportStart) cursorLine = cursorRow - first;
+  else if (cursorRow >= visibleStart && cursorRow < viewportEnd) cursorLine = (viewportStart - first) + (cursorRow - visibleStart);
   const result = {
     ...(options.compact ? {} : { text: rows.join('\n') }),
     lines: rows,
     cursor: { x: buffer.cursorX, y: buffer.cursorY },
+    cursorLine,
     cols: term.cols,
     rows: term.rows,
     alt: buffer.type === 'alternate',
@@ -312,6 +322,7 @@ function renderScreen(term, options = {}) {
     if (bytes > limit) throw new Error('terminal viewport exceeds history snapshot limit');
     result.lines = rows.slice(removed);
     result.scrollbackLines -= removed;
+    if (cursorLine !== null) result.cursorLine = cursorLine >= removed ? cursorLine - removed : null;
     result.truncated = removed > 0;
   }
   return result;

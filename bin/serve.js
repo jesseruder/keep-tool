@@ -9189,22 +9189,23 @@ async function sendWithoutTranscript(session, target, text, opts, deps = {}) {
   // time to draw before the screen below is read.
   await (deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms))))(FRESH_SEND_SETTLE_MS);
   let screen = '';
-  try { screen = await readScreen(target, 30, false, deps); }
-  catch { throw refuse(`the screen of ${target.pane} could not be read; nothing was sent`); }
+  let screenResult = null;
+  try {
+    screenResult = await readScreenResult(target, 30, false, deps);
+    screen = String(screenResult && screenResult.text || '');
+  } catch { throw refuse(`the screen of ${target.pane} could not be read; nothing was sent`); }
   const plain = stripTerminalAnsi(screen);
   const dialog = claudePrompts.recognize(plain);
   if (claudeTrustScreen(plain) || (dialog && dialog.live) || CLAUDE_TURN_OR_DIALOG_RE.test(plain)) {
     throw refuse(`session ${where} has no transcript yet and ${target.pane} is showing a dialog or a running turn; nothing was sent`, screen);
   }
-  if (!agentPromptVisible('claude', screen)) {
+  if (!agentPromptVisibleIn('claude', screenResult)) {
     throw refuse(`session ${where} has no transcript yet and ${target.pane} does not show Claude's empty prompt; nothing was sent`, screen);
   }
   // The box itself is the bottom-most prompt line, and it must be empty the way
-  // agentPromptVisible reads one: bare, or holding only the dim placeholder, which
+  // agentPromptVisible reads one: bare, or holding only the placeholder, which
   // sendPrecheck would take for a draft. An empty box above a lower draft is not it.
-  const promptRows = String(screen || '').split(/\r?\n/).slice(-10)
-    .filter((line) => /^\s*❯(?:\s|$)/.test(stripTerminalAnsi(line)));
-  if (!promptRows.length || !EMPTY_CLAUDE_PROMPT_RAW.test(promptRows[promptRows.length - 1])) {
+  if (!claudeInputBoxEmpty(screenResult)) {
     throw refuse('the session input box already contains text; clear it in the terminal first', screen);
   }
   const after = await livePaneState(target.pane, deps);
@@ -9372,8 +9373,11 @@ async function resumeAfterLimit(sessionId, text, { hitAt } = {}, deps = {}) {
     const target = claimInjectionTarget(await resolve(session, null));
     // The transcript can say "parked" while the pane says otherwise (a restarted
     // Claude, a shell prompt, a dialog). Only type when the input box is on screen.
-    const screen = await screenOf(target, 30, false);
-    if (!agentPromptVisible('claude', screen)) {
+    // Read as a result where it can be, so the cursor can tell an empty box that holds
+    // the placeholder; a caller's own screen reader answers text alone.
+    const read = deps.readScreen ? null : await readScreenResult(target, 30, false, deps);
+    const screen = read ? String(read.text || '') : await screenOf(target, 30, false);
+    if (!agentPromptVisibleIn('claude', read || screen)) {
       throw new InjectionError(409, 'no Claude prompt visible', { screenTail: screenTail(screen) });
     }
     // Resolving the pane and reading the screen are awaits: the session can have
@@ -9561,19 +9565,72 @@ const EMPTY_CLAUDE_PROMPT_RAW = new RegExp(
   '^(?:\\s|\\x1b\\[[0-?]*[ -/]*[@-~])*'
   + '❯ *(?:\\x1b\\[2m[^\\x1b]*\\x1b\\[22m)?(?:\\s|\\x1b\\[[0-9;]*[mK])*$');
 
+//
+// The host's screen verb, though, renders text with every style dropped, so the dim
+// never reaches the daemon from a real pane. What does is the cursor: in an empty box
+// Claude parks it right after the marker, over the placeholder's first character, and
+// typed text leaves it at the text's end. So a screen *result* (readScreenResult) is
+// also read by its cursor: the bottom-most prompt line holding only text of the
+// placeholder's shape counts as empty when the cursor is on that very line
+// (cursorLine, which the host names) in the column after the marker. An older host
+// answers no cursorLine at all; then the column alone decides, and only for text of
+// the placeholder's shape on the bottom-most prompt line. A cursor anywhere else, or
+// any other text, is a draft.
+const CLAUDE_PLACEHOLDER_LINE = /^(\s*)❯ (Try ".{1,114}")$/;
+
+// Whether line `index` of the screen's lines is an empty Claude box, by its raw style
+// or by where the cursor is.
+function claudePromptLineEmpty(rawLines, index, result = null) {
+  const raw = rawLines[index];
+  if (EMPTY_CLAUDE_PROMPT_RAW.test(raw)) return true;
+  if (!result || !result.cursor) return false;
+  const match = CLAUDE_PLACEHOLDER_LINE.exec(stripTerminalAnsi(raw).replace(/\s+$/, ''));
+  if (!match || Array.from(match[2]).length > 120) return false;
+  if (result.cursor.x !== match[1].length + 2) return false;
+  if (!Object.prototype.hasOwnProperty.call(result, 'cursorLine')) return true;
+  return result.cursorLine === index;
+}
+
 function agentPromptVisible(agent, screen) {
-  const raw = String(screen || '').split(/\r?\n/);
+  return agentPromptVisibleIn(agent, { text: String(screen || '') });
+}
+
+// agentPromptVisible for a screen result ({ text, cursor, cursorLine }), which may also
+// tell an empty box by its cursor (above). A plain string is read as text alone.
+function agentPromptVisibleIn(agent, result) {
+  const answer = result && typeof result === 'object' ? result : { text: String(result || '') };
+  const raw = String(answer.text || '').split(/\r?\n/);
   const lines = raw.map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, ''));
   if (agent === 'codex') return lines.some((line) => line.includes('› Ask Codex to do anything'));
-  const bottom = lines.slice(-12);
-  const bottomRaw = raw.slice(-12);
-  for (let index = bottom.length - 1; index > 0; index -= 1) {
-    if (!EMPTY_CLAUDE_PROMPT_RAW.test(bottomRaw[index])) continue;
+  const offset = Math.max(0, lines.length - 12);
+  const bottomMost = lastClaudePromptIndex(lines);
+  for (let index = lines.length - 1; index > offset; index -= 1) {
+    const cursorWitness = index === bottomMost && Boolean(answer.cursor) ? answer : null;
+    if (!claudePromptLineEmpty(raw, index, cursorWitness)) continue;
     // A named session draws its name into the rule: "──── fable-fleet-reviewer ─".
-    if (/^\s*─{10,}\s*$/.test(bottom[index - 1])
-        || /^\s*─{20,}\s\S[^─]{0,80}\s─\s*$/.test(bottom[index - 1])) return true;
+    if (/^\s*─{10,}\s*$/.test(lines[index - 1])
+        || /^\s*─{20,}\s\S[^─]{0,80}\s─\s*$/.test(lines[index - 1])) return true;
   }
   return false;
+}
+
+// The index of the bottom-most Claude prompt line (`❯` first) in the last 12 of the
+// stripped lines, or -1.
+function lastClaudePromptIndex(lines) {
+  for (let index = lines.length - 1; index >= Math.max(0, lines.length - 12); index -= 1) {
+    if (/^\s*❯(?:\s|$)/.test(lines[index])) return index;
+  }
+  return -1;
+}
+
+// Whether the input box itself, the bottom-most prompt line, is empty: bare, or holding
+// only the placeholder by its style or its cursor. An empty-looking box above a lower
+// draft is not it.
+function claudeInputBoxEmpty(result) {
+  const answer = result && typeof result === 'object' ? result : { text: String(result || '') };
+  const raw = String(answer.text || '').split(/\r?\n/);
+  const index = lastClaudePromptIndex(raw.map((line) => stripTerminalAnsi(line)));
+  return index >= 0 && claudePromptLineEmpty(raw, index, answer.cursor ? answer : null);
 }
 
 // Codex's update notice: "✨ Update available! 0.155.1 -> 0.156.1". In the chat history
@@ -9635,9 +9692,10 @@ const codexNoticeExtra = (notice) => (notice.dialog ? { awaitingDialog: notice.d
 // (the agent may have exited back to a shell), then type like a live delivery.
 async function typeOpeningMessage(target, agent, text, deps = {}) {
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
-  let screen = '';
-  try { screen = await readScreen(target, 30, false, deps); } catch { screen = ''; }
-  if (!agentPromptVisible(agent, screen)) {
+  let result = null;
+  try { result = await readScreenResult(target, 30, false, deps); } catch { result = null; }
+  const screen = String(result && result.text || '');
+  if (!agentPromptVisibleIn(agent, result || screen)) {
     throw new InjectionError(409, `${agent} prompt disappeared from ${target.pane} before the message could be typed`, { screenTail: screenTail(screen) });
   }
   const confirmation = agent === 'codex' ? codexTypedTextVisible : claudeTypedTextVisible;
@@ -9650,8 +9708,10 @@ async function waitForHostAgent(target, agent, deps = {}) {
   let deadline = now() + AGENT_PROMPT_TIMEOUT_MS;
   let screen = '', refusedDialog = null, refusalGrace = false;
   while (now() < deadline) {
-    try { screen = await readScreen(target, 30, false, deps); } catch { screen = ''; }
-    if (agentPromptVisible(agent, screen)) return true;
+    let result = null;
+    try { result = await readScreenResult(target, 30, false, deps); } catch { result = null; }
+    screen = String(result && result.text || '');
+    if (agentPromptVisibleIn(agent, result || screen)) return true;
     if (deps.detectPortableSetup === true) {
       const plain = stripTerminalAnsi(screen);
       const setupKind = CLAUDE_TRUST_MARKERS.some((marker) => plain.includes(marker)) ? 'workspace-trust' : '';
@@ -16367,6 +16427,8 @@ module.exports = {
   start,
   apiRequestAuthError,
   agentPromptVisible,
+  agentPromptVisibleIn,
+  claudeInputBoxEmpty,
   typeOpeningMessage,
   isInjectionBusy,
   withInjectionLock,

@@ -122,6 +122,8 @@ const {
   applySessionLiveness,
   resumeAfterLimit,
   agentPromptVisible,
+  agentPromptVisibleIn,
+  claudeInputBoxEmpty,
   isInjectionBusy,
   withInjectionLock,
   sendToSessionLocked,
@@ -5773,6 +5775,36 @@ test('an empty Claude prompt may carry the dim placeholder suggestion, and typed
   assert.equal(agentPromptVisible('claude', box('\x1b[2m❯ Try "fix typecheck errors"\x1b[22m\x1b[K')), false,
     'a dim span opened before the marker is not the placeholder');
   assert.equal(agentPromptVisible('claude', `Loading\n${placeholder}\n`), false, 'no rule above, no prompt');
+});
+
+test('a real host screen carries no styles, so the placeholder is told by the cursor sitting after the marker', () => {
+  const rule = '─'.repeat(30);
+  // What the host's screen verb answers: plain text, and the cursor with the index of
+  // its line among the rendered lines.
+  const lines = ['Welcome to Claude Code', '', rule, '❯ Try "fix typecheck errors"', rule, '  keep  (main)  ctx:4%'];
+  const result = (cursor, cursorLine, rows = lines) => ({
+    text: rows.join('\n'), lines: rows, cursor, ...(cursorLine === undefined ? {} : { cursorLine }),
+  });
+  assert.equal(agentPromptVisible('claude', lines.join('\n')), false, 'the text alone cannot tell it from a draft');
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3)), true, 'the cursor after the marker, on that line');
+  assert.equal(claudeInputBoxEmpty(result({ x: 2, y: 3 }, 3)), true);
+  const typedEnd = { x: '❯ Try "fix typecheck errors"'.length, y: 3 };
+  assert.equal(agentPromptVisibleIn('claude', result(typedEnd, 3)), false, 'the cursor at the end of the text: typed');
+  assert.equal(claudeInputBoxEmpty(result(typedEnd, 3)), false);
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 5 }, 5)), false, 'column 2 on another line');
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, null)), false, 'a cursor row the host did not render');
+  // An older host names no cursorLine: the column decides, for placeholder text only.
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 })), true);
+  const typed = lines.map((line) => (line.startsWith('❯') ? '❯ fix the typecheck errors' : line));
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, undefined, typed)), false, 'typed text is not the placeholder');
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3, typed)), false);
+  // The bare box and the styled placeholder still count, with or without a cursor.
+  const bare = lines.map((line) => (line.startsWith('❯') ? '❯' : line));
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3, bare)), true);
+  assert.equal(agentPromptVisibleIn('claude', 'x\n' + rule + '\n\x1b[39m❯ \x1b[2mTry "it"\x1b[22m\x1b[K'), true);
+  // Under a named session's rule.
+  const named = lines.map((line, index) => (index === 2 ? '──────────────────── fable-fleet-reviewer ─' : line));
+  assert.equal(agentPromptVisibleIn('claude', result({ x: 2, y: 3 }, 3, named)), true);
 });
 
 function checkDeliveryFixture(fm, sessions, closed = []) {

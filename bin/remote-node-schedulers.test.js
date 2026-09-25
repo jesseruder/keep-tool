@@ -316,6 +316,24 @@ test('review: a message to a reviewer on the node is gated on the node\'s own re
 const RULE = '─'.repeat(60);
 const emptyPrompt = (draft = '') => `Claude Code\n${RULE}\n❯ ${draft}\n${RULE}\n`;
 
+// A screen answer the way the real host renders one: plain lines, and the cursor with
+// the index of its line (cursorLine). The cursor sits in the bottom-most prompt line,
+// right after the marker when the box holds only the placeholder (nothing typed yet),
+// else at the end of the text.
+function screenAnswer(text, state) {
+  const lines = String(text).split('\n');
+  const plain = lines.map((line) => line.replace(/\x1b\[[0-?]*[ -/]*[@-~]/g, '').replace(/\s+$/, ''));
+  let cursorLine = null;
+  for (let index = plain.length - 1; index >= 0 && cursorLine === null; index -= 1) {
+    if (/^\s*❯/.test(plain[index])) cursorLine = index;
+  }
+  if (cursorLine === null) return { text, lines, cursor: { x: 0, y: 0 }, cursorLine: null };
+  const line = plain[cursorLine];
+  const placeholder = !state.draft && /^\s*❯ Try "/.test(line);
+  const x = placeholder ? line.indexOf('❯') + 2 : Math.max(line.indexOf('❯') + 2, line.length);
+  return { text, lines, cursor: { x, y: cursorLine }, cursorLine };
+}
+
 function freshPaneHosts(fleet, { screen = emptyPrompt, list = null, answer = () => undefined, input = null } = {}) {
   const state = { draft: '', submitted: [], ordinary: [], inputs: 0 };
   const awsPanes = () => fleet.all.filter((session) => session.node === 'aws1').map((session) => {
@@ -327,7 +345,7 @@ function freshPaneHosts(fleet, { screen = emptyPrompt, list = null, answer = () 
     if (answered !== undefined) return answered;
     if (node !== 'aws1') return undefined;
     if (type === 'list' && list) return { panes: list(awsPanes(), state) };
-    if (type === 'screen') return { text: screen(state.draft, state), cursor: { x: 2, y: 2 } };
+    if (type === 'screen') return screenAnswer(screen(state.draft, state), state);
     if (type === 'input') {
       state.inputs += 1;
       const custom = input ? input(params, state) : undefined;
@@ -545,6 +563,15 @@ test('send: a fresh session\'s box holding only Claude\'s dim placeholder is emp
   const fresh = await send((draft) => (draft ? emptyPrompt(draft) : `Claude Code\n${RULE}\n${placeholder}\n${RULE}\n`), 'past the placeholder');
   assert.equal((await fresh.result).transcriptPending, true);
   assert.deepEqual(fresh.fake.state.submitted, ['past the placeholder']);
+  // What a real host answers: no styles at all, the cursor right after the marker.
+  const plainPlaceholder = '❯ Try "fix typecheck errors"';
+  const unstyled = await send((draft) => (draft ? emptyPrompt(draft) : `Claude Code\n${RULE}\n${plainPlaceholder}\n${RULE}\n`), 'on a real host');
+  assert.equal((await unstyled.result).transcriptPending, true);
+  assert.deepEqual(unstyled.fake.state.submitted, ['on a real host']);
+  // The same text with the cursor at its end is a draft someone typed.
+  const typedLike = await send((draft, state) => { state.draft = draft || 'typed'; return `Claude Code\n${RULE}\n${plainPlaceholder}\n${RULE}\n`; }, 'not over it');
+  await assert.rejects(typedLike.result, /does not show Claude's empty prompt|already contains text/);
+  assert.equal(typedLike.fake.state.inputs, 0);
   // An empty-looking box drawn above the real one, which holds a draft.
   const drafted = await send(() => `${RULE}\n${placeholder}\n${RULE}\n❯ half a sentence\n${RULE}\n`, 'over a draft');
   await assert.rejects(drafted.result, /the session input box already contains text/);
