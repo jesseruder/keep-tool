@@ -9,7 +9,7 @@ const { spawnSync } = require('node:child_process');
 
 const { routes, matchRoute, routeDenial } = require('./serve/routes.js');
 const { createRegistryService } = require('./registry-route.js');
-const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, openExtraMs, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
+const { REGISTRY_COMMANDS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, openExtraMs, argumentRefusal, forwardedWaitMs, nodeSideRefusal } = require('./registry-commands.js');
 const ME = { session: 'sess-aws1', node: 'aws1' };
 
 const AWS1 = { class: 'node', node: 'aws1' };
@@ -446,6 +446,52 @@ test('a resend of an open still in flight waits for it and is answered with its 
   assert.deepEqual([a.status, a.body.stdout, a.body.replayed], [200, 'opened\n', false]);
   assert.deepEqual([b.status, b.body.stdout, b.body.replayed], [200, 'opened\n', true]);
   assert.equal(calls.length, 1);
+});
+
+test('an open\'s bound is capped well inside the journal\'s lifetime', (t) => {
+  const { JOURNAL_TTL_MS, TIMEOUT_MS } = require('./registry-route.js');
+  assert.ok(MAX_OPEN_EXTRA_MS < JOURNAL_TTL_MS);
+  assert.equal(MAX_OPEN_EXTRA_MS, JOURNAL_TTL_MS / 2);
+  const env = { KEEP_COMPACT_TIMEOUT_MS: String(4 * 24 * 3600e3) };
+  assert.equal(openExtraMs(env), MAX_OPEN_EXTRA_MS, 'a four-day compaction timeout gets the cap, not eight days');
+  assert.equal(openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '1e15' }), MAX_OPEN_EXTRA_MS);
+  assert.equal(service(t, { env }).svc.maxRunMs(), TIMEOUT_MS + MAX_OPEN_EXTRA_MS, 'the ping advertises the cap');
+  assert.ok(TIMEOUT_MS + MAX_OPEN_EXTRA_MS < JOURNAL_TTL_MS);
+});
+
+// A run longer than the journal's lifetime keeps its started record: a resend after
+// a crash must find it. A finished entry past the lifetime is still pruned.
+test('the journal never prunes a run still in flight, and still prunes an old finished one', async (t) => {
+  const { JOURNAL_TTL_MS } = require('./registry-route.js');
+  const root = tempDir(t);
+  let offset = 0;
+  const fake = fakeSpawn((call) => (call.args[1] === 'open' ? 'hang' : { code: 0, stdout: 'shown\n' }));
+  const original = fake.spawn;
+  const opens = [];
+  fake.spawn = (...args) => { const child = original(...args); if (args[1][1] === 'open') opens.push(child); return child; };
+  const svc = createRegistryService({
+    root, spawn: fake.spawn, daemonNode: () => 'main', now: () => Date.now() + offset,
+    location: (id) => (id === 'sess-aws1' ? { node: 'aws1', agent: 'claude' } : null),
+    env: { PATH: '/usr/bin:/bin', HOME: root, LANG: 'C' }, configFile: path.join(root, 'config.json'),
+  });
+  const entries = () => fs.readdirSync(svc.journalDir).length;
+  const shown = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(shown.status, 200);
+  const request = body(root, { command: 'open', args: ['card', '--fresh'], idempotencyKey: `${KEY}-open` });
+  const first = svc.handle(AWS1, request);
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(opens.length, 1);
+  assert.equal(entries(), 2, 'the finished show and the open\'s started record');
+  offset = JOURNAL_TTL_MS + 3600e3;
+  const resend = svc.handle(AWS1, request);
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(entries(), 1, 'the old finished entry was pruned, the running one kept');
+  assert.equal(opens.length, 1, 'the resend started nothing');
+  opens[0].stdout.emit('data', Buffer.from('opened\n'));
+  opens[0].emit('close', 0, null);
+  const [a, b] = await Promise.all([first, resend]);
+  assert.deepEqual([a.status, a.body.stdout, a.body.replayed], [200, 'opened\n', false]);
+  assert.deepEqual([b.status, b.body.stdout, b.body.replayed], [200, 'opened\n', true]);
 });
 
 test('a project named relative to the node\'s directory is refused; absolute, ~ and bare names are not', () => {

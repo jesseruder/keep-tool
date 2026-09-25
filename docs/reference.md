@@ -1621,7 +1621,8 @@ daemon knows, not the caller's own. The daemon picks the account and model as fo
 open typed on its own node. A forwarded open may run twelve minutes past the ordinary
 bound, the longest an open can take (a reopen waits for the prompt and may compact the
 session first), and longer on a daemon whose `KEEP_COMPACT_TIMEOUT_MS` is raised,
-since the daemon sizes the bound from its own setting. Each of the node's posts waits
+since the daemon sizes the bound from its own setting (at most three and a half days,
+half the week its journal keeps the entry that answers a resend). Each of the node's posts waits
 the twelve minutes; when one times out and the daemon still answers its ping, the node
 says the command is still running and resends the same key, which the one run answers.
 It keeps resending while the daemon answers, for as long as the daemon says a command

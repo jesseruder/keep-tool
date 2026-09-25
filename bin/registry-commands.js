@@ -281,16 +281,23 @@ const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
 // than proceed.
 const OPEN_EXTRA_MS = 12 * 60e3;
 const OPEN_MARGIN_MS = 135e3;
+// The most an open's bound may grow to, whatever the compaction timeout: half of
+// registry-route JOURNAL_TTL_MS (seven days), which it must stay under. A resend
+// long after the first post needs the run's journal entry to answer it, so a
+// compaction timeout large enough to go past this is refused a longer bound rather
+// than given one that outlives the journal.
+const MAX_OPEN_EXTRA_MS = 3.5 * 24 * 3600e3;
 const DEFAULT_COMPACT_TIMEOUT_MS = 240e3;
 
 // The open bound for a daemon whose environment is `env`: the waits above with its
 // KEEP_COMPACT_TIMEOUT_MS read the way serve.js envNumber reads it (a finite,
-// non-negative number, else the 240 s default), and never below OPEN_EXTRA_MS.
+// non-negative number, else the 240 s default), never below OPEN_EXTRA_MS and never
+// above MAX_OPEN_EXTRA_MS.
 function openExtraMs(env = {}) {
   const configured = Number(env.KEEP_COMPACT_TIMEOUT_MS);
   const compactMs = Number.isFinite(configured) && configured >= 0 ? configured : DEFAULT_COMPACT_TIMEOUT_MS;
   const longest = 45e3 + 15e3 + (compactMs + 30e3) + compactMs + 15e3;
-  return Math.max(OPEN_EXTRA_MS, longest + OPEN_MARGIN_MS);
+  return Math.min(MAX_OPEN_EXTRA_MS, Math.max(OPEN_EXTRA_MS, longest + OPEN_MARGIN_MS));
 }
 
 // `env` is the daemon's own environment, passed only by the daemon's route: a node's
@@ -347,4 +354,4 @@ function requestedWaitMs(command, args) {
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
-module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, openExtraMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REGISTRY_COMMANDS, COMMAND_FLAGS, INSTRUCTION_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, openExtraMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

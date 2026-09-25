@@ -194,7 +194,10 @@ function createRegistryService(options = {}) {
   }
 
   // Lazily, at most hourly: an entry exists to answer a retry, and a retry a week
-  // late is not one.
+  // late is not one. Never a run still in flight here, however old its started
+  // record: while it runs, that record is the only witness a resend after a crash
+  // would find, and without it the command would run again. A started record left by
+  // a daemon that died is not in flight in this one and is pruned as before.
   function prune() {
     if (now() - prunedAt < PRUNE_EVERY_MS) return;
     prunedAt = now();
@@ -202,6 +205,7 @@ function createRegistryService(options = {}) {
     try { names = io.readdirSync(journalDir); } catch { return; }
     for (const name of names) {
       const file = path.join(journalDir, name);
+      if (inflight.has(file)) continue;
       try { if (now() - io.statSync(file).mtimeMs > JOURNAL_TTL_MS) io.unlinkSync(file); } catch {}
     }
   }
