@@ -8,14 +8,16 @@ import { numLabel } from './session-number.js';
 
 // `#` then digits, standing alone: not `repo#12`, `&#39;`, `a/#3` or `##4`, and not
 // a hex colour or anchor like `#123abc`. A GitHub reference reads the same, so a
-// number right after PR/issue/pull/MR is left alone even when a session has it.
+// number right after PR/issue/pull request/MR (`PR #12`, `PR: #12`, `issue (#12)`)
+// is left alone even when a session has it, and so is an all-digit colour after
+// color/fill/background (`color: #123456`).
 const REF = /#(\d{1,6})(?![\w-])/g;
-const NOT_SESSION = /(?:\b(?:prs?|pull|pulls|issues?|mr|bug|ticket)\s*$|[\w#&/]$)/i;
+const NOT_SESSION = /(?:\b(?:prs?|pull(?:\s+requests?)?|pulls|issues?|mrs?|bugs?|tickets?|colou?r|fill|stroke|background|bg)[\s:=("'`]*$|[\w#&/=]$)/i;
 
 export function findSessionRefs(text) {
   const refs = [];
   for (const match of String(text || '').matchAll(REF)) {
-    const before = text.slice(Math.max(0, match.index - 12), match.index);
+    const before = text.slice(Math.max(0, match.index - 24), match.index);
     if (NOT_SESSION.test(before)) continue;
     const num = Number(match[1]);
     if (num >= 1) refs.push({ num, start: match.index, end: match.index + match[0].length });
@@ -73,10 +75,11 @@ export function sessionCardHTML(esc, info, { openHint = true } = {}) {
     + (openHint ? `<div class="sl-hint">${/Mac/.test(globalThis.navigator?.platform || '') ? '⌘' : 'Ctrl'}-click to open</div>` : '');
 }
 
-// Registers the provider on one xterm. `lookup(num)` answers the hover card's
-// fields for a known session or null; a number no session has is left as text, so
-// ordinary `#3` in prose does not light up.
-export function installSessionLinks(terminal, { lookup, open, esc, doc = globalThis.document } = {}) {
+// Registers the provider on one xterm. `has(num)` says whether a session holds the
+// number, and is asked for every reference on every row the pointer crosses, so it
+// must be cheap; a number no session has is left as text, so ordinary `#3` in prose
+// does not light up. `lookup(num)` builds the hover card's fields, only on hover.
+export function installSessionLinks(terminal, { has, lookup, open, esc, doc = globalThis.document } = {}) {
   let pop = null;
   const hide = () => { pop?.remove(); pop = null; };
   const show = (event, info) => {
@@ -99,8 +102,7 @@ export function installSessionLinks(terminal, { lookup, open, esc, doc = globalT
       const { text, columns } = lineCells(buffer.getLine(y - 1), terminal.cols);
       const links = [];
       for (const ref of findSessionRefs(text)) {
-        const info = lookup(ref.num);
-        if (!info) continue;
+        if (!has(ref.num)) continue;
         links.push({
           range: { start: { x: columns[ref.start] + 1, y }, end: { x: columns[ref.end - 1] + 1, y } },
           text: text.slice(ref.start, ref.end),
@@ -110,9 +112,12 @@ export function installSessionLinks(terminal, { lookup, open, esc, doc = globalT
             hide();
             open(ref.num);
           },
-          // Read the row again at hover time: a session's status moves on while the
-          // same line sits on screen.
-          hover(event) { show(event, lookup(ref.num) || info); },
+          // Read at hover time: a session's status moves on while the same line
+          // sits on screen.
+          hover(event) {
+            const info = lookup(ref.num);
+            if (info) show(event, info);
+          },
           leave: hide,
         });
       }
@@ -121,5 +126,7 @@ export function installSessionLinks(terminal, { lookup, open, esc, doc = globalT
   });
   const scroll = terminal.onScroll(hide);
   const key = terminal.onKey(hide);
-  return { dispose() { hide(); provider.dispose(); scroll.dispose(); key.dispose(); } };
+  // hide() is for the terminal going out of view: a detached xterm sends no
+  // mouseleave, and the card lives on document.body, outside it.
+  return { hide, dispose() { hide(); provider.dispose(); scroll.dispose(); key.dispose(); } };
 }

@@ -783,12 +783,22 @@ async function removePane(pane) {
   await dropPane(pane);
 }
 // `#n` in any terminal names a session: the hover card and ⌘-click read the
-// console's current rows, so they follow the session as it moves on.
+// console's current rows, so they follow the session as it moves on. xterm asks
+// about every reference on each row the pointer crosses, so the numbers are indexed
+// once per published session list rather than scanned per question.
+let sessionNumIndex = { sessions: null, byNum: new Map() };
 function sessionByNum(num) {
-  return (data.sessions || []).find((session) => session.num === num && !isClosingSession(session.id, session.pane)) || null;
+  if (sessionNumIndex.sessions !== data.sessions) {
+    const byNum = new Map();
+    for (const session of data.sessions || []) if (Number.isInteger(session?.num)) byNum.set(session.num, session);
+    sessionNumIndex = { sessions: data.sessions, byNum };
+  }
+  const session = sessionNumIndex.byNum.get(num);
+  return session && !isClosingSession(session.id, session.pane) ? session : null;
 }
 const sessionLinks = {
   esc,
+  has: (num) => Boolean(sessionByNum(num)),
   lookup: (num) => describeSession(sessionByNum(num), {
     tasks: data.tasks, rel, statusOf: sessionLabel,
     projectName: (path) => projectOf(path).name,

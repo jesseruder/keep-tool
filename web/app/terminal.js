@@ -733,6 +733,7 @@ export function mountTerminal(container, pane, options = {}) {
       showFrame = 0;
       stopObserving();
       disposeWebgl();
+      sessionLinks?.hide();
     },
     syncVisibility() {
       if (document.hidden) profiler.stop('hidden');
@@ -742,6 +743,7 @@ export function mountTerminal(container, pane, options = {}) {
       else {
         stopObserving();
         disposeWebgl();
+        sessionLinks?.hide();
       }
     },
     dispose() {

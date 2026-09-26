@@ -15,6 +15,9 @@ test('GitHub references, repo refs, entities and hex are not sessions', () => {
   assert.deepEqual(nums('PR #12 and pr#13, issue #14, pull #15, MR #16'), []);
   assert.deepEqual(nums('castle-www#88 a/#3 ##4 &#39;'), []);
   assert.deepEqual(nums('color #123abc, anchor #12-top, #0'), []);
+  assert.deepEqual(nums('PR: #12, issue (#13), pull request #14, see issues #15'), []);
+  assert.deepEqual(nums('color: #123456; fill="#123" background:#1234 x=#5'), []);
+  assert.deepEqual(nums('(#12) and "#13" after #14:'), [12, 13, 14]);
 });
 
 // A fake xterm buffer line: one entry per cell, width 2 cells carry a 0-width tail.
@@ -59,7 +62,7 @@ test('only numbers a session holds become links, and only ⌘/Ctrl-click opens',
   };
   const opened = [];
   const handle = installSessionLinks(terminal, {
-    esc, lookup: (num) => (num === 5 ? { num, title: 'five' } : null), open: (num) => opened.push(num),
+    esc, has: (num) => num === 5, lookup: (num) => (num === 5 ? { num, title: 'five' } : null), open: (num) => opened.push(num),
   });
   let links;
   provider.provideLinks(3, (value) => { links = value; });
@@ -70,6 +73,7 @@ test('only numbers a session holds become links, and only ⌘/Ctrl-click opens',
   assert.deepEqual(opened, []);
   links[0].activate({ metaKey: true });
   assert.deepEqual(opened, [5]);
+  assert.equal(typeof handle.hide, 'function');
   handle.dispose();
   assert.deepEqual(disposed.sort(), ['key', 'provider', 'scroll']);
 });
