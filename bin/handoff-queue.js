@@ -411,6 +411,7 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
   // The live pane wins over the recorded one: the session may have been reopened
   // since it was queued, and the transfer must name the pane it is in now.
   const pane = session.pane || entry.pane;
+  const parkedStop = nodes.isRemotePane(pane) && Boolean(entry.sourceAccountId) && entry.rateLimitAt != null;
   let reason = '';
   try {
     const result = await deps.handoffSession({
@@ -419,11 +420,13 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
       accountId: entry.targetAccountId,
       intent: 'continue',
       ...(entry.force === true ? { force: true } : {}),
-      // The parked stop is only ever sent with the source account named (below), and,
-      // unless the transaction is past its stop and has nothing left to stop, with the
-      // limit too (normalize requires both of the entry); account-handoff refuses it
-      // otherwise.
-      ...(entry.parkedForce === true && entry.sourceAccountId && entry.rateLimitAt != null ? { parkedForce: true } : {}),
+      // The stop follows the pane the session is in now, not the one it was queued
+      // from: a session that moved back to this machine during a backoff stops
+      // gracefully, and one that moved to a node needs the parked stop. That stop is
+      // only ever sent with the source account and the limit named (below; a
+      // transaction past its stop omits the limit, which account-handoff allows only
+      // for a record past its stop).
+      ...(parkedStop ? { parkedForce: true } : {}),
       // Belt and braces for the checks above: the transfer re-resolves both
       // itself, before it writes a record or stops anything, so a snapshot this
       // queue read a moment too early cannot move a session that has moved on.

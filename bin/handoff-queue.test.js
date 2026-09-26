@@ -389,6 +389,33 @@ test('a rate-limited session on another node is queued for the parked stop, and 
   assert.equal(queue.readOne(f.root, 'session-far-2'), null, 'the batch itself never queues a node session');
 });
 
+test('the stop an attempt asks for follows the pane the session is in now, not the one it was queued from', async () => {
+  const f = fixture();
+  const asked = [];
+  const refuse = async (body) => { asked.push(body); throw Object.assign(new Error('another session injection is busy'), { status: 409 }); };
+  // Queued on aws1, back on this machine by the next attempt: the graceful stop, still
+  // with the source and limit named.
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1@aws1', sourceAccountId: 'one', targetAccountId: 'two',
+    rateLimitAt: T, parkedForce: true }, { now: T, log: () => {} });
+  await queue.tick(tickDeps(f, refuse, { sessions: async () => [session({ pane: 'pane-9' })] }));
+  assert.deepEqual(asked.at(-1), { sessionId: 'session-a', pane: 'pane-9', accountId: 'two', intent: 'continue',
+    expectedSourceAccountId: 'one', expectedRateLimitAt: T });
+  // Queued here, on aws1 by the next attempt: the parked stop, with both expectations.
+  queue.cancel(f.root, 'session-a', { now: T, log: () => {} });
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two',
+    rateLimitAt: T }, { now: T, log: () => {} });
+  await queue.tick(tickDeps(f, refuse, { sessions: async () => [session({ pane: 'pane-4@aws1', node: 'aws1' })] }));
+  assert.deepEqual(asked.at(-1), { sessionId: 'session-a', pane: 'pane-4@aws1', accountId: 'two', intent: 'continue',
+    parkedForce: true, expectedSourceAccountId: 'one', expectedRateLimitAt: T });
+  // An entry that names no limit is never sent the parked stop, wherever the session is;
+  // account-handoff refuses a node transfer without it, and the entry parks for a person.
+  queue.cancel(f.root, 'session-a', { now: T, log: () => {} });
+  queue.enqueue(f.root, { sessionId: 'session-a', pane: 'pane-1', sourceAccountId: 'one', targetAccountId: 'two' },
+    { now: T, log: () => {} });
+  await queue.tick(tickDeps(f, refuse, { sessions: async () => [session({ pane: 'pane-4@aws1', node: 'aws1' })] }));
+  assert.equal('parkedForce' in asked.at(-1), false);
+});
+
 test('a parked-stop entry names its limit and source, and its refusals retire or park it like any other', async () => {
   const f = fixture();
   assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@aws1', sourceAccountId: 'one',

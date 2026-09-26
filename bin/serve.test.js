@@ -13634,9 +13634,9 @@ test('the queue\'s parked stop signals the captured tree only after fresh reads 
     // A session cut off by the limit mid-turn, as the terminal-limit path sees one.
     const session = { id: 'parked', kind: 'claude', state: 'waiting', project: cwd, endedTurn: false,
       rateLimit: { at: LIMIT, type: 'seven_day' }, lastUserAt: Date.parse(LIMIT) - 60e3, mtime: 1000 };
-    const state = { live: new Set([10, 11]), signals: [], reads: 0 };
+    const state = { live: new Set([10, 11]), signals: [], reads: 0, input: 7, screens: 0, calls: [] };
     const pane = () => ({ id: 'p', pid: 10, createdAt: 'created', alive: state.live.has(10), cwd, cols: 80, rows: 24, attached: 0,
-      meta: { sessionId: 'parked', agent: 'claude' } });
+      inputCount: state.input, meta: { sessionId: 'parked', agent: 'claude' } });
     const agentRow = { pid: 11, ppid: 10, pidStart: 'agent-start', agent: 'claude', interactive: true, args: 'claude --resume parked' };
     const table = () => [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow].filter((p) => state.live.has(p.pid));
     const target = { id: 'claude-two', label: 'Claude Two', agent: 'claude', configDir: cwd };
@@ -13644,10 +13644,11 @@ test('the queue\'s parked stop signals the captured tree only after fresh reads 
       resumeAccount: target, parkedForce: true, expectedRateLimitAt: LIMIT, allowTerminalRateLimit: true,
       buildState: async () => ({ sessions: [session], tasks: [] }),
       claudeSessionFor: () => { state.reads += 1; return fresh(state.reads); },
-      readScreen: async () => screen,
+      // A function screen is told which read it is; the last one is the pre-signal check.
+      readScreen: async () => { state.screens += 1; state.calls.push('screen'); return typeof screen === 'function' ? screen(state.screens) : screen; },
       agentProcessRows: async () => table().filter((p) => p.pid === 11),
-      forceRows: async () => table(),
-      forceSignal: async (pid, signal) => { state.signals.push([pid, signal]); state.live.delete(pid); },
+      forceRows: async () => { state.calls.push('rows'); return table(); },
+      forceSignal: async (pid, signal) => { state.calls.push('signal'); state.signals.push([pid, signal]); state.live.delete(pid); },
       closeIdleSession: async () => assert.fail('a parked stop types nothing into the session'),
       waitForHostAgent: async () => {},
       host: { request: async (type, params) => {
@@ -13658,7 +13659,9 @@ test('the queue\'s parked stop signals the captured tree only after fresh reads 
       } },
       ...extra });
     const body = { sessionId: 'parked', pane: 'p', pid: 10, mode: 'now' };
-    const reset = () => Object.assign(state, { live: new Set([10, 11]), signals: [], reads: 0 });
+    const reset = () => Object.assign(state, { live: new Set([10, 11]), signals: [], reads: 0, input: 7, screens: 0, calls: [] });
+    let journals = 0;
+    const counting = (extra) => ({ onForcedStop: () => { journals += 1; state.calls.push('journal'); }, ...extra });
 
     // Every refusal lands before anything is signalled.
     const refusals = [
@@ -13672,19 +13675,37 @@ test('the queue\'s parked stop signals the captured tree only after fresh reads 
       ['a dialog on screen', deps(undefined, 'Allow this?\n  1. Yes\nEnter to confirm · Esc to cancel'), /showing a modal/],
       ['a transcript that moved during the check', deps((n) => ({ ...session, mtime: n === 1 ? 1000 : 2000 })), /^Session changed before the forced stop/],
       ['no limit named', deps(undefined, '❯', { expectedRateLimitAt: undefined }), /needs the limit it was requested for/],
+      // A person at the terminal is not held off by the injection lock: a key between the
+      // probe and the stop, or one during the last look before the first signal, refuses.
+      ['a key while the proof was taken', deps((n) => { if (n === 2) state.input += 1; return session; }, '❯', counting()),
+        /^Session input arrived before the forced stop/],
+      ['a key during the last look', deps(undefined, (n) => { if (n === 2) state.input += 1; return '❯'; }, counting()),
+        /^Session input arrived before the forced stop/],
+      ['a dialog raised by output at the last look', deps(undefined,
+        (n) => (n === 1 ? '❯' : 'Allow this?\n  1. Yes\nEnter to confirm · Esc to cancel'), counting()), /showing a modal/],
+      ['a turn started at the last look', deps(undefined, (n) => (n === 1 ? '❯' : '✻ Thinking… (esc to interrupt)\n❯'), counting()),
+        /^Waiting for the turn and background work to finish$/],
+      ['the transcript moved at the last look', deps((n) => ({ ...session, mtime: n < 3 ? 1000 : 2000 }), '❯', counting()),
+        /^Session changed before the forced stop/],
     ];
     for (const [why, refusing, pattern] of refusals) {
       reset();
+      journals = 0;
       await assert.rejects(restartSession(body, refusing), (error) => pattern.test(error.message), why);
       assert.deepEqual(state.signals, [], `${why}: nothing is signalled`);
+      assert.equal(journals, 0, `${why}: no forced stop is journalled`);
     }
 
     // Parked, idle, at an empty prompt: the captured tree is signalled and the session resumes.
     reset();
     let journalled;
-    const result = await restartSession(body, deps(undefined, '❯', { onForcedStop: (processes) => { journalled = processes; } }));
+    const result = await restartSession(body, deps(undefined, '❯', { onForcedStop: (processes) => { state.calls.push('journal'); journalled = processes; } }));
     assert.equal(result.ok, true);
-    assert.equal(state.reads, 2, 'the transcript is read before and after the screen check');
+    assert.equal(state.reads, 3, 'the transcript is read before and after the screen check, and once more before the signal');
+    // The last look comes after the final process-table read, and the journal and the
+    // first signal follow it directly.
+    const firstSignal = state.calls.indexOf('signal');
+    assert.deepEqual(state.calls.slice(firstSignal - 3, firstSignal + 1), ['rows', 'screen', 'journal', 'signal']);
     assert.deepEqual(journalled.map((p) => p.pid).sort(), [10, 11]);
     assert.deepEqual(state.signals.map(([pid]) => pid).sort(), [10, 11]);
     assert.equal(state.replace.meta.accountId, 'claude-two');
@@ -13695,13 +13716,16 @@ test('the parked-stop proof reads a node session from that node, never from here
   const { requireParkedAtLimit } = require('./serve');
   const LIMIT = '2026-09-25T10:00:00.000Z';
   const session = { id: 'far', kind: 'claude', rateLimit: { at: LIMIT } };
-  const pane = { id: 'p1@aws1', alive: true, meta: { sessionId: 'far', agent: 'claude' } };
+  const pane = { id: 'p1@aws1', pid: 4, createdAt: 'c', alive: true, inputCount: 3, meta: { sessionId: 'far', agent: 'claude' } };
   const nodes = [];
   const deps = (read) => ({ expectedRateLimitAt: LIMIT, readScreen: async () => '❯',
+    hostRequest: async (type) => (type === 'get' ? { pane } : assert.fail(`asked ${type}`)),
     claudeSessionFor: () => assert.fail('a node session is never read from this machine'),
     remoteSessionRead: async (id, given) => { nodes.push(given.readNode); return read(id); } });
-  await requireParkedAtLimit(session, pane, 'aws1', deps((id) => ({ id, kind: 'claude', rateLimit: { at: LIMIT }, mtime: 5 })));
+  const last = await requireParkedAtLimit(session, pane, 'aws1', deps((id) => ({ id, kind: 'claude', rateLimit: { at: LIMIT }, mtime: 5 })));
   assert.deepEqual(nodes, ['aws1', 'aws1']);
+  await last();
+  assert.deepEqual(nodes, ['aws1', 'aws1', 'aws1'], 'the last look reads the node again');
   await assert.rejects(requireParkedAtLimit(session, pane, 'aws1', deps(() => { throw new Error('host request timed out'); })),
     (error) => error.status === 409 && /^Session activity on aws1 could not be verified/.test(error.message)
       && require('./account-handoff').classifyRefusal(error.message) === 'transient');

@@ -7824,8 +7824,8 @@ async function restartSession(body, deps = {}) {
     // A session move (bin/session-move.js) stops the session here and resumes it on
     // another machine: `afterStop` is handed the stopped pane in place of the resume.
     if (forcedStop) {
-      if (parkedForce) await requireParkedAtLimit(session, pane, remotePane ? paneNode : null, deps);
-      return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume }, deps);
+      const beforeSignal = parkedForce ? await requireParkedAtLimit(session, pane, remotePane ? paneNode : null, deps) : null;
+      return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume, beforeSignal }, deps);
     }
     const ledger = require('./restart-ledger');
     // The job ledger is verified against the session's own transcript. A session on
@@ -8102,6 +8102,15 @@ function priorForcedSurvivors(table, prior) {
 //   - the pane's screen must show no running turn, no dialog and no draft (a ghost
 //     suggestion is told from a draft the way a message send tells it).
 // A running turn or a changed transcript is transient; a draft or dialog parks.
+//
+// The injection lock keeps Keep out of the pane, not a person at the terminal. So the
+// proof is bound to the pane's own input counter, read before the screen is (the
+// probe's keys go in conditional on it), and what this returns is the last word:
+// forceStopThenResume calls it after its final process-table read, immediately before
+// the capture is journalled and the first signal is sent. It re-reads the pane (same
+// process, not one key more than the probe's own), the screen (no turn, no dialog)
+// and the transcript (unchanged, same limit). What is left is the journal write and
+// the signal request itself; a key typed inside that gap is lost, as under Owner's force.
 async function requireParkedAtLimit(session, pane, remoteNode, deps = {}) {
   if (session?.kind !== 'claude') throw new InjectionError(409, 'Only a Claude session parked on its limit is stopped this way');
   if (deps.expectedRateLimitAt == null) throw new InjectionError(409, 'A parked-session stop needs the limit it was requested for');
@@ -8132,15 +8141,44 @@ async function requireParkedAtLimit(session, pane, remoteNode, deps = {}) {
     if (!parked) throw new InjectionError(409, 'Waiting for the turn and background work to finish');
     if (reason) throw new InjectionError(409, reason);
   };
+  const livePane = async () => {
+    const current = (await (deps.hostRequest || hostRequest)('get', { pane: pane.id }, deps)).pane;
+    if (!current || !current.alive || current.id !== pane.id || current.pid !== pane.pid || current.createdAt !== pane.createdAt
+        || !Number.isInteger(current.inputCount)) {
+      throw new InjectionError(409, 'Session changed before the forced stop; nothing was stopped');
+    }
+    return current;
+  };
+  const inputArrived = () => new InjectionError(409, 'Session input arrived before the forced stop; nothing was stopped');
+  const readTarget = deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps));
+  const screenIdle = (screen) => {
+    if (claudeTurnRunningOutsideDraft(screen, 'claude')) throw new InjectionError(409, 'Waiting for the turn and background work to finish');
+  };
   const first = await read();
   check(first);
+  const before = await livePane();
   const target = claimInjectionTarget({ pane: pane.id });
-  const screen = await (deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)))(target, 30, false);
-  if (claudeTurnRunningOutsideDraft(screen, 'claude')) throw new InjectionError(409, 'Waiting for the turn and background work to finish');
-  await probeSuggestion(target, screen, deps);
+  const screen = await readTarget(target, 30, false);
+  screenIdle(screen);
+  const proof = await probeSuggestion(target, screen, { ...deps, probeInputGuard: { pid: before.pid, inputCount: before.inputCount } });
+  // The probe's comma and its Backspace are the only keys this pane may have had.
+  const expectedInput = before.inputCount + (proof && proof.kind === 'suggestion' ? 2 : 0);
   const second = await read();
   check(second);
   if (second.mtime !== first.mtime) throw new InjectionError(409, 'Session changed before the forced stop; nothing was stopped');
+  if ((await livePane()).inputCount !== expectedInput) throw inputArrived();
+  return async () => {
+    if ((await livePane()).inputCount !== expectedInput) throw inputArrived();
+    const last = await readTarget(target, 30, false);
+    screenIdle(last);
+    // Output alone can raise a dialog; the counter only speaks for keys.
+    try { sendPrecheck(last); }
+    catch (error) { if (/showing a modal/.test(String(error && error.message))) throw error; }
+    const third = await read();
+    check(third);
+    if (third.mtime !== first.mtime) throw new InjectionError(409, 'Session changed before the forced stop; nothing was stopped');
+    if ((await livePane()).inputCount !== expectedInput) throw inputArrived();
+  };
 }
 
 // Owner-forced restart or handoff. Nothing is typed into the session and the host is
@@ -8149,7 +8187,7 @@ async function requireParkedAtLimit(session, pane, remoteNode, deps = {}) {
 // and only those exact instances are sent SIGTERM and then SIGKILL. Descendants that
 // appear while it runs join the set only through a parent already in it. The caller's
 // resume step then starts the conversation again (for a handoff, on the target account).
-async function forceStopThenResume({ session, pane, identity, resume }, deps = {}) {
+async function forceStopThenResume({ session, pane, identity, resume, beforeSignal = null }, deps = {}) {
   const host = (type, params) => hostRequest(type, params, deps);
   const sleep = deps.sleep || ((ms) => new Promise((resolve) => setTimeout(resolve, ms)));
   const rows = forceStopDeps({ sessionId: session.id, pane: pane.id, pid: pane.pid }, deps, host, async () => {}).rows;
@@ -8189,20 +8227,28 @@ async function forceStopThenResume({ session, pane, identity, resume }, deps = {
   }
   if (!samePane((await host('get', { pane: pane.id })).pane)) throw Error('Pane changed since it was inspected; nothing closed');
   // Journalled before the first signal: a handoff that loses the daemon from here on can
-  // still prove the stop, and only once every one of these is gone.
-  await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+  // still prove the stop, and only once every one of these is gone. A stop with a last
+  // check to make (the queue's parked stop) journals only once that check has passed,
+  // after the final process-table read below, so a refusal there leaves no mark of a
+  // stop that never began.
+  if (!beforeSignal) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
 
   let remaining = processes;
+  let first = true;
   for (const name of ['SIGTERM', 'SIGKILL']) {
     const table = await rows();
     // Anything newly captured is journalled before it is signalled, so recovery waits for it too.
     // A capture that could not finish is journalled as incomplete, which recovery never accepts.
     let grew;
     try { grew = grow(table); } catch (error) {
-      if (error.incompleteCapture) await deps.onForcedStop?.(processes.map((p) => ({ ...p })), { incomplete: true });
+      if (error.incompleteCapture && !(first && beforeSignal)) await deps.onForcedStop?.(processes.map((p) => ({ ...p })), { incomplete: true });
       throw error;
     }
-    if (grew) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+    if (first && beforeSignal) {
+      await beforeSignal();
+      await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+    } else if (grew) await deps.onForcedStop?.(processes.map((p) => ({ ...p })));
+    first = false;
     for (const old of [...processes].reverse()) {
       const current = table.find((p) => p.pid === old.pid);
       // The live row this process was just matched against travels with the pid: on
