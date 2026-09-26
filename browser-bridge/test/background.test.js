@@ -14,6 +14,7 @@ const state = {
   nextGroupId: 100,
   detached: [],
   detachCalls: [],
+  debugLog: [],
   removeCalls: [],
   holdRemove: null,
   holdDetach: null,
@@ -158,7 +159,8 @@ globalThis.chrome = {
   debugger: {
     onEvent: { addListener: () => {} },
     onDetach: { addListener: () => {} },
-    async attach() {
+    async attach({ tabId }) {
+      state.debugLog.push(`attach ${tabId}`);
       await tick();
     },
     async detach({ tabId }) {
@@ -166,6 +168,7 @@ globalThis.chrome = {
       await tick();
       if (state.holdDetach) await state.holdDetach;
       state.detached.push(tabId);
+      state.debugLog.push(`detached ${tabId}`);
     },
     async sendCommand() {
       await tick();
@@ -605,6 +608,30 @@ test("a view starting on a tab keeps it attached when another view lets go of it
   assert.equal((await reply("s_3")).ok, true);
   for (let i = 0; i < 20; i++) await tick();
   assert.equal(state.detachCalls.includes(popup.id), false);
+});
+
+test("a view that starts while its tab is being let go of attaches after the detach", async () => {
+  const session = await makeSession("release-racing", "#84 card");
+  const popup = { id: state.nextTabId++, windowId: 3, groupId: -1, openerTabId: session.tab.id, url: "https://accounts.example", title: "Sign in" };
+  state.tabs.set(popup.id, popup);
+  const reply = (id) => waitFor(() => replyFor(id), `the reply to ${id}`);
+  const view = (viewer) => ({ viewer, session: "#84", tabId: popup.id, width: 800, height: 600, fit: true });
+  deliver({ id: "r_1", method: "viewer_start", params: view("r1") });
+  const first = await reply("r_1");
+  assert.equal(first.ok, true, JSON.stringify(first));
+
+  let release;
+  state.holdDetach = new Promise((resolve) => { release = resolve; });
+  deliver({ id: "r_2", method: "viewer_stop", params: { viewer: "r1" } });
+  await waitFor(() => state.detachCalls.includes(popup.id), "the detach under way");
+  state.debugLog.length = 0;
+  deliver({ id: "r_3", method: "viewer_start", params: view("r2") });
+  for (let i = 0; i < 20; i++) await tick();
+  state.holdDetach = null;
+  release();
+  assert.equal((await reply("r_3")).ok, true);
+  await reply("r_2");
+  assert.deepEqual(state.debugLog.filter((line) => line.endsWith(` ${popup.id}`)), [`detached ${popup.id}`, `attach ${popup.id}`]);
 });
 
 test("a release a failed start held off happens once that start fails", async () => {

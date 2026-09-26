@@ -143,7 +143,7 @@ export function createViewerHandlers() {
       return; // the tab is gone, and its attachment with it
     }
     if (!owner) {
-      if (!held()) await detach(tabId);
+      if (!held()) await detachTracked(tabId);
       return;
     }
     // An ended session can come back at any moment, and with it a tool call on this tab.
@@ -162,8 +162,18 @@ export function createViewerHandlers() {
         return;
       }
       if (tab.groupId !== groupId || activityGeneration(owner) !== generation || held()) return;
-      await detach(tabId);
+      await detachTracked(tabId);
     });
+  }
+
+  // A detach in flight, per tab: a start waits for it rather than attaching into it.
+  const releasing = new Map(); // tabId -> promise
+  function detachTracked(tabId) {
+    const done = detach(tabId).finally(() => {
+      if (releasing.get(tabId) === done) releasing.delete(tabId);
+    });
+    releasing.set(tabId, done);
+    return done;
   }
 
   function otherViewerFits(tabId, exceptId) {
@@ -190,6 +200,8 @@ export function createViewerHandlers() {
   async function startScreencast(viewer) {
     const tabId = viewer.tabId;
     const current = () => !viewer.stopped && viewer.tabId === tabId;
+    await releasing.get(tabId);
+    if (!current()) return;
     await attach(tabId);
     if (!current()) return;
     if (viewer.fit) {
@@ -263,6 +275,9 @@ export function createViewerHandlers() {
   onOwnDetach((tabId) => reattach(tabId));
 
   function reattach(tabId) {
+    // Our own release: no view held the tab, and one that took it since is waiting on
+    // the release to finish before it starts itself.
+    if (releasing.has(tabId)) return;
     for (const viewer of viewers.values()) {
       if (viewer.tabId !== tabId) continue;
       viewer.emit({ event: "viewer_state", viewer: viewer.id, state: "detached" });
