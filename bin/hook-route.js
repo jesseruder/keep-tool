@@ -664,6 +664,21 @@ function createHookService(options = {}) {
     return { status: result.status || 413, body: { error: result.reason } };
   }
 
+  // The prompt came before a request filed after it, when the node queued this post
+  // while the daemon was unreachable and replays it now (its firedAt is when the hook
+  // ran): that request answers a later moment, and is left alone. A post with no
+  // firedAt was sent as it fired, so it is now.
+  async function voidCompactRequest(request, clock) {
+    const file = path.join(root, '.keep', 'compact', `${request.sessionId}.request.json`);
+    let record = null;
+    try { record = JSON.parse(await fsp.readFile(file, 'utf8')); } catch (error) {
+      if (error && error.code === 'ENOENT') return;
+    }
+    const firedAt = request.firedAt || clock();
+    if (record && Number.isFinite(record.at) && firedAt < record.at) return;
+    await fsp.unlink(file).catch(() => {});
+  }
+
   async function handle(principal, body) {
     try {
       const caller = shared.callerNode(principal);
@@ -743,9 +758,7 @@ function createHookService(options = {}) {
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${scope}`,
           run: async () => {
-            if (voidsRequest) {
-              await fsp.unlink(path.join(root, '.keep', 'compact', `${request.sessionId}.request.json`)).catch(() => {});
-            }
+            if (voidsRequest) await voidCompactRequest(request, now);
             return shared.spawnKeep(argv, { cwd: root, env, stdin: JSON.stringify(input), timeoutMs });
           },
           what: `keep ${argv.join(' ')} for ${request.sessionId ? `session ${request.sessionId}` : `node ${caller}`}`,

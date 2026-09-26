@@ -6494,6 +6494,8 @@
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::loadCurrentSession|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::loadRemoteSession|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::mirroredCompactRow|1",
+    "bin/serve.js::autoCompactTick>call callback|bin/serve.js::autoCompactTick>call callback>right callback|2",
+    "bin/serve.js::autoCompactTick>call callback>right callback|bin/accounts.js::sessionNode|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::resolveSessionTarget|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::sessionLastTurn|1",
     "bin/serve.js::autoCompactTick>claudeAccountId|bin/accounts.js::defaultFor|1",

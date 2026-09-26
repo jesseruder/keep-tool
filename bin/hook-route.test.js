@@ -559,6 +559,19 @@ test('a node session\'s new prompt voids its compaction request on the daemon', 
   const replay = await lifecycle('UserPromptSubmit', `${KEY}-prompt`);
   assert.equal(replay.body.replayed, true);
   assert.equal(fs.existsSync(request('sess-aws1')), true);
+
+  // A prompt the node queued while the daemon was unreachable, replayed now for the
+  // first time: it fired before the request was filed, so it leaves it alone. One that
+  // fired after the request voids it.
+  const at = Date.now() - 30e3;
+  fs.writeFileSync(request('sess-aws1'), `${JSON.stringify({ sessionId: 'sess-aws1', at, expiresAt: Date.now() + 60e3 })}\n`);
+  const queued = (firedAt, key) => hooks.handle(AWS1, body({ event: 'lifecycle', idempotencyKey: key,
+    identity: { agent: 'claude', sessionId: 'sess-aws1', pane: 'p1@aws1', accountId: 'claude-node', firedAt },
+    input: { session_id: 'sess-aws1', cwd: '/home/node/project', hook_event_name: 'UserPromptSubmit', prompt: 'queued' } }));
+  assert.equal((await queued(at - 60e3, `${KEY}-queued-old`)).status, 200);
+  assert.equal(fs.existsSync(request('sess-aws1')), true, 'an older prompt does not void a newer request');
+  assert.equal((await queued(at + 1000, `${KEY}-queued-new`)).status, 200);
+  assert.equal(fs.existsSync(request('sess-aws1')), false, 'a prompt after the request voids it');
 });
 
 test('the session env the daemon\'s hook reads is forwarded from an allow-list, and nothing else', async (t) => {

@@ -443,7 +443,7 @@ function openRequiredMs(env = {}) {
 function runsLikeOpen(command) {
   return command === 'open' || command === 'verify';
 }
-const OPEN_UNBOUNDED_REFUSAL ="this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
+const OPEN_UNBOUNDED_REFUSAL = "this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
 
 // `env` is the daemon's own environment, passed only by the daemon's route: a node's
 // environment says nothing about the daemon's compaction timeout, so a node leaves

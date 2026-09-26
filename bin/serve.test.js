@@ -3414,6 +3414,18 @@ test('auto-compact compacts a requested Claude session on another node from its 
   assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due', holdResult: true });
   assert.deepEqual([compacted, cleared, decisions], [[], [], []]);
 
+  // The pane is on aws1 but the location record says the session moved elsewhere: a
+  // duplicate left behind by a move. Neither is chosen; the skip is retryable.
+  deps.sessionNode = () => 'aws2';
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due', holdResult: true });
+  assert.deepEqual([compacted, cleared, decisions, readNodes], [[], [], [], ['aws1']]);
+  delete deps.sessionNode;
+  // And a read through a node the record contradicts is refused before the node is asked.
+  const { loadRemoteSession } = require('./serve');
+  await assert.rejects(loadRemoteSession(fleet.mirrored.id, { readNode: 'aws2',
+    hostRequest: () => assert.fail('asked a node the record contradicts') }),
+  (error) => error.status === 409 && /is recorded on aws1 but was read for its pane on aws2/.test(error.message));
+
   // The node says the session was active twenty seconds ago, while the mirror (its Stop
   // post still queued) says five minutes: the later time holds it back, retryably.
   nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: Date.now() - 20e3 });

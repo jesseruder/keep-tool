@@ -4522,6 +4522,13 @@ async function remoteSessionRead(id, deps = {}) {
   if (!location || !['claude', 'codex'].includes(location.agent)) {
     throw remoteDeliveryRefusal({ id: sessionId, node }, deps, location && location.agent ? location.agent : null);
   }
+  // A caller's node that the record contradicts is two answers, and neither is taken:
+  // a pane left behind by a move (a duplicate resume on the old node) is not where the
+  // session is, and the record alone may be stale. The caller skips and asks again.
+  if (deps.readNode && location.node !== deps.readNode) {
+    throw new InjectionError(409, `${sessionId} is recorded on ${location.node || 'no node'} but was read for its pane on ${deps.readNode}; nothing was read`,
+      { reason: 'remote-node' });
+  }
   if (location.agent === 'codex') {
     const session = { id: sessionId, kind: 'codex', node };
     const account = nodeTranscriptAccount(session, deps);
@@ -9090,6 +9097,17 @@ async function autoCompactTick(deps = {}) {
             // judged by gives its last turn. A node that cannot be asked right now is a
             // retryable skip, not a spent request; a node that says there is no such
             // session is an answer.
+            // The pane and the location record must agree on the node. A live pane left
+            // on the old node by a move (a duplicate resume) is not the session, and a
+            // stale record is not either; neither is chosen, and the skip is retryable.
+            phase = 'eligibility';
+            let recorded = null;
+            try {
+              recorded = (deps.sessionNode || ((id) => accounts.sessionNode(id, { root: deps.root || keep.ROOT, env: deps.env || process.env })))(candidate.session.id);
+            } catch {}
+            if (recorded !== remoteNode) {
+              throw new InjectionError(409, `its live pane is on ${remoteNode} but it is recorded on ${recorded || 'no node'}`);
+            }
             phase = 'node';
             let current;
             try {
