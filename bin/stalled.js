@@ -349,7 +349,9 @@ async function fallbackCodexJobs(options = {}, deps = {}) {
     const stdout = await execFileOutput(process.execPath, [script, 'status', '--json'], {
       cwd: rootOf(options),
       encoding: 'utf8',
-      timeout: 10e3,
+      // A caller that is itself bounded (a node's companion-jobs read) passes a
+      // shorter one, so this never outlives it.
+      timeout: Number(options.fallbackTimeoutMs) > 0 ? Number(options.fallbackTimeoutMs) : 10e3,
     }, deps);
     const report = JSON.parse(stdout);
     const jobs = (Array.isArray(report.running) ? report.running : []).map((job) => {

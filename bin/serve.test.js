@@ -11788,6 +11788,138 @@ test('companion snapshot reads a node that fails, predates the verb, is slow or 
     'a host whose hello does not name the verb is never asked it');
 });
 
+test('a node\'s last answer stands through a slow refresh, and only goes stale past its window', async () => {
+  let now = 1_000_000;
+  let hang = false;
+  const asked = [];
+  const hostRequest = async (type, params, deps) => {
+    asked.push(type);
+    if (hang && type === 'companion-jobs') return new Promise(() => {});
+    if (type === 'hello') return { node: deps.node, companionJobs: 1 };
+    return { node: deps.node, codexJobs: { discovery: 'ok', jobs: [{ id: 'node-job', sessionId: 'node-owner', state: 'running' }] },
+      piJobs: { known: true, discovery: 'ok', jobs: [] } };
+  };
+  const deps = { ...localCompanion, hostNodes: ['main', 'cj-keep'], hostRequest, now: () => now, nodeCompanionWaitMs: 5000 };
+  const first = await companionSnapshot(deps);
+  assert.equal(first.byNode['cj-keep'].discovery, 'ok');
+  assert.equal(first.byNode['cj-keep'].staleMs, 0);
+  // Past the refresh interval the node stops answering: every snapshot in the next
+  // half minute reads the last answer at once, with its age, and never waits.
+  hang = true;
+  for (const later of [5e3, 10e3, 20e3, 29e3]) {
+    now = 1_000_000 + later;
+    const started = Date.now();
+    const snapshot = await companionSnapshot(deps);
+    assert.ok(Date.now() - started < 1000, 'a snapshot does not wait on a refresh behind a known answer');
+    assert.equal(snapshot.byNode['cj-keep'].discovery, 'ok', `still known at ${later} ms`);
+    assert.equal(snapshot.byNode['cj-keep'].staleMs, later);
+    assert.deepEqual(snapshot.byNode['cj-keep'].jobs.map((job) => job.id), ['node-job']);
+  }
+  assert.equal(asked.filter((type) => type === 'companion-jobs').length, 2, 'one refresh in flight, not one per snapshot');
+  now = 1_000_000 + 31e3;
+  const stale = await companionSnapshot(deps);
+  assert.equal(stale.byNode['cj-keep'].discovery, 'unknown');
+  assert.equal(stale.byNode['cj-keep'].reason, 'stale');
+  assert.equal(stale.byNode['cj-keep'].staleMs, 31e3);
+});
+
+test('an unreachable node is not asked again inside the window, nor one the listing could not reach', async () => {
+  let now = 2_000_000;
+  const asked = [];
+  const hostRequest = async (type, params, deps) => {
+    asked.push([type, deps.node]);
+    throw new Error('terminal host is unavailable');
+  };
+  const deps = { ...localCompanion, hostNodes: ['main', 'cj-dead', 'cj-unlisted'], hostRequest, now: () => now };
+  const first = await companionSnapshot(deps, { skipNodes: ['cj-unlisted'] });
+  assert.equal(first.byNode['cj-dead'].reason, 'unreachable');
+  assert.equal(first.byNode['cj-unlisted'].reason, 'unreachable');
+  assert.deepEqual(asked, [['hello', 'cj-dead']], 'a node the pane listing did not reach is not asked');
+  for (const later of [3e3, 10e3, 29e3]) {
+    now = 2_000_000 + later;
+    const snapshot = await companionSnapshot(deps, { skipNodes: ['cj-unlisted'] });
+    assert.equal(snapshot.byNode['cj-dead'].discovery, 'unknown');
+  }
+  assert.equal(asked.length, 1, 'an unreachable answer is kept for the longer window');
+  now = 2_000_000 + 31e3;
+  await companionSnapshot(deps, { skipNodes: ['cj-unlisted'] });
+  assert.deepEqual(asked, [['hello', 'cj-dead'], ['hello', 'cj-dead']]);
+});
+
+test('the nodes are asked while this machine\'s own discovery runs', async () => {
+  let nodeAsked = null;
+  const asked = new Promise((resolve) => { nodeAsked = resolve; });
+  const hostRequest = async (type, params, deps) => {
+    nodeAsked();
+    if (type === 'hello') return { node: deps.node, companionJobs: 1 };
+    return { node: deps.node, codexJobs: { discovery: 'ok', jobs: [] }, piJobs: { known: true, discovery: 'ok', jobs: [] } };
+  };
+  const snapshot = await companionSnapshot({
+    ...localCompanion, hostNodes: ['main', 'cj-parallel'], hostRequest,
+    // Local discovery finishes only once the node has been asked.
+    discoverCodexJobs: async () => {
+      const waited = await Promise.race([asked.then(() => true), new Promise((resolve) => setTimeout(() => resolve(false), 2000))]);
+      assert.equal(waited, true, 'the node was asked before local discovery finished');
+      return { known: true, complete: true, jobs: [] };
+    },
+  });
+  assert.equal(snapshot.byNode['cj-parallel'].discovery, 'ok');
+});
+
+test('buildState judges a session on a node pane by that node\'s own companion list', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-companion-node-pane-'));
+  try {
+    for (const dir of ['tasks', 'archive', 'digests', path.join('.keep', 'acks')]) fs.mkdirSync(path.join(root, dir), { recursive: true });
+    const run = (companion) => {
+      const script = `
+        ${STATE_FIXTURE_SETUP}
+        const { buildState } = require('./bin/serve.js');
+        const state = buildState({
+          ledger: { updatedAt: Date.now(), sessions: {} },
+          hostPanes: [
+            { id: 'p1@cj-pane', node: 'cj-pane', hostPaneId: 'p1', alive: true, agentAlive: true,
+              footer: { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false },
+              meta: { sessionId: 'cj-node-session', agent: 'claude', project: '/host/project' } },
+            { id: 'p2', alive: true, agentAlive: true,
+              footer: { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false },
+              meta: { sessionId: 'cj-local-session', agent: 'claude', project: '/host/project' } },
+          ],
+          claudeSessionFor: (sessionId) => ({ id: sessionId, kind: 'claude', project: '/host/project', title: 'Work',
+            lastUser: 'go', lastAssistant: 'done', lastAssistantFull: 'done', mtime: 123456, size: 10, endedTurn: true, state: 'recent' }),
+          companion: ${JSON.stringify(companion)},
+        });
+        const pick = (id) => { const s = state.sessions.find((session) => session.id === id); return s && { node: s.node || null, companionComplete: s.companionComplete, jobs: (s.backgroundJobs?.jobs || []).map((job) => [job.id, job.node || null]) }; };
+        process.stdout.write(JSON.stringify({ node: pick('cj-node-session'), local: pick('cj-local-session') }));
+      `;
+      const child = spawnSync(process.execPath, ['-e', script], {
+        cwd: path.join(__dirname, '..'), env: { ...process.env, KEEP_DIR: root, HOME: root }, encoding: 'utf8', timeout: 20000,
+      });
+      assert.equal(child.status, 0, child.stderr);
+      return JSON.parse(child.stdout);
+    };
+    const local = { known: true, complete: true, discovery: 'ok', jobs: [] };
+    const answered = run({ ...local, byNode: {
+      main: { ...local },
+      'cj-pane': { known: true, complete: true, discovery: 'ok', jobs: [
+        { id: 'task-on-node', sessionId: 'cj-node-session', state: 'running', node: 'cj-pane' },
+        { id: 'task-for-local', sessionId: 'cj-local-session', state: 'running', node: 'cj-pane' },
+      ] },
+    } });
+    assert.equal(answered.node.node, 'cj-pane');
+    assert.equal(answered.node.companionComplete, true, 'judged by its own node\'s complete list');
+    assert.deepEqual(answered.node.jobs, [['task-on-node', 'cj-pane']], 'its own node\'s job, tagged with the node');
+    assert.equal(answered.local.companionComplete, true);
+    assert.deepEqual(answered.local.jobs, [], 'a node\'s job never attaches to a session on this machine');
+    const unanswered = run({ ...local, byNode: { main: { ...local },
+      'cj-pane': { known: false, complete: false, discovery: 'unknown', jobs: [], reason: 'stale' } } });
+    assert.equal(unanswered.node.companionComplete, false, 'an unknown node keeps its sessions RUNNING');
+    assert.equal(unanswered.local.companionComplete, true);
+    const none = run(local);
+    assert.equal(none.node.companionComplete, false, 'no node answers at all');
+    assert.equal(none.local.companionComplete, true);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a session is judged by the companion list of the node its pane is on', () => {
   const byNode = {
     main: { known: true, complete: true, discovery: 'ok', jobs: [] },

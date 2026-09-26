@@ -551,7 +551,9 @@ function stallAliveIds(ledger, now) {
   return liveIds.length ? new Set(liveIds) : null;
 }
 
-async function companionSnapshot(deps = {}) {
+// `options.skipNodes`: nodes the caller already knows did not answer (the pane
+// listing's unansweredNodes), which are not asked again for this snapshot.
+async function companionSnapshot(deps = {}, options = {}) {
   const injected = Boolean(deps.discoverCodexJobs || deps.discoverPiJobs);
   const empty = () => ({ known: true, complete: true, discovery: 'ok', jobs: [] });
   const discoverCodex = deps.discoverCodexJobs
@@ -604,9 +606,11 @@ async function companionSnapshot(deps = {}) {
   // The fleet-wide fields stay this machine's own discovery, so nothing that reads
   // them changes; every node's answer, this one's included, rides beside them in
   // `byNode`, for the rules that ask about a session where it runs.
-  const discoverFleet = async (options) => {
-    const local = await discover(options);
-    return { ...local, byNode: await companionByNode(local, deps) };
+  // The nodes are asked while this machine's own discovery runs, not after it.
+  const discoverFleet = async (discoverOptions) => {
+    const nodeAnswers = companionNodeAnswers(deps, options);
+    const local = await discover(discoverOptions);
+    return { ...local, byNode: companionByNode(local, await nodeAnswers, deps) };
   };
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
   // Injected discovery is request scoped and must not share production cache state.
@@ -6635,9 +6639,18 @@ const nodeCompanionJobsCapability = new Map();
 const NODE_COMPANION_CAPABILITY_MS = 60e3;
 // The node reads its lists in a child it kills at six seconds.
 const NODE_COMPANION_REQUEST_TIMEOUT_MS = 10e3;
-// How long a snapshot waits on a node before it counts that node as unknown for this
-// round. The read goes on and fills the cache for the next one: one slow node must not
-// hold up a publication that every other session's status waits on.
+// How long a node's last answer stands. Well past the dashboard's publish interval,
+// so a node whose read takes longer than one publication does not swap between known
+// and unknown every round (and flip its idle sessions between ready and RUNNING with
+// a push each time). A snapshot reads the last answer, with its age as `staleMs`,
+// while a refresh runs behind it; only past this is the node unknown ('stale').
+const NODE_COMPANION_KEEP_MS = 30e3;
+// A known answer is refreshed this often; an unknown one (unreachable, an older host,
+// a node whose own read timed out) is asked again only after the longer window.
+const NODE_COMPANION_REFRESH_MS = PROCESS_ROWS_CACHE_MS;
+const NODE_COMPANION_RETRY_MS = NODE_COMPANION_KEEP_MS;
+// How long a snapshot waits for a node it has no answer from at all (the first read).
+// The read goes on and fills the cache for the next snapshot.
 const NODE_COMPANION_WAIT_MS = 3000;
 
 function unknownNodeCompanion(node, reason) {
@@ -6666,9 +6679,25 @@ function summarizeNodeCompanion(node, answer) {
   };
 }
 
+function companionNow(deps = {}) {
+  return typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+}
+
+// Whether this daemon's last attempt to reach the node's host failed recently enough
+// that hostClientFor would refuse without trying (HOST_FAILURE_CACHE_MS). Asking then
+// only buys a forced reconnect and its retry window, on a path a publication waits on.
+function nodeHostRecentlyFailed(node, deps = {}) {
+  const now = companionNow(deps);
+  for (const channel of ['control', 'ops']) {
+    const state = hostChannels.get(`${node}\u0000${channel}`);
+    if (state && state.failureAt && now - state.failureAt < HOST_FAILURE_CACHE_MS) return true;
+  }
+  return false;
+}
+
 async function fetchNodeCompanionJobs(node, deps = {}) {
   const request = deps.hostRequest || hostRequest;
-  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  const now = companionNow(deps);
   try {
     let capability = nodeCompanionJobsCapability.get(node);
     if (!capability || !(now - capability.at < NODE_COMPANION_CAPABILITY_MS)) {
@@ -6696,38 +6725,52 @@ async function fetchNodeCompanionJobs(node, deps = {}) {
   }
 }
 
-// Never rejects: a node that does not answer is `discovery: 'unknown'`.
-function remoteCompanionJobs(node, deps = {}) {
+// The node's last answer as a snapshot reads it now: with its age, or 'stale' once it
+// is older than NODE_COMPANION_KEEP_MS. Null before the node has answered at all.
+function nodeCompanionView(node, cache, now) {
+  if (!cache.value) return null;
+  const staleMs = Math.max(0, now - cache.at);
+  if (staleMs >= NODE_COMPANION_KEEP_MS) return { ...unknownNodeCompanion(node, 'stale'), staleMs };
+  return { ...cache.value, staleMs };
+}
+
+// Never rejects, and never waits on a node it has an answer from: a refresh that is
+// due runs behind the answer it returns. `options.skip` says the caller already knows
+// the node did not answer, so no refresh is started.
+function remoteCompanionJobs(node, deps = {}, options = {}) {
   let cache = nodeCompanionJobsCaches.get(node);
   if (!cache) {
     cache = { value: null, at: 0, pending: null };
     nodeCompanionJobsCaches.set(node, cache);
   }
-  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
-  if (cache.value && now - cache.at < PROCESS_ROWS_CACHE_MS) return Promise.resolve(cache.value);
-  if (cache.pending) return cache.pending;
-  cache.pending = fetchNodeCompanionJobs(node, deps).then((value) => {
-    cache.value = value;
-    cache.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
-    cache.pending = null;
-    return value;
-  }, () => {
-    cache.pending = null;
-    return unknownNodeCompanion(node, 'failed');
-  });
-  return cache.pending;
+  const now = companionNow(deps);
+  const due = !cache.value
+    || now - cache.at >= (companionKnown(cache.value) ? NODE_COMPANION_REFRESH_MS : NODE_COMPANION_RETRY_MS);
+  const blocked = options.skip === true || nodeHostRecentlyFailed(node, deps);
+  if (due && !blocked && !cache.pending) {
+    cache.pending = fetchNodeCompanionJobs(node, deps).then((value) => value, () => unknownNodeCompanion(node, 'failed'))
+      .then((value) => {
+        cache.value = value;
+        cache.at = companionNow(deps);
+        cache.pending = null;
+        return value;
+      });
+  }
+  const view = nodeCompanionView(node, cache, now);
+  if (view) return Promise.resolve(view);
+  if (cache.pending) return cache.pending.then(() => nodeCompanionView(node, cache, companionNow(deps)));
+  return Promise.resolve(unknownNodeCompanion(node, blocked ? 'unreachable' : 'failed'));
 }
 
-// Every node's companion list, the daemon's own (already read) under its own name.
-async function companionByNode(local, deps = {}) {
+// Every other node's answer, keyed by node. Started before this machine's own
+// discovery, so the two run side by side. A node with no answer yet is waited on for
+// NODE_COMPANION_WAIT_MS at most.
+async function companionNodeAnswers(deps = {}, options = {}) {
   const daemon = daemonNodeName(deps);
-  const byNode = {
-    [daemon]: { node: daemon, known: local.known, complete: local.complete, discovery: local.discovery,
-      jobs: local.jobs || [], parts: local.parts || null },
-  };
   let others = [];
   try { others = hostNodeNames(deps).filter((node) => node && node !== daemon); } catch {}
-  if (!others.length) return byNode;
+  if (!others.length) return {};
+  const skip = new Set(Array.isArray(options.skipNodes) ? options.skipNodes : []);
   const fetch = deps.remoteCompanionJobs || remoteCompanionJobs;
   const waitMs = deps.nodeCompanionWaitMs == null ? NODE_COMPANION_WAIT_MS : Number(deps.nodeCompanionWaitMs);
   const answers = await Promise.all(others.map((node) => new Promise((resolve) => {
@@ -6738,12 +6781,21 @@ async function companionByNode(local, deps = {}) {
     };
     timer = setTimeout(() => settle(unknownNodeCompanion(node, 'slow')), waitMs);
     Promise.resolve()
-      .then(() => fetch(node, deps))
+      .then(() => fetch(node, deps, { skip: skip.has(node) }))
       .then((value) => settle(value && typeof value === 'object' ? value : unknownNodeCompanion(node, 'no-answer')),
         () => settle(unknownNodeCompanion(node, 'failed')));
   })));
-  others.forEach((node, index) => { byNode[node] = answers[index]; });
-  return byNode;
+  return Object.fromEntries(others.map((node, index) => [node, answers[index]]));
+}
+
+// Every node's companion list, the daemon's own (already read) under its own name.
+function companionByNode(local, nodeAnswers, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  return {
+    ...nodeAnswers,
+    [daemon]: { node: daemon, known: local.known, complete: local.complete, discovery: local.discovery,
+      jobs: local.jobs || [], parts: local.parts || null },
+  };
 }
 
 async function agentProcessRows(deps = {}, options = {}) {
@@ -17552,7 +17604,8 @@ function start(deps = {}) {
       const listedResult = await listHostPaneResult(deps, freshPanes);
       const listed = hostPanesForPublish(listedResult, publishedPanes, Date.now(), paneEpoch);
       await reviewQueue.reconcile({ inspectLaunch: (active) => inspectReviewQueueLaunch(active) });
-      const companion = await companionSnapshot(deps);
+      // A node the listing could not reach is not asked for its jobs either.
+      const companion = await companionSnapshot(deps, { skipNodes: unansweredNodes(listedResult) });
       const nodeSessions = await remoteSessionFreshness(listed.panes, deps, { skipNodes: unansweredNodes(listedResult) });
       return { hostPanes: listed.panes, hostStatus: listed.host, companion, mutationFence: capturedMutationFence,
         ...(nodeSessions ? { nodeSessions } : {}) };
