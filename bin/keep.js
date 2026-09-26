@@ -2017,6 +2017,22 @@ commands.land = (argv) => {
   console.log(`  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
 };
 
+// One pass of the CI watch (bin/ci-watch.js). The daemon runs it every minute in a
+// child process; --list shows what is being watched.
+commands['ci-watch'] = async (argv) => {
+  const o = parseArgs(argv, { list: 'bool', json: 'bool' });
+  const ciWatch = require('./ci-watch.js');
+  if (o.list) {
+    const watches = Object.values(ciWatch.loadWatches()).sort((a, b) => Number(b.at) - Number(a.at));
+    if (o.json) return console.log(JSON.stringify(watches, null, 2));
+    for (const watch of watches) {
+      console.log(`${watch.state.padEnd(8)} ${watch.slug} ${watch.sha.slice(0, 8)} ${watch.subject}${watch.cards.length ? `  [${watch.cards.join(', ')}]` : ''}`);
+    }
+    return;
+  }
+  console.log(JSON.stringify(await ciWatch.tick()));
+};
+
 // What `keep land` on another node needs from the registry to decide a land where
 // the worktree is: the card's grants, its review records, its open review
 // obligations, and whether it has opted out of auto-land. Read-only, JSON only; an
@@ -4128,6 +4144,7 @@ ${stepUsage()}
   keep landed [--dry] [--only <id>]
   keep landed policy narrow|broad
   keep landed dry on|off
+  keep ci-watch [--list [--json]]               # one pass of the post-land CI watch (the daemon runs it every minute)
   keep landed judge rules|haiku|veto
   keep landed decisions [--disagree]
   keep slack poll [--dry]

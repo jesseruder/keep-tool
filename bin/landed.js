@@ -42,8 +42,8 @@ const MODEL_OUTPUT_MAX = 1024 * 1024;
 // Bump when judgePrompt's policy changes: cached verdicts from an older prompt
 // are stale and the entry is judged again.
 const JUDGE_PROMPT_VERSION = 2;
-// Only a commit this recent is watched for CI when the sweep first sees it land.
-const CI_WATCH_MAX_AGE_MS = 86400e3;
+// A landed sha is watched for CI when the check-in citing it is this recent.
+const CI_WATCH_CITATION_MS = 86400e3;
 const DEFAULT_CONFIG = Object.freeze({ policy: 'narrow', closeDry: false, judge: 'rules', shadowJudge: null });
 
 function landedDir() { return path.join(keep.ROOT, '.keep', 'landed'); }
@@ -910,7 +910,7 @@ function rulesDecision(entry, task, policy, now) {
   };
 }
 
-function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches = patchCaches(), attempts = {}) {
+function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches = patchCaches(), attempts = {}, ciFailed = new Set()) {
   const entry = newestPolicyEntry(entries, policy);
   if (!fetchOk || !entry) return null;
   if (task.fm.status !== 'review' && task.fm.status !== 'landing') return null;
@@ -925,7 +925,7 @@ function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches 
   if (rules.wouldClose || rules.unsure) {
     // Pushed is not shipped: a card whose commit's CI is still running, or red, stays
     // open. The watch releases it on the first sweep after CI goes green.
-    const blocked = ciWatch.blockingFor(repo, shas);
+    const blocked = ciFailed.has(task.id) ? 'could not register a CI watch for its commits' : ciWatch.blockingFor(repo, shas);
     if (blocked) rules = { wouldClose: false, reason: blocked, fixed: true };
   }
   return { entry, items, shas, rules };
@@ -1067,6 +1067,7 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
     const attemptUpdates = {};
     const onAttempt = (sha, value) => { attempts[sha] = value; attemptUpdates[sha] = value; };
     const fresh = [];
+    const freshCited = [];
     for (const citation of citedShas(entries)) {
       if (recorded.some((sha) => sameSha(sha, citation.sha))) continue;
       // Patch-id matching costs git calls the stale-ref path does not, so it
@@ -1081,21 +1082,34 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       // onAttempt has stored the match, so it is never derived again.
       if (known) continue;
       fresh.push(record);
+      freshCited.push({ record, citation });
       if (record.citedSha) recorded.push(record.sha);
     }
-    // A sha that just reached the default branch is watched until its CI settles, and
-    // closeContext holds the card until then (bin/ci-watch.js).
+    // A sha that just reached the default branch is watched until its CI settles
+    // (bin/ci-watch.js): every fresh one cited in the last day, and every sha of a card
+    // this sweep might close, whose close then waits for green. A card whose watch
+    // could not be registered is not closed on this sweep.
+    const ciFailed = new Set();
+    const watchCi = (sha) => {
+      try {
+        ciWatch.register({ repo, sha, branch, card: task.id, source: 'landed sweep', now });
+        return true;
+      } catch (error) {
+        process.stderr.write(`keep landed: could not watch CI for ${String(sha).slice(0, 8)}: ${errorText(error)}\n`);
+        return false;
+      }
+    };
     if (!dry && fetchOk) {
-      for (const record of fresh) {
-        try {
-          ciWatch.register({ repo, sha: record.sha, branch, card: task.id, source: 'landed sweep', maxAgeMs: CI_WATCH_MAX_AGE_MS, now });
-        } catch (error) {
-          process.stderr.write(`keep landed: could not watch CI for ${record.sha.slice(0, 8)}: ${errorText(error)}\n`);
-        }
+      for (const { record, citation } of freshCited) {
+        if (now - stampMs(citation.entryStamp) <= CI_WATCH_CITATION_MS) watchCi(record.sha);
+      }
+      const candidate = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts);
+      if (candidate && (candidate.rules.wouldClose || candidate.rules.unsure)) {
+        for (const sha of candidate.shas) if (!watchCi(sha)) ciFailed.add(task.id);
       }
     }
 
-    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts);
+    const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts, ciFailed);
     const prior = context && priorDecisions.get(task.id);
     const alreadyJudged = Boolean(prior && prior.entryKey === entryKey(context && context.entry) && prior.policy === config.policy);
     let modelDecision = null;
@@ -1158,7 +1172,7 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
         saveCard(task.id, currentRecords, nextAttempts);
       }
       const currentContext = closeContext(currentTask, currentEntries, repo, branch, fetchOk, currentConfig.policy, now,
-        caches, aliasView({ records: currentRecords, attempts: nextAttempts }));
+        caches, aliasView({ records: currentRecords, attempts: nextAttempts }), ciFailed);
       // A judge or dry-mode flip during the unlocked model call invalidates the
       // judgement as surely as a policy flip: record and let the next sweep judge
       // under the new config rather than close on the rules alone.
