@@ -3628,6 +3628,15 @@ written except once to clear a failure an earlier daemon left behind (`no remote
 nodes`), and the row is rewritten only when its result changes. Self-repair excludes the row: a
 repair session on the daemon cannot drain a node's queue, which empties on its own once
 the node reaches the daemon again.
+On the node, every queued event a replay removes without the daemon having taken it (a
+refusal, a transcript replaced since the event fired, a session that ended) is logged to
+`~/.keep-node/hook.log` with its event, session, sequence number and reason. A mirror
+that keeps moving under a post (the daemon's 409 `needFrom` past its resend limit) is
+not a refusal: the event stays queued, the node's cursor moves to where the daemon last
+said, and the session goes last in the next replays. Only one hook replays a session's
+entries at a time (`~/.keep-node/replay-locks/<sid>.lock`, taken over once its holder is
+gone or past its bound); a hook that finds the lock held leaves that session to its
+holder, queues its own event of that session behind them, and goes on to the others.
 A stall in the probe's first minute is logged as `keep serve: event loop stalled
 7200ms during startup` (with ` (<name>)` when a holder was measured, and
 ` (likely <name>)` when it is a guess) and only counted in
