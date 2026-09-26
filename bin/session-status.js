@@ -69,14 +69,15 @@ function activity(session, context = {}) {
   const task = context.task?.fm || context.task || {};
   const taskStatus = model.task.status;
   // The turn-end model verdict (bin/stop-classifier.js) outranks the prose rules and
-  // tracked-job waits below, but not a stop intent a hook or card handoff declared.
-  // It sees only the message, so it cannot hide the card's own review or needs, and
-  // DONE cannot pull a session out of a scheduled or dependency wait it does not see.
+  // tracked-job waits below. A stop intent a hook or card handoff declared outranks
+  // RUNNING and DONE, but not ASKS: a turn that schedules a check and ends on options
+  // for Owner is asking. DONE cannot pull a session out of a scheduled or dependency
+  // wait it does not see, and RUNNING and DONE cannot hide the card's review or needs.
   // RUNNING and DONE speak for a live pane only; ASKS also for the card's latest
   // session whose pane is gone, whose final ask would otherwise sit behind the card's
   // schedule or read as idle.
   const verdict = ended && !model.identity.reviewer
-    && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
+    && (!['hook', 'registry'].includes(model.conversation.source) || session.stopVerdict?.verdict === 'asks') ? session.stopVerdict : null;
   const live = model.identity.interactive;
   const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
   const durableWait = model.conversation.waiting && ['scheduled check', 'dependency'].includes(model.conversation.reason);
@@ -93,7 +94,12 @@ function activity(session, context = {}) {
   // A one-shot scheduled job (a cron, a /loop wakeup) well past its time has fired.
   const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service'
     && !(job.kind === 'scheduled' && !job.recurring && Number.isFinite(job.expiresAt) && nowMs - job.expiresAt > 10 * 60e3));
-  const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
+  // 'history-gap' marks transcript history the ledger never read. Once a trusted
+  // footer, a counted process table and a complete companion list all speak, what it
+  // could hide (a shell, an agent, a Codex job) shows in one of them instead.
+  const coveredGap = Boolean(footer) && Number.isInteger(session.agentShells) && session.companionComplete === true;
+  const uncertain = model.background.uncertain.filter((id) => !(coveredGap && id === 'history-gap'));
+  const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || uncertain.length
     || model.background.agents.length || ledgerPending || model.conversation.scheduled.length
     || (model.task.checkAfter && !model.task.checkOverdue) || model.task.dependencies.length;
   const nothingWakes = Boolean(footer) && ledger?.caughtUp === true && !wakes;
@@ -104,7 +110,9 @@ function activity(session, context = {}) {
   // turn is listed as finished below. An ASKS verdict still counts for it.
   const unattended = session.unattended === true;
   // The agent's own words stay the row's (and a push's) detail when it asked something.
-  add(verdict?.verdict === 'asks' && !cardAsks && (live || model.task.cardLatest), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
+  // The agent's own question is the row's detail, so it can stand ahead of the card's
+  // review or needs text too.
+  add(verdict?.verdict === 'asks' && (live || model.task.cardLatest), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
     { kind: 'input', detail: text || verdict?.reason }, 'inferred');
   add(live && verdict?.verdict === 'done' && !durableWait && !cardAsks && !unattended, 'model-done', 'model', 'needs-input', 'Ready for next instruction',
     'next instruction', { kind: 'input', detail: verdict?.reason || 'Ready for your next instruction.' }, 'inferred');

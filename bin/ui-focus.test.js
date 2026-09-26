@@ -121,13 +121,28 @@ test('Waiting on you keeps each row where it first appeared while Keep writes to
   assert.deepEqual(order([{ sessionId: 'd', since: 5 }, { sessionId: 'c', since: 5 }]), ['c', 'd'], 'ties break by key');
 });
 
+test('running panel leaves out a waiting session with no pane, unless it runs outside Keep or was marked running', () => {
+  const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
+  const data = { tasks: [], sessions: [
+    { id: 'live', pane: 'p', state: 'waiting', mtime: 1 },
+    { id: 'checked', state: 'waiting', mtime: 2 },
+    { id: 'outside', state: 'waiting', runtime: { state: 'external' }, mtime: 3 },
+    { id: 'marked', state: 'waiting', mtime: 4 },
+    { id: 'working', state: 'running', mtime: 5 }] };
+  const ctx = vm.createContext({ data, runningOrder: new Map(), stableSessionOrder: selection.stableSessionOrder,
+    paneMap: () => new Map([['p', { createdAt: '2026-01-15' }]]), isClosingSession: () => false,
+    sessionItem: (kind, session) => session, state: { markedRunning: new Set(['marked']) } });
+  vm.runInContext(source.slice(source.indexOf('function runningItems('), source.indexOf('function pinnedItems(')), ctx);
+  assert.deepEqual(Array.from(ctx.runningItems(), (item) => item.id).sort(), ['live', 'marked', 'outside', 'working']);
+});
+
 test('running panel orders newest-created first regardless of activity and refresh order', () => {
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const data = {
     tasks: [{ id: 'old', fm: { created: '2026-01-01' } }, { id: 'new', fm: { created: '2026-02-01' } }],
-    sessions: [{ id: 'new', taskId: 'new', state: 'running', mtime: 1 },
+    sessions: [{ id: 'new', taskId: 'new', pane: 'n', state: 'running', mtime: 1 },
       { id: 'shell', pane: 'p', state: 'waiting', mtime: 2 },
-      { id: 'old', taskId: 'old', state: 'waiting', mtime: 3 }],
+      { id: 'old', taskId: 'old', pane: 'o', state: 'waiting', mtime: 3 }],
   };
   const ctx = vm.createContext({ data, runningOrder: new Map(), stableSessionOrder: selection.stableSessionOrder,
     paneMap: () => new Map([['p', { createdAt: '2026-01-15' }]]), isClosingSession: () => false,

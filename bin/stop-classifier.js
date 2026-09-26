@@ -55,7 +55,9 @@ function eligible(session) {
 function input(session) {
   const text = lastText(session);
   const scheduled = (session.backgroundJobs?.jobs || []).some((job) => job.status === 'pending' && job.kind === 'scheduled');
-  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).length || (session.lifecycleAgents || []).length || scheduled;
+  // 'history-gap' is unread transcript history, not a job; it says nothing is running.
+  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).filter((id) => id !== 'history-gap').length
+    || (session.lifecycleAgents || []).length || scheduled;
   const check = session.cardCheck;
   const checkLine = !check ? 'none' : check.overdue ? `overdue since ${check.at}, not delivered` : `at ${check.at}`;
   return `Background work Keep tracks for this session: ${background ? 'still running' : 'none running'}\n`

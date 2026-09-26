@@ -286,3 +286,31 @@ test('a RUNNING verdict falls to the rules only when a trusted footer, the proce
   // A long-running service is not something that wakes the session.
   assert.equal(activity({ ...idle, backgroundJobs: { caughtUp: true, jobs: [{ id: 's1', kind: 'service', status: 'pending' }] } }).decision.rule, 'conversation-ready');
 });
+
+test('unread history (history-gap) is not running work, for the model and once the other sources cover it', () => {
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'] }), /Keep tracks for this session: none running/);
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap', 'b1'] }), /still running/);
+  const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
+  const covered = { ...base, lastAssistantFull: 'Checked in on the card; it is done.', stopVerdict: { verdict: 'running', reason: 'background still running' },
+    footer, footerTrusted: true, agentShells: 0, companionComplete: true, unknownBackgroundJobs: ['history-gap'],
+    backgroundJobs: { caughtUp: true, jobs: [] } };
+  assert.equal(activity(covered).decision.rule, 'conversation-ready');
+  // Without every covering source, the gap still counts as unknown.
+  assert.equal(activity({ ...covered, companionComplete: undefined }).decision.rule, 'model-running');
+  assert.equal(activity({ ...covered, agentShells: undefined }).decision.rule, 'model-running');
+  assert.equal(activity({ ...covered, footerTrusted: false }).decision.rule, 'model-running');
+});
+
+test('an ASKS verdict outranks a declared waiting handoff and the card\'s own review', () => {
+  const at = Date.parse('2026-09-26T09:00');
+  const asks = { verdict: 'asks', reason: 'offers two next steps' };
+  const text = 'Scheduled the check for the 28th. Next: shrink the bundle, or move on to step 4.';
+  const session = { ...base, taskId: 't', lastAssistantFull: text, turnStartedAt: at - 60e3, lastUserAt: at - 60e3, stopVerdict: asks };
+  const task = { status: 'waiting', check_after: '2030-09-28T16:34', check: 'read it', scheduled_by: 's1',
+    scheduled_at: new Date(at - 30e3).toISOString(), scheduled_for: '2030-09-28T16:34', scheduled_intent: 'waiting', sessions: [{ id: 's1' }] };
+  assert.equal(activity({ ...session, stopVerdict: { verdict: 'running' } }, { task, now: at }).decision.rule, 'conversation-wait', 'RUNNING leaves the handoff');
+  const asked = activity(session, { task, now: at });
+  assert.equal(asked.decision.rule, 'model-asks');
+  assert.equal(asked.request.detail, text);
+  assert.equal(activity(session, { task: { ...task, status: 'review' }, now: at }).decision.rule, 'model-asks');
+});
