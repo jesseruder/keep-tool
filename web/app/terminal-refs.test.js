@@ -283,7 +283,7 @@ function pressTerminal(lineText) {
 test('a press on a link never reaches xterm; release opens it', () => {
   const { terminal, doc, listeners, fire } = pressTerminal('see #5 here');
   const opened = [];
-  const handle = installTerminalRefs(terminal, { esc, doc,
+  const handle = installTerminalRefs(terminal, { esc, doc, mac: false,
     kinds: [{ find: findSessionRefs, has: () => true, describe: (num) => ({ title: String(num) }), open: (num) => opened.push(num) }] });
   let links;
   terminal.provider.provideLinks(1, (value) => { links = value; });
@@ -299,8 +299,9 @@ test('a press on a link never reaches xterm; release opens it', () => {
   assert.deepEqual(opened, [5]);
 
   // Option or Shift selects instead; a drag or a release off the link does nothing.
-  assert.equal(fire('element', 'mousedown', { altKey: true }).stopped, false);
-  assert.equal(fire('element', 'mousedown', { shiftKey: true }).stopped, false);
+  assert.equal(fire('element', 'mousedown', { shiftKey: true }).stopped, false, 'Shift selects off a Mac');
+  assert.equal(fire('element', 'mousedown', { altKey: true }).stopped, true, 'Alt would reach the pane off a Mac');
+  fire('doc', 'mouseup', { clientX: 40 });
   fire('element', 'mousedown');
   fire('doc', 'mouseup', { clientX: 40 });
   fire('element', 'mousedown');
@@ -310,4 +311,15 @@ test('a press on a link never reaches xterm; release opens it', () => {
 
   handle.dispose();
   assert.equal(listeners.element.length + listeners.doc.length, 0);
+});
+
+test('on a Mac, Option selects a link and Shift does not reach the pane', () => {
+  const { terminal, doc, fire } = pressTerminal('see #5 here');
+  installTerminalRefs(terminal, { esc, doc, mac: true,
+    kinds: [{ find: findSessionRefs, has: () => true, describe: (num) => ({ title: String(num) }), open: () => {} }] });
+  let links;
+  terminal.provider.provideLinks(1, (value) => { links = value; });
+  links[0].hover({ clientX: 10, clientY: 10 });
+  assert.equal(fire('element', 'mousedown', { altKey: true }).stopped, false);
+  assert.equal(fire('element', 'mousedown', { shiftKey: true }).stopped, true);
 });

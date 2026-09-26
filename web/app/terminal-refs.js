@@ -285,7 +285,12 @@ export function refCardHTML(esc, info, { openHint = true } = {}) {
 // Registers one provider on an xterm for every kind.
 const CLICK_SLOP_PX = 4;
 
-export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThis.document } = {}) {
+// xterm's "select, don't send" modifier while an agent holds the mouse: Option on a
+// Mac (the console sets macOptionClickForcesSelection), Shift everywhere else. Any
+// other modifier still sends the press to the pane, so it must not pass either.
+const isMac = () => /Mac|iPhone|iPad/.test(globalThis.navigator?.platform || '');
+
+export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThis.document, mac = isMac() } = {}) {
   let pop = null;
   let current = null;
   // The link under the pointer (xterm's hover/leave) and a press taken for it.
@@ -343,7 +348,7 @@ export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThi
   // propagation also covers a press whose target is that element itself.
   const onPress = (event) => {
     const ref = hovered;
-    if (!ref?.kind.open || event.button !== 0 || event.altKey || event.shiftKey) return;
+    if (!ref?.kind.open || event.button !== 0 || (mac ? event.altKey : event.shiftKey)) return;
     event.preventDefault();
     event.stopImmediatePropagation();
     pressed = { ref, x: event.clientX, y: event.clientY };
