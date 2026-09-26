@@ -575,7 +575,10 @@ function claimFor(previous, group, now) {
   const seq = Number(group.dirtySeq) || 0;
   const card = group.card || '';
   const same = previous && previous.token && previous.seq === seq && previous.state === group.state && previous.card === card;
-  return { at: now, token: same ? previous.token : crypto.randomBytes(8).toString('hex'), seq, state: group.state, card };
+  return {
+    at: now, plannedAt: now, token: same ? previous.token : crypto.randomBytes(8).toString('hex'),
+    seq, state: group.state, card,
+  };
 }
 
 function noteMarker(token) { return `(report note ${token})`; }
@@ -613,7 +616,40 @@ async function settleOnce(options) {
   let incidentCfg = null;
   try { incidentCfg = deps.incidentConfig(); } catch { incidentCfg = null; }
   const openAreas = openAreasNow(deps, cfg, now);
+  // An expired claim may have landed before the daemon that held it died. Look for
+  // its token first — outside the lock — so that the claim is acknowledged as sent
+  // even when the group has changed since and would be planned under a new token.
+  const landedBefore = new Set();
+  for (const group of Object.values(state0.groups)) {
+    const wake = group.wakeClaim;
+    const note = group.noteClaim;
+    try {
+      if (wake && wake.token && wake.agent && !claimLive(wake, now) && deps.feedHas(wake.agent, wake.token)) landedBefore.add(wake.token);
+      if (note && note.token && note.card && !claimLive(note, now) && deps.cardHas(note.card, noteMarker(note.token))) landedBefore.add(note.token);
+    } catch (error) { say(`could not check an earlier send for ${group.id}: ${oneLine(error && error.message || error, 200)}`); }
+  }
   const plan = mutateState((state) => {
+    for (const group of Object.values(state.groups)) {
+      const wake = group.wakeClaim;
+      if (wake && landedBefore.has(wake.token)) {
+        delete group.wakeClaim;
+        group.wokeAt = Number(wake.plannedAt) || now;
+        group.wokeReason = wake.reason || group.wokeReason || '';
+        if (group.state === wake.state) {
+          if (group.state === 'noise') { group.state = 'open'; group.reportersAtMark = 0; }
+          markClean(group, wake.seq);
+        }
+      }
+      const note = group.noteClaim;
+      if (note && landedBefore.has(note.token)) {
+        delete group.noteClaim;
+        if (group.card === note.card) {
+          group.cardNotedAt = Number(note.plannedAt) || now;
+          group.reportersNoted = Number(note.reporters) || 0;
+          markClean(group, note.seq);
+        }
+      }
+    }
     for (const [key, verdict] of verdicts) {
       const item = state.reports[key];
       if (!item || item.state !== 'new') continue;
@@ -658,7 +694,7 @@ async function settleOnce(options) {
         const noted = Number(group.reportersNoted ?? group.reportersAtMark) || 0;
         if (!fresh.length && stats.reporters <= noted) { markClean(group, group.dirtySeq); continue; }
         if (claimLive(group.noteClaim, now)) continue;
-        const claim = claimFor(group.noteClaim, group, now);
+        const claim = { ...claimFor(group.noteClaim, group, now), reporters: stats.reporters };
         group.noteClaim = claim;
         notes.push({
           card: group.card, group: group.id, reporters: stats.reporters, token: claim.token,
@@ -672,7 +708,7 @@ async function settleOnce(options) {
       const agent = reason ? areaAgent(group.area, incidentCfg) : '';
       if (!agent) { markClean(group, group.dirtySeq); continue; }
       if (claimLive(group.wakeClaim, now)) continue;
-      const claim = claimFor(group.wakeClaim, group, now);
+      const claim = { ...claimFor(group.wakeClaim, group, now), agent, reason };
       group.wakeClaim = claim;
       wakes.push({
         agent, group: group.id, area: group.area, reason, reporters: stats.reporters,

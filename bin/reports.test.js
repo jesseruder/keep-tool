@@ -488,6 +488,29 @@ test('a claim whose group changed since gets a new token, so the news is not sup
   assert.notEqual(seen[0].token, 'old');
 });
 
+test('a wake that landed before a crash is acknowledged even though the group changed since', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Login broken'));
+  await f.run([discord('lb', 'alice', { starter: true, id: 'lb' })]);
+  const state = reports.loadState(f.root);
+  const group = state.groups['login-broken'];
+  group.wakeClaim = { at: 1, plannedAt: 1, token: 'sent', seq: group.dirtySeq || 0, state: 'open', card: '', agent: 'app-server', reason: 'reported as a major bug' };
+  group.dirtySeq = (group.dirtySeq || 0) + 1;
+  state.reports['discord:lb'].major = true;
+  fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
+  const seen = [];
+  await reports.ingest({ units: [] }, {
+    root: f.root, config: CFG, withLock: (fn) => fn(), wait: true,
+    deps: { classify: async () => '[]', emit: (name, event) => { seen.push(event); return event; }, flushAgents() {},
+      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {},
+      feedHas: (name, token) => token === 'sent', cardHas: () => false, write() {} },
+  });
+  assert.equal(seen.length, 0, 'no second wake');
+  const after = f.state().groups['login-broken'];
+  assert.equal(after.wakeClaim, undefined);
+  assert.ok(after.wokeAt);
+});
+
 test('merging dirties the target, so moved reporters can cross the bar', async () => {
   const f = fixture();
   f.setVerdicts((prompt) => [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => ({
