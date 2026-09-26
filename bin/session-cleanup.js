@@ -95,9 +95,10 @@ function consoleListing(session, state) {
   const aside = state.setAside?.[session?.id]?.kind;
   if (aside === 'running') return 'Running & waiting';
   if (aside) return null;
-  // As web/app/app.js runningItems: a waiting session with no pane runs nothing.
+  // As web/app/app.js runningItems: a paneless session waiting only on its card
+  // runs nothing.
   if (session?.state === 'running' || (session?.state === 'waiting'
-    && (session.pane || session.runtime?.state === 'external'))) return 'Running & waiting';
+    && (session.pane || session.runtime?.state === 'external' || session.activity?.decision?.source !== 'registry'))) return 'Running & waiting';
   const asking = session?.state === 'needs-input' || session?.activity?.needsInput
     || (state.attention || []).some((item) => item?.sessionId === session?.id && HUMAN_ATTENTION_KINDS.has(item.kind));
   return asking ? 'Waiting on you' : null;

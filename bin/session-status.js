@@ -94,10 +94,12 @@ function activity(session, context = {}) {
   // A one-shot scheduled job (a cron, a /loop wakeup) well past its time has fired.
   const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service'
     && !(job.kind === 'scheduled' && !job.recurring && Number.isFinite(job.expiresAt) && nowMs - job.expiresAt > 10 * 60e3));
-  // 'history-gap' marks transcript history the ledger never read. Once a trusted
-  // footer, a counted process table and a complete companion list all speak, what it
-  // could hide (a shell, an agent, a Codex job) shows in one of them instead.
-  const coveredGap = Boolean(footer) && Number.isInteger(session.agentShells) && session.companionComplete === true;
+  // 'history-gap' marks transcript history the ledger never read. Only a gap the
+  // ledger itself settled as a replaced transcript is discounted, and only once a
+  // trusted footer, a counted process table and a complete companion list all speak,
+  // so what it could hide (a shell, an agent, a Codex job) shows in one of them.
+  const settledGap = ledger?.gapSettled === true && ledger?.gapReason === 'transcript-replaced';
+  const coveredGap = settledGap && Boolean(footer) && Number.isInteger(session.agentShells) && session.companionComplete === true;
   const uncertain = model.background.uncertain.filter((id) => !(coveredGap && id === 'history-gap'));
   const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || uncertain.length
     || model.background.agents.length || ledgerPending || model.conversation.scheduled.length

@@ -288,13 +288,17 @@ test('a RUNNING verdict falls to the rules only when a trusted footer, the proce
 });
 
 test('unread history (history-gap) is not running work, for the model and once the other sources cover it', () => {
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'] }), /Keep tracks for this session: none running/);
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap', 'b1'] }), /still running/);
+  const settled = { caughtUp: true, gapSettled: true, gapReason: 'transcript-replaced', jobs: [] };
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: settled }), /Keep tracks for this session: none running/);
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapSettled: false } }), /still running/, 'an unsettled gap stays unknown');
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapReason: 'hook-transcript-mismatch' } }), /still running/);
+  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap', 'b1'], backgroundJobs: settled }), /still running/);
   const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
   const covered = { ...base, lastAssistantFull: 'Checked in on the card; it is done.', stopVerdict: { verdict: 'running', reason: 'background still running' },
     footer, footerTrusted: true, agentShells: 0, companionComplete: true, unknownBackgroundJobs: ['history-gap'],
-    backgroundJobs: { caughtUp: true, jobs: [] } };
+    backgroundJobs: settled };
   assert.equal(activity(covered).decision.rule, 'conversation-ready');
+  assert.equal(activity({ ...covered, backgroundJobs: { ...settled, gapSettled: false } }).decision.rule, 'model-running', 'an unsettled gap still counts');
   // Without every covering source, the gap still counts as unknown.
   assert.equal(activity({ ...covered, companionComplete: undefined }).decision.rule, 'model-running');
   assert.equal(activity({ ...covered, agentShells: undefined }).decision.rule, 'model-running');

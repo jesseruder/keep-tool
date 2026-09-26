@@ -55,8 +55,10 @@ function eligible(session) {
 function input(session) {
   const text = lastText(session);
   const scheduled = (session.backgroundJobs?.jobs || []).some((job) => job.status === 'pending' && job.kind === 'scheduled');
-  // 'history-gap' is unread transcript history, not a job; it says nothing is running.
-  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).filter((id) => id !== 'history-gap').length
+  // 'history-gap' is unread transcript history, not a job: it is not running work
+  // when the ledger settled it as a replaced transcript, and unknown otherwise.
+  const settledGap = session.backgroundJobs?.gapSettled === true && session.backgroundJobs?.gapReason === 'transcript-replaced';
+  const background = session.pendingBackground || (session.unknownBackgroundJobs || []).filter((id) => !(settledGap && id === 'history-gap')).length
     || (session.lifecycleAgents || []).length || scheduled;
   const check = session.cardCheck;
   const checkLine = !check ? 'none' : check.overdue ? `overdue since ${check.at}, not delivered` : `at ${check.at}`;

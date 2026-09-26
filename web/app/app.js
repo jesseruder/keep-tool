@@ -300,11 +300,13 @@ function runningItems() {
     // out rather than called because bin/ui-focus.test.js evaluates this
     // function's source text in a bare context: a bare identifier from another
     // module is not defined there.
-    // A waiting session with no pane Keep hosts, and none running outside Keep, runs
-    // nothing: a finished check session whose card waits on its next check. Its
-    // card shows the schedule; a question it ended on is under Waiting on you.
+    // A session with no pane Keep hosts (and none outside Keep) that waits only on
+    // its card runs nothing: a finished check session whose card waits on its next
+    // check. The card shows the schedule; a question it ended on is under Waiting on
+    // you. A paneless wait on its own background work stays listed.
     .filter((session) => (session.state === 'running'
-      || (session.state === 'waiting' && (session.pane || session.runtime?.state === 'external'))
+      || (session.state === 'waiting' && (session.pane || session.runtime?.state === 'external'
+        || session.activity?.decision?.source !== 'registry'))
       || state.markedRunning.has(session.id))
       && !session.reviewer && !session.agentName && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));
