@@ -91,6 +91,14 @@ Things that are normal and not findings:
 
 ## Judging
 
+The daemon's CI watch (`bin/ci-watch.js`) already follows each sha pushed by `wt land`
+or cited on a card: a new red goes straight to the session that pushed it and reopens
+its card with a `ci (daemon)` check-in. Your pass is the backstop for what that misses —
+plain pushes nobody cited, a red nobody took (`.keep/ci-watch/watches.json` shows
+`notify.gaveUp`), a branch red across several pushes. Before filing a card for a red,
+look for a `ci (daemon)` entry naming that sha; if its session is on it, name that card
+instead of filing another.
+
 - **A failed workflow on a default branch** is always reported, with its class, job, sha
   and author. A test failure or build break on the newest commit means that repo is not
   deploying: a finding. One that a newer green run already superseded is a line, not a

@@ -15,6 +15,7 @@ const slack = require('./slack.js');
 const summarize = require('./summarize.js');
 const wt = require('./wt.js');
 const health = require('./health.js');
+const ciWatch = require('./ci-watch.js');
 
 const OPEN_STATUSES = new Set(['review', 'landing', 'active', 'waiting', 'blocked']);
 const RECENT_MS = 45 * 86400e3;
@@ -41,6 +42,8 @@ const MODEL_OUTPUT_MAX = 1024 * 1024;
 // Bump when judgePrompt's policy changes: cached verdicts from an older prompt
 // are stale and the entry is judged again.
 const JUDGE_PROMPT_VERSION = 2;
+// Only a commit this recent is watched for CI when the sweep first sees it land.
+const CI_WATCH_MAX_AGE_MS = 86400e3;
 const DEFAULT_CONFIG = Object.freeze({ policy: 'narrow', closeDry: false, judge: 'rules', shadowJudge: null });
 
 function landedDir() { return path.join(keep.ROOT, '.keep', 'landed'); }
@@ -917,7 +920,15 @@ function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches 
   // spending its own, so a citation is never derived twice for one card.
   const items = citations.map((citation) => landedRecord(repo, branch, citation, caches, now, { attempts }));
   if (items.some((item) => !item)) return null;
-  return { entry, items, shas: items.map((item) => item.sha), rules: rulesDecision(entry, task, policy, now) };
+  const shas = items.map((item) => item.sha);
+  let rules = rulesDecision(entry, task, policy, now);
+  if (rules.wouldClose || rules.unsure) {
+    // Pushed is not shipped: a card whose commit's CI is still running, or red, stays
+    // open. The watch releases it on the first sweep after CI goes green.
+    const blocked = ciWatch.blockingFor(repo, shas);
+    if (blocked) rules = { wouldClose: false, reason: blocked, fixed: true };
+  }
+  return { entry, items, shas, rules };
 }
 
 function closeDecision(task, entries, records, fetchOk = true, policy = 'narrow', now = Date.now()) {
@@ -1071,6 +1082,17 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
       if (known) continue;
       fresh.push(record);
       if (record.citedSha) recorded.push(record.sha);
+    }
+    // A sha that just reached the default branch is watched until its CI settles, and
+    // closeContext holds the card until then (bin/ci-watch.js).
+    if (!dry && fetchOk) {
+      for (const record of fresh) {
+        try {
+          ciWatch.register({ repo, sha: record.sha, branch, card: task.id, source: 'landed sweep', maxAgeMs: CI_WATCH_MAX_AGE_MS, now });
+        } catch (error) {
+          process.stderr.write(`keep landed: could not watch CI for ${record.sha.slice(0, 8)}: ${errorText(error)}\n`);
+        }
+      }
     }
 
     const context = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts);

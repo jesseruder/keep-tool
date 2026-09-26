@@ -54,6 +54,7 @@ const CADENCES = Object.freeze({
   slack: { cadenceMs: 15 * 60e3 },
   discord: { cadenceMs: 15 * 60e3 },
   landed: { cadenceMs: 30 * 60e3 },
+  'ci-watch': { cadenceMs: 60e3 },
   'wt-gc': { cadenceMs: DAY_MS },
   'pane-retention': { cadenceMs: HOUR_MS },
   'auto-compact': { cadenceMs: 30e3 },

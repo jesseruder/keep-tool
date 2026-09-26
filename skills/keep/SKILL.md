@@ -181,6 +181,16 @@ background-terminal wake-up is not yet verified.
   `Next:` line without the word `notification`.
 - The daemon adds `landed (daemon)` entries when cited shas reach the default branch
   and may close review cards according to `watch/landed.json`.
+- **Pushed is not shipped.** On a repo with CI, a commit deploys only once CI is green
+  on it. `wt land` refuses to push onto a red default branch; find out why first, and
+  pass `--onto-red "<why>"` (to `wt land` or `keep land`) only when this land is the fix
+  or the red is a known, unrelated check. After a push, Keep watches the sha's CI
+  (`bin/ci-watch.js`): the landed sweep keeps a `landing` card open until CI is green,
+  and a new red sends `[keep] ci red — …` into the session that pushed and reopens its
+  card. Never write "done", "landed" or "deployed" on a card before CI is green on the
+  sha. When a `ci red` message arrives, the red is yours: read the failing job's log,
+  fix it forward or revert, and land the fix before anything else. A plain `git push`
+  is watched only once a check-in cites the sha.
 
 ## Conventions
 

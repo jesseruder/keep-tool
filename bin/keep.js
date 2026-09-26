@@ -1960,9 +1960,9 @@ commands.reviews = (argv) => {
 const KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE = 'For keep-tool, wt land deploys a ready live checkout by fast-forwarding it and restarting the daemon; it reports any skipped or failed deployment, then watches daemon health for up to 90 seconds and names any scheduler that started failing, with the revert to run.';
 
 commands.land = (argv) => {
-  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
+  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool', 'onto-red': 'str' });
   const id = o._[0];
-  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
+  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json] [--onto-red "<why>"]\n'
     + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
     + `  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
   const task = loadTask(id);
@@ -1996,7 +1996,7 @@ commands.land = (argv) => {
   // couple of minutes, and the citation should not wait on that, or be lost with a
   // land whose caller gave up waiting.
   let deploy = null;
-  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; } }); }
+  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; }, card: id, ontoRed: o['onto-red'] }); }
   catch (error) { die(`wt land refused: ${error.message}`); }
   if (!sha) die('wt land had nothing to push');
   const cited = record ? ` (review record ${record.id})` : '';
@@ -2101,9 +2101,9 @@ async function allowRemote(argv, where, deps = {}) {
 
 async function landRemote(argv, where, deps = {}) {
   const remote = deps.remote || require('./remote-cli.js');
-  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool' });
+  const o = parseArgs(argv, { json: 'bool', 'dry-run': 'bool', 'onto-red': 'str' });
   const id = o._[0];
-  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json]\n'
+  if (!id || o._.length > 1) die('usage: keep land <card> [--dry-run] [--json] [--onto-red "<why>"]\n'
     + '  Checks keep allow <card> land, then runs wt land from the current worktree and cites the landed sha.\n'
     + `  ${KEEP_TOOL_LAND_DEPLOYMENT_GUIDANCE}`);
   const value = await fetchLandFacts(id, where, remote);
@@ -2131,7 +2131,7 @@ async function landRemote(argv, where, deps = {}) {
   const wt = deps.wt || require('./wt.js');
   let deploy = null;
   let sha;
-  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; } }); }
+  try { sha = wt.landWorktree(context.worktree, { deferDeploy: (run) => { deploy = run; }, card: id, ontoRed: o['onto-red'] }); }
   catch (error) { die(`wt land refused: ${error.message}`); }
   if (!sha) die('wt land had nothing to push');
   const cited = record ? ` (review record ${record.id})` : '';
@@ -4027,7 +4027,7 @@ function helpText() {
   keep review-route [--json]                   # which reviewer an independent review should go to now
   keep review-route --exhausted <codex-id> --until <when> [-m "..."]   # record an account's usage limit
   keep review-route --clear <codex-id>
-  keep land <card> [--dry-run] [--json]        # keep allow <card> land, then wt land, then cite the sha
+  keep land <card> [--dry-run] [--json] [--onto-red "<why>"]  # keep allow <card> land, then wt land, then cite the sha
                        # exit 3 when the reviewed patches are not exactly what would land
                        # for keep-tool, wt land fast-forwards a ready live checkout, restarts the daemon,
                        # and reports any skipped or failed deployment; it then watches daemon health

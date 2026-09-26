@@ -899,6 +899,61 @@ function checkDaemonSyncPolicy(worktree, opts = {}) {
   ].join('\n'));
 }
 
+// A land stacks its commits on whatever origin/<default> is. When that is red, the
+// new commits do not deploy either, and the red is someone's unfinished fix or a
+// flake nobody reran: the session landing should know before it pushes, and push
+// anyway only on purpose (--onto-red "<why>", typically "this is the fix").
+// Fails open: no GitHub origin, or gh missing or failing, lands as before.
+function checkBranchCi(main, worktree, defaultName, opts) {
+  if (process.env.WT_NO_CI_CHECK === '1') return;
+  let head;
+  try { head = git(worktree, ['rev-parse', `origin/${defaultName}`]).trim(); } catch { return; }
+  const result = require('./ci-watch.js').headCheck(main, head);
+  if (!result) return;
+  const ciWatch = require('./ci-watch.js');
+  if (result.verdict === 'running') {
+    process.stderr.write(`wt: CI is still running on origin/${defaultName} (${head.slice(0, 8)}): ${ciWatch.describeRows(result.running)}\n`);
+    return;
+  }
+  if (result.verdict !== 'failed') return;
+  const what = `origin/${defaultName} (${head.slice(0, 8)}) is red: ${ciWatch.describeRows(result.failed)}`;
+  if (opts.ontoRed) {
+    process.stderr.write(`wt: ${what}; landing anyway: ${opts.ontoRed}\n`);
+    return;
+  }
+  const message = [
+    `${what}.`,
+    'Commits landed on a red branch do not deploy until it is green again.',
+    'Find out why (the job log, keep list for a card already on it), then either wait for the fix,',
+    `or land with --onto-red "<why>" when this land is the fix or the red is a known, unrelated check.`,
+  ].join('\n');
+  if (opts.dryRun) process.stderr.write(`wt: ${message}\n`);
+  else die(message);
+}
+
+// After the push: Keep watches the pushed sha's CI and sends a red build to this
+// session (bin/ci-watch.js). On a pane-only node the registry is the daemon's, and
+// the landed sweep registers the sha once the card's check-in cites it.
+function watchLandedCi(main, defaultName, sha, opts) {
+  if (process.env.WT_NO_CI_CHECK === '1') return;
+  try {
+    if (require('./nodes.js').paneOnlyNode(process.env)) return;
+    const ciWatch = require('./ci-watch.js');
+    const session = require('./keep.js').currentSession();
+    const sessionId = session && session.id;
+    const card = opts.card || ciWatch.cardForSession(sessionId);
+    const watch = ciWatch.register({
+      repo: main, sha, branch: defaultName, card, sessionId, source: 'wt land', ontoRed: opts.ontoRed,
+    });
+    if (watch) {
+      process.stderr.write(`wt: Keep is watching CI on ${sha.slice(0, 8)}; a red build is sent to this session`
+        + `${card ? ` and reopens ${card}` : ''}. The work is not done until CI is green.\n`);
+    }
+  } catch (error) {
+    process.stderr.write(`wt: could not register a CI watch for ${sha.slice(0, 8)}: ${error.message}\n`);
+  }
+}
+
 function landWorktree(input, opts = {}) {
   const worktree = gitTopLevel(input || process.cwd());
   if (!worktree) die(`not a git repo: ${path.resolve(expandHome(input || process.cwd()))}`);
@@ -919,6 +974,7 @@ function landWorktree(input, opts = {}) {
       `Push them first (git -C ${main} push origin ${defaultName}), move them to a worktree branch, or drop them (git -C ${main} branch -f ${defaultName} origin/${defaultName}); --ignore-main lands anyway.`,
     ].join('\n'));
   }
+  if (!opts.noPush) checkBranchCi(main, worktree, defaultName, opts);
   if (opts.dryRun) {
     const log = git(worktree, ['log', '--oneline', `origin/${defaultName}..HEAD`]).trim();
     if (log) process.stderr.write(`${log}\n`);
@@ -947,6 +1003,7 @@ function landWorktree(input, opts = {}) {
     if (path.basename(main) === 'keep-tool') checkDaemonSyncPolicy(worktree, opts);
     git(worktree, ['push', 'origin', `HEAD:${defaultName}`], { stdio: ['ignore', 2, 2] });
     process.stderr.write(`landed ${count} commit(s) to origin/${defaultName}\n`);
+    watchLandedCi(main, defaultName, sha, opts);
     if (!opts.noDeploy) {
       // On a node that holds panes for another machine's daemon, the live checkout is
       // the daemon's, so it is asked to deploy itself; the daemon node deploys here.
@@ -1435,11 +1492,12 @@ function main(argv = process.argv.slice(2)) {
     const result = gcWorktrees({ cfg, repo: opts._[0], dryRun: opts['dry-run'], days: opts.days, keepFree: opts['keep-free'] });
     console.log(gcTable(result.rows));
   } else if (command === 'land') {
-    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool', 'no-deploy': 'bool', 'no-health-wait': 'bool' });
-    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy] [--no-health-wait]');
+    const opts = parseArgs(rest, { 'dry-run': 'bool', 'no-push': 'bool', 'ignore-main': 'bool', 'no-deploy': 'bool', 'no-health-wait': 'bool', 'onto-red': 'str' });
+    if (opts._.length > 1) die('usage: wt land [<path>] [--dry-run] [--no-push] [--ignore-main] [--no-deploy] [--no-health-wait] [--onto-red "<why>"]');
+    if (opts['onto-red'] !== undefined && !String(opts['onto-red']).trim()) die('--onto-red needs a reason');
     const sha = landWorktree(opts._[0] || process.cwd(), {
       dryRun: opts['dry-run'], noPush: opts['no-push'], ignoreMain: opts['ignore-main'], noDeploy: opts['no-deploy'],
-      noHealthWait: opts['no-health-wait'],
+      noHealthWait: opts['no-health-wait'], ontoRed: opts['onto-red'],
     });
     if (sha) console.log(sha);
   } else if (command === 'main') {

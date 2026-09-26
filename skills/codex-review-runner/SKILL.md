@@ -107,3 +107,6 @@ keep reviewed <card> --commit origin/<default>..HEAD --verdict clean|findings --
   already past this land belongs to its newer landing session; recover only a safe failure
   the landing still owns, otherwise record the blocker or dependency.
 - Cite the landed shas in the final check-in, not the pre-rebase worktree shas.
+- On a repo with CI the land is not finished at the push: use `--status landing` (the
+  sweep closes the card once CI is green on the sha), or wait for green before `done`.
+  A `[keep] ci red` message means your push broke the build; fix it first.

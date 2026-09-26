@@ -605,6 +605,12 @@ function startSchedulers(ctx) {
   // file is the same as no lint at all.
   require('../lint.js').startScheduler({ onChange: broadcast });
   landed.startScheduler({ onChange: broadcast });
+  // CI on what was just pushed: a red build goes to the session that pushed it and
+  // reopens its card; the landed sweep holds a landing card until CI is green.
+  require('../ci-watch.js').startScheduler({
+    onChange: broadcast,
+    deliver: (sessionIds, text) => deliverUnblockToThread({ fm: { sessions: sessionIds.map((id) => ({ id })) } }, text),
+  });
   // Reviews that were launched and never answered. The sweep reads the Codex job's own
   // state through the snapshot the console already keeps warm, so it costs no extra ps.
   require('../review-obligations.js').startScheduler({ onChange: broadcast, companionSnapshot });
