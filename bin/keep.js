@@ -510,8 +510,12 @@ commands.retitle = (argv) => {
 // anything; a `#n` it cannot resolve off its event loop, so it is checked here, on the
 // id the number names (registry-commands targetRefusal is the route's half).
 function remoteTargetRefusal(sessionArg, sessionId, options = {}) {
-  const caller = (options.env || process.env).KEEP_REMOTE_CALLER;
-  if (!caller) return;
+  const env = options.env || process.env;
+  const caller = env.KEEP_REMOTE_CALLER;
+  // The route names the daemon node itself as the caller for its own admin and local
+  // callers (registry-route callerNode), whose requests act for the daemon node as a
+  // command typed there does, and whose targets the route does not bind.
+  if (!caller || caller === env.KEEP_DAEMON_NODE) return;
   const self = (options.currentSession || currentSession)();
   if (self && self.id === sessionId) return;
   const locate = options.location || ((id) => require('./accounts.js').sessionLocation(id, { root: options.root || ROOT }));

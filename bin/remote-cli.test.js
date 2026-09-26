@@ -607,8 +607,8 @@ test('a node qualifies a bare pane it names for handoff and force-restart, and i
   assert.equal((await runRemote('handoff', ['sess-aws1', '--pane', 'p4', '--account', 'other'], deps)).code, 0);
   assert.deepEqual(sent[0].payload.args, ['sess-aws1', '--pane', 'p4@aws1', '--account', 'other']);
   assert.equal(sent[0].timeoutMs, REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS);
-  assert.equal((await runRemote('force-restart', ['sess-aws1', '--pane=p4@main'], deps)).code, 0);
-  assert.deepEqual(sent[1].payload.args, ['sess-aws1', '--pane=p4@main']);
+  assert.equal((await runRemote('force-restart', ['sess-aws1', '--pane', 'p4@main'], deps)).code, 0);
+  assert.deepEqual(sent[1].payload.args, ['sess-aws1', '--pane', 'p4@main']);
   assert.equal(requestTimeoutMs('move', ['#3', '--node', 'main']), REQUEST_TIMEOUT_MS + MOVE_EXTRA_MS);
   assert.equal(requestTimeoutMs('probe', ['card']), REQUEST_TIMEOUT_MS + PROBE_EXTRA_MS);
   assert.equal(requestTimeoutMs('wait', ['--card', 'x']), REQUEST_TIMEOUT_MS + WAIT_DEFAULT_MS);
@@ -619,6 +619,9 @@ test('a node qualifies a bare pane it names for handoff and force-restart, and i
     ['slack', ['poll'], /only keep slack status/],
     ['accounts', ['add', 'x'], /only keep accounts list/],
     ['codex-jobs', ['--reap'], /--reap stops them/],
+    // parseArgs reads no --flag=value, so the node says so rather than the daemon failing.
+    ['force-restart', ['sess-aws1', '--pane=p4'], /keep reads --pane <value>, never --pane=<value>; write --pane "p4"/],
+    ['restore', ['--project', '--dry', '--project', '/srv/real'], /a node runs only keep restore --dry/],
   ]) {
     const refused = await runRemote(command, args, deps);
     assert.equal(refused.code, 2, command);
@@ -824,7 +827,7 @@ test('fetchArtifact reads one artifact\'s bytes from the daemon with the node to
     [['keep-running', 'on'], null, true, 0], [['delegate', 'card', '--step', '1', '--prepare'], null, true, 0],
     [['move', '#3', '--node', 'main'], null, true, MOVE_EXTRA_MS],
     [['handoff', 'sess-aws1', '--pane', 'p4', '--account', 'other'], ['handoff', 'sess-aws1', '--pane', 'p4@aws1', '--account', 'other'], true, OPEN_EXTRA_MS],
-    [['force-restart', 'sess-aws1', '--pane=p4', '--recover'], ['force-restart', 'sess-aws1', '--pane=p4@aws1', '--recover'], true, OPEN_EXTRA_MS],
+    [['force-restart', 'sess-aws1', '--recover', '--pane', 'p4'], ['force-restart', 'sess-aws1', '--recover', '--pane', 'p4@aws1'], true, OPEN_EXTRA_MS],
   ];
   for (const [typed, expected, inSession, extra] of SENT) {
     test(`a node sends keep ${typed.join(' ')} to the daemon as it will run`, async (t) => {

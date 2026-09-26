@@ -1902,8 +1902,9 @@ rules (`bin/registry-commands.js` holds them):
   delegation (`keep delegate <card> --step <n> --prepare`) and have the worker run
   `keep delegate --accept <id>`, or register it with `--session <sid> --agent <agent>`,
   which names the worker and may be any session.
-- **A node acts on its own sessions.** `move`, `handoff`, `force-restart`, and `mark`,
-  `rename` and `keep-running` with a session named, may name only the calling session
+- **A node acts on its own sessions.** `move`, `handoff`, `force-restart`, `mark`,
+  `rename` and `keep-running` with a session named, and the worker a `delegate
+  --session` registers, may name only the calling session
   or one whose location record places it on the calling node, and a `--pane` must be
   `<pane-id>@<calling node>`; anything else is refused by the daemon (the route checks
   an id before it runs anything, and the daemon's CLI checks the id a `#n` names).
@@ -1921,6 +1922,11 @@ rules (`bin/registry-commands.js` holds them):
   ends the caller's pane partway, so the node never prints the answer, as for a
   forwarded open that replaces it; the daemon carries on and the console shows the
   outcome.
+
+Every rule above reads the arguments the way the CLI's own parser does: a flag taken as
+another flag's value (`--project --dry`) is not that flag. So a node may not send a
+value-taking flag whose value begins with `-`, nor the `--flag=value` spelling, which
+the parser never reads; either is refused on the node with the form to use instead.
 
 What stays on the daemon node says so, with a reason, rather than the generic "the
 registry lives on node …": `serve`, `service`, `restart-daemon`, `sync`, `init`,

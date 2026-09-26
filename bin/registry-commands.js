@@ -225,10 +225,13 @@ const RESTORE_REFUSAL = 'a node runs only keep restore --dry: a real restore ope
 // tell whose move it is: they stay with the daemon node and the console's buttons.
 const MOVE_JOURNAL_REFUSAL = "a node's keep move names the session it moves; recover or abandon a move journal on the daemon node or in the console";
 
-// The refusals a command's arguments alone decide, the same on both sides.
+// The refusals a command's arguments alone decide, the same on both sides. Every flag
+// here is read as the CLI's parseArgs reads it (readArgs): a `--dry` that parseArgs
+// takes as another flag's value is not a --dry.
 function formRefusal(command, args) {
   const sub = subcommandOf(args);
-  const flagged = (name) => args.some((arg, i) => arg === name && !args.slice(0, i).includes('--'));
+  const read = readArgs(command, args);
+  const flagged = (name) => read.bools.has(name.slice(2));
   if (command === 'accounts' && sub !== null && !ACCOUNTS_ALLOWED.includes(sub)) return ACCOUNTS_REFUSAL;
   if (command === 'incidents' && sub !== null && !INCIDENTS_ALLOWED.includes(sub)) return INCIDENTS_REFUSAL;
   if ((command === 'discord' || command === 'slack') && sub !== 'status') return FEED_STATUS_REFUSAL(command);
@@ -237,8 +240,60 @@ function formRefusal(command, args) {
   // commands.delegate splits its argv at the first `--` wherever it stands.
   if (command === 'delegate' && args.includes('--')) return DELEGATE_COMMAND_REFUSAL;
   if (command === 'restore' && !flagged('--dry')) return RESTORE_REFUSAL;
-  if (command === 'move' && (args.some((arg, i) => /^--(recover|abandon)(=|$)/.test(arg) && !args.slice(0, i).includes('--')))) return MOVE_JOURNAL_REFUSAL;
+  if (command === 'move' && (read.values.has('recover') || read.values.has('abandon'))) return MOVE_JOURNAL_REFUSAL;
   return null;
+}
+
+// The flags whose parseArgs kind is 'many': every following argument up to the next
+// flag or -m is a value.
+const MANY_FLAGS = Object.freeze({ add: ['plan'], plan: ['set'] });
+const EQUALS_REFUSAL = (arg) => {
+  const eq = arg.indexOf('=');
+  return `keep reads ${arg.slice(0, eq)} <value>, never ${arg.slice(0, eq)}=<value>; write ${arg.slice(0, eq)} ${JSON.stringify(arg.slice(eq + 1))}`;
+};
+const DASH_VALUE_REFUSAL = (flag) => `${flag} takes a value, and a node's value for it may not begin with "-": keep would read that argument as ${flag}'s value, not as the flag it looks like`;
+
+// `args` read exactly as keep-core.parseArgs reads them for `command`: `--` ends the
+// flags, -m takes the next argument whatever it is, a flag BOOLEAN_FLAGS names takes
+// none, a 'many' flag takes every argument up to the next flag or -m, and every other
+// flag takes the next argument, even one that looks like a flag. Every refusal that
+// reads a flag or a positional reads it from here, so a flag hidden as another flag's
+// value (`--project --dry`) is never mistaken for itself.
+//
+// `refusal` is the first spelling a node may not send: `--flag=value`, which parseArgs
+// reads as an unknown flag named `flag=value` (so the daemon's CLI would only fail), and
+// a value-taking flag whose value begins with "-", which is how a flag is disguised.
+function readArgs(command, args) {
+  const out = { bools: new Set(), values: new Map(), positionals: [], refusal: null };
+  if (!Array.isArray(args)) return out;
+  const many = Object.prototype.hasOwnProperty.call(MANY_FLAGS, command) ? MANY_FLAGS[command] : [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') { out.positionals.push(...args.slice(i + 1)); break; }
+    if (arg === '-m') { i += 1; continue; }
+    if (typeof arg !== 'string' || !arg.startsWith('--')) { out.positionals.push(arg); continue; }
+    const name = arg.slice(2);
+    if (name.includes('=')) { out.refusal ||= EQUALS_REFUSAL(arg); continue; }
+    if (isBooleanFlag(command, name)) { out.bools.add(name); continue; }
+    const values = out.values.get(name) || [];
+    if (many.includes(name)) {
+      while (i + 1 < args.length && args[i + 1] !== '-m' && !String(args[i + 1]).startsWith('--')) values.push(args[++i]);
+    } else if (i + 1 < args.length) {
+      const value = args[++i];
+      if (String(value).startsWith('-')) out.refusal ||= DASH_VALUE_REFUSAL(arg);
+      values.push(value);
+    }
+    out.values.set(name, values);
+  }
+  return out;
+}
+
+// The spelling refusal readArgs finds, for a command parseArgs reads. `keep wait` reads
+// its own argv (bin/wait.js), which refuses a value beginning with "--" itself and
+// reads no `=`; a delegate's `--` is refused outright (formRefusal).
+function spellingRefusal(command, args) {
+  if (command === 'wait') return null;
+  return readArgs(command, args).refusal;
 }
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
@@ -307,7 +362,8 @@ const PLACEMENT_FLAGS = Object.freeze({
   'review-replay': ['--session'],
   // Where the session moves to.
   move: ['--node'],
-  // The worker session a parent registers the delegation to, never the parent.
+  // The worker session a parent registers the delegation to, never the parent; it
+  // must still be one of the calling node's own (sessionTargetOf, targetRefusal).
   delegate: ['--session'],
 });
 
@@ -328,12 +384,16 @@ const PANE_OTHER_NODE_REFUSAL = (flag, node) => `${flag} must be a pane on the c
 // or one the location record places on that node (the route's targetRefusal): with
 // any id it could otherwise interrupt, move or relabel a session it neither owns nor
 // hosts. `tell` and `open` are the deliberate exceptions, reaching any session.
-const TARGET_COMMANDS = Object.freeze(['move', 'handoff', 'force-restart', 'mark', 'rename', 'keep-running']);
+// A delegation's `--session` is its worker: registered against a session elsewhere,
+// that session's later commands would count as delegated work, so it is bound the same
+// way.
+const TARGET_COMMANDS = Object.freeze(['move', 'handoff', 'force-restart', 'mark', 'rename', 'keep-running', 'delegate']);
 function sessionTargetOf(command, args) {
   if (!TARGET_COMMANDS.includes(command) || !Array.isArray(args)) return null;
-  const positionals = positionalsOf(command, args);
-  const flags = args.slice(0, args.includes('--') ? args.indexOf('--') : args.length);
-  if (command === 'rename') return flags.includes('--clear') ? positionals[0] ?? null : positionals.length === 2 ? positionals[0] : null;
+  const read = readArgs(command, args);
+  const positionals = read.positionals;
+  if (command === 'delegate') return read.values.has('session') ? read.values.get('session').at(-1) ?? null : null;
+  if (command === 'rename') return read.bools.has('clear') ? positionals[0] ?? null : positionals.length === 2 ? positionals[0] : null;
   if (command === 'keep-running') return positionals.length === 2 ? positionals[0] : null;
   return positionals[0] ?? null;
 }
@@ -358,22 +418,22 @@ function targetRefusal(command, args, identity, { resolve, location } = {}) {
 }
 
 // `args` with each bare pane value qualified with `local`, the node the CLI runs on:
-// walked the way parseArgs reads it (a `--` ends the flags, -m's value is not one).
+// walked the way parseArgs reads it (a `--` ends the flags, -m's value is not one, a
+// boolean flag takes none and any other flag the next argument). A `--pane=<id>` is
+// left as it is: parseArgs does not read that spelling, and the node refuses it
+// (readArgs) before anything is sent.
 function qualifyPaneArgs(command, args, local) {
   const flags = Object.prototype.hasOwnProperty.call(PANE_FLAGS, command) ? PANE_FLAGS[command] : [];
   if (!flags.length || !Array.isArray(args) || !local) return args;
   const out = [...args];
-  const qualify = (value) => (typeof value === 'string' && value && !value.includes('@') ? `${value}@${local}` : value);
+  const qualify = (value) => (typeof value === 'string' && value && !value.startsWith('-') && !value.includes('@') ? `${value}@${local}` : value);
   for (let i = 0; i < out.length; i += 1) {
     const arg = out[i];
     if (arg === '--') break;
     if (arg === '-m') { i += 1; continue; }
-    if (typeof arg !== 'string' || !arg.startsWith('--')) continue;
-    const eq = arg.indexOf('=');
-    const flag = eq < 0 ? arg : arg.slice(0, eq);
-    if (!flags.includes(flag)) continue;
-    if (eq >= 0) out[i] = `${flag}=${qualify(arg.slice(eq + 1))}`;
-    else if (i + 1 < out.length) { out[i + 1] = qualify(out[i + 1]); i += 1; }
+    if (typeof arg !== 'string' || !arg.startsWith('--') || arg.includes('=') || isBooleanFlag(command, arg.slice(2))) continue;
+    if (i + 1 < out.length && flags.includes(arg)) out[i + 1] = qualify(out[i + 1]);
+    i += 1;
   }
   return out;
 }
@@ -407,35 +467,17 @@ const SESSION_REFUSALS = Object.freeze({
 // needs none. Each reads the positionals the CLI will see (isBareSessionForm).
 const BARE_SESSION_FORMS = Object.freeze(['mark', 'rename', 'keep-running']);
 function isBareSessionForm(command, args) {
-  const positionals = positionalsOf(command, args);
-  const flags = args.slice(0, args.includes('--') ? args.indexOf('--') : args.length);
+  const read = readArgs(command, args);
+  const positionals = read.positionals;
   // keep mark [<#n|id>] --emoji …; --colors lists the palette and names no session.
-  if (command === 'mark') return positionals.length === 0 && !flags.includes('--colors');
+  if (command === 'mark') return positionals.length === 0 && !read.bools.has('colors');
   // keep rename [<#n|id>] "title" | keep rename [<#n|id>] --clear
-  if (command === 'rename') return positionals.length === (flags.includes('--clear') ? 0 : 1);
+  if (command === 'rename') return positionals.length === (read.bools.has('clear') ? 0 : 1);
   // keep keep-running [<#n|id>] on|off
   if (command === 'keep-running') return positionals.length === 1;
   return false;
 }
 const BARE_SESSION_REFUSAL = (command) => `a node's ${command} with no session named acts on the session it is from; run it inside an agent session, or name the session`;
-
-// The positional arguments parseArgs would read for `command`: -m and its value, a
-// flag and (unless the command reads it as boolean, or it carries =) its value are
-// not; after `--` everything is.
-function positionalsOf(command, args) {
-  const out = [];
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--') { out.push(...args.slice(i + 1)); break; }
-    if (arg === '-m') { i += 1; continue; }
-    if (typeof arg === 'string' && arg.startsWith('--')) {
-      if (!arg.includes('=') && !isBooleanFlag(command, arg.slice(2))) i += 1;
-      continue;
-    }
-    out.push(arg);
-  }
-  return out;
-}
 
 function bareSessionRefusal(command, args, identity) {
   if (identity.session || !BARE_SESSION_FORMS.includes(command)) return null;
@@ -448,17 +490,8 @@ function bareSessionRefusal(command, args, identity) {
 // carried on. A node asks for the idle-time form, which files a request and returns.
 const COMPACT_NOW_REFUSAL = "a node's keep compact <id> would compact now and outlast a forwarded command; add --when-idle, or run it on the daemon node";
 function compactRefusal(args) {
-  let named = false;
-  let idle = false;
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (typeof arg !== 'string') continue;
-    if (arg === '--') { named ||= i + 1 < args.length; break; }
-    if (arg === '-m') { i += 1; continue; }
-    if (arg === '--when-idle') idle = true;
-    else if (!arg.startsWith('--')) named = true;
-  }
-  return named && !idle ? COMPACT_NOW_REFUSAL : null;
+  const read = readArgs('compact', args);
+  return read.positionals.length && !read.bools.has('when-idle') ? COMPACT_NOW_REFUSAL : null;
 }
 
 const MAX_ARG_BYTES = 4 * 1024;
@@ -667,7 +700,8 @@ function argumentRefusal(command, args, identity = {}) {
     }
     if (flag && eq < 0 && !isBooleanFlag(command, flag.slice(2))) { value = i + 1; valueFlag = flag; }
   }
-  return null;
+  // Last, so a flag the rules above name is refused under its own reason first.
+  return spellingRefusal(command, args);
 }
 
 // How long a forwarded command may wait on the daemon beyond an ordinary run: a
@@ -823,7 +857,7 @@ function nodeSideRefusal(command, args) {
     if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
   }
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return waitCapRefusal(command);
-  return null;
+  return spellingRefusal(command, args);
 }
 
 // The --wait a forwarded tell asks for, or the --for of a `keep wait` (nine minutes
@@ -833,17 +867,22 @@ function nodeSideRefusal(command, args) {
 // its usage error well inside the ordinary bound.
 function requestedWaitMs(command, args) {
   if ((command !== 'tell' && command !== 'wait') || !Array.isArray(args)) return 0;
-  const flagName = command === 'wait' ? 'for' : 'wait';
   let wait = null;
-  for (let i = 0; i < args.length; i += 1) {
-    const arg = args[i];
-    if (arg === '--') break;
-    if (arg === '-m') { i += 1; continue; }
-    if (typeof arg !== 'string' || !arg.startsWith('--')) continue;
-    const name = arg.slice(2);
-    if (isBooleanFlag(command, name)) continue;
-    i += 1;
-    if (name === flagName) wait = args[i];
+  if (command === 'tell') {
+    const values = readArgs('tell', args).values.get('wait');
+    wait = values && values.length ? values.at(-1) : null;
+  } else {
+    // bin/wait.js parseWaitArgs: each flag takes this many values, --lane two; anything
+    // else, or a value beginning with "--", is its usage error, answered at once.
+    const arity = { '--no-hold': 1, '--scope': 1, '--card': 1, '--lane': 2, '--check-due': 1, '--for': 1, '--interval': 1 };
+    for (let i = 0; i < args.length; i += 1) {
+      const take = arity[args[i]];
+      if (!take) return 0;
+      const values = args.slice(i + 1, i + 1 + take);
+      if (values.length < take || values.some((value) => !value || String(value).startsWith('--'))) return 0;
+      if (args[i] === '--for') wait = values[0];
+      i += take;
+    }
   }
   if (wait == null) return command === 'wait' ? WAIT_DEFAULT_MS : 0;
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
