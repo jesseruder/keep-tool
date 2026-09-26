@@ -213,6 +213,42 @@ test('a failed check-in is retried before the session is told', async () => {
   assert.equal(sent.length, 1);
 });
 
+test('a card that joins a red watch is noted, and a rerun after a day still releases it', async () => {
+  reset();
+  writeCard('ci-late-card', 'done');
+  const { dir, shas } = repo();
+  const at = Date.now();
+  ciWatch.register({ repo: dir, sha: shas[2], branch: 'main', sessionId: 'sess-push', now: at });
+  const table = {
+    [shas[1]]: status(['ci/circleci: test', 'success']),
+    [shas[2]]: status(['ci/circleci: test', 'failure']),
+  };
+  const deliver = async (ids) => ({ sessionId: ids[0] });
+  await ciWatch.tick({ now: at + 60e3, fetch: fakeFetch(table), deliver });
+  ciWatch.register({ repo: dir, sha: shas[2], branch: 'main', card: 'ci-late-card', now: at + 90e3 });
+  await ciWatch.tick({ now: at + 120e3, fetch: fakeFetch(table), deliver });
+  assert.equal(keep.loadTask('ci-late-card').fm.status, 'active');
+
+  const late = at + 25 * 3600e3;
+  table[shas[2]] = status(['ci/circleci: test', 'success']);
+  await ciWatch.tick({ now: late, fetch: fakeFetch(table), deliver });
+  assert.equal(ciWatch.blockingFor(dir, [shas[2]]), null);
+});
+
+test('a pass out of budget stops starting lookups and saves what it read', async () => {
+  reset();
+  const { dir, shas } = repo();
+  const at = Date.now();
+  ciWatch.register({ repo: dir, sha: shas[1], branch: 'main', now: at });
+  ciWatch.register({ repo: dir, sha: shas[2], branch: 'main', now: at });
+  let tick = 0;
+  const result = await ciWatch.tick({
+    now: at + 60e3, budgetMs: 5, clock: () => (tick++ ? 1000 : 0),
+    fetch: fakeFetch({ [shas[1]]: status(['a', 'success']), [shas[2]]: status(['a', 'success']) }),
+  });
+  assert.equal(result.lookups, 0);
+});
+
 test('an intermediate commit is judged by the build of the push that carried it', async () => {
   reset();
   const { dir, shas } = repo({ count: 4 });

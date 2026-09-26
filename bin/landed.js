@@ -922,12 +922,11 @@ function closeContext(task, entries, repo, branch, fetchOk, policy, now, caches 
   if (items.some((item) => !item)) return null;
   const shas = items.map((item) => item.sha);
   let rules = rulesDecision(entry, task, policy, now);
-  if (rules.wouldClose || rules.unsure) {
-    // Pushed is not shipped: a card whose commit's CI is still running, or red, stays
-    // open. The watch releases it on the first sweep after CI goes green.
-    const blocked = ciFailed.has(task.id) ? 'could not register a CI watch for its commits' : ciWatch.blockingFor(repo, shas);
-    if (blocked) rules = { wouldClose: false, reason: blocked, fixed: true };
-  }
+  // Pushed is not shipped: a card whose commit's CI is still running, or red, stays
+  // open, as a fixed rule no model judge can overturn. The watch releases it on the
+  // first sweep after CI goes green.
+  const blocked = ciFailed.has(task.id) ? 'could not register a CI watch for its commits' : ciWatch.blockingFor(repo, shas);
+  if (blocked) rules = { wouldClose: false, reason: blocked, fixed: true };
   return { entry, items, shas, rules };
 }
 
@@ -1104,7 +1103,9 @@ async function sweep({ now = Date.now(), dry = false, only } = {}) {
         if (now - stampMs(citation.entryStamp) <= CI_WATCH_CITATION_MS) watchCi(record.sha);
       }
       const candidate = closeContext(task, entries, repo, branch, fetchOk, config.policy, now, caches, attempts);
-      if (candidate && (candidate.rules.wouldClose || candidate.rules.unsure)) {
+      // Any card the sweep could close, whatever the rules say: a model judge can
+      // turn a rules keep into a close.
+      if (candidate) {
         for (const sha of candidate.shas) if (!watchCi(sha)) ciFailed.add(task.id);
       }
     }
