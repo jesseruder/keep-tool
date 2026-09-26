@@ -272,3 +272,65 @@ test('keep nodes update exits non-zero when only a registry was left behind, and
   assert.equal(json.code, 1);
   assert.deepEqual(JSON.parse(json.lines[0]), [{ node: 'box', ...reply }]);
 });
+
+// A registry clone that git answers for, on a clock the fetch and merge-base move.
+function stubbedRegistry({ fetchMs = 0, mergeBaseMs = 0, mergeMs = 0 } = {}) {
+  let clock = 1_000_000;
+  const calls = [];
+  const before = 'a'.repeat(40);
+  const target = 'b'.repeat(40);
+  const answers = {
+    'rev-parse --abbrev-ref HEAD': 'main', 'rev-parse HEAD': before,
+    'config --get branch.main.remote': 'origin', 'config --get branch.main.merge': 'refs/heads/main',
+    'rev-parse --absolute-git-dir': '/nonexistent/.git', 'rev-parse FETCH_HEAD': target, 'rev-list --count': '2',
+  };
+  const git = async (args, timeoutMs) => {
+    calls.push({ step: args[0], timeoutMs, at: clock });
+    if (args[0] === 'fetch') clock += fetchMs;
+    if (args[0] === 'merge-base') clock += mergeBaseMs;
+    if (args[0] === 'merge') clock += mergeMs;
+    const key = Object.keys(answers).find((prefix) => args.join(' ').startsWith(prefix));
+    return key ? answers[key] : '';
+  };
+  const update = () => updateRegistry({ registry: path.join(os.tmpdir(), `keep-stub-registry-${calls.length}-${Math.random()}`),
+    env: NODE_ENV, git, now: () => clock, exists: () => false });
+  return { calls, update, before, target };
+}
+
+test('a registry update stops before a step it has no time left for, and never starts a merge late', async () => {
+  // A fetch that takes the whole 40 s: the next step is not started, nothing merges.
+  const slow = stubbedRegistry({ fetchMs: 41e3 });
+  const late = await slow.update();
+  assert.deepEqual([late.status, late.reason, late.before, late.branch],
+    ['refused', 'ran out of time before git rev-parse; will be tried again next update', slow.before, 'main']);
+  assert.equal(slow.calls.find((call) => call.step === 'fetch').timeoutMs, 40e3, 'the fetch is capped by the deadline');
+  assert.equal(slow.calls.some((call) => call.step === 'merge'), false);
+
+  // Under a second left once the ancestry check is done: the merge is not started.
+  const tight = stubbedRegistry({ fetchMs: 38.5e3, mergeBaseMs: 600 });
+  const close = await tight.update();
+  assert.deepEqual([close.status, close.reason, close.target],
+    ['refused', 'ran out of time before git merge; will be tried again next update', tight.target]);
+  assert.equal(tight.calls.find((call) => call.step === 'rev-parse' && call.at > 1_000_000).timeoutMs, 1.5e3,
+    'each call gets what is left, not its own timeout');
+  assert.equal(tight.calls.some((call) => call.step === 'merge'), false);
+
+  // A merge started in time gets its full timeout, and the update reports what it did.
+  const merged = stubbedRegistry({ fetchMs: 35e3, mergeMs: 5e3 });
+  const done = await merged.update();
+  assert.deepEqual([done.status, done.commits], ['updated', 2]);
+  assert.equal(merged.calls.find((call) => call.step === 'merge').timeoutMs, 15e3);
+  assert.equal(merged.calls.find((call) => call.step === 'rev-list').timeoutMs, 1e3, 'a read after the merge still gets a second');
+});
+
+test('the code update keeps its own timeouts, with no deadline', async (t) => {
+  const { node, land } = repos(t);
+  land('two\n');
+  const seen = [];
+  const { execFileSync: run } = require('node:child_process');
+  const result = await updateSelf({ checkout: node, now: () => { throw new Error('the code update reads no clock'); },
+    git: async (args, timeoutMs) => { seen.push([args[0], timeoutMs]); return run('git', ['-C', node, ...args], { encoding: 'utf8' }).trim(); } });
+  assert.equal(result.status, 'updated');
+  assert.deepEqual(seen.find(([step]) => step === 'fetch'), ['fetch', 30e3]);
+  assert.ok(seen.filter(([step]) => step !== 'fetch').every(([, ms]) => ms === 15e3));
+});
