@@ -322,8 +322,15 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
     for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) nodesBools.add(flag[1]);
   }
   assert.deepEqual([...BOOLEAN_FLAGS.nodes].sort(), [...nodesBools].sort(), 'nodes');
+  // `reports` lives in bin/commands/reports.js; every subcommand there is forwarded.
+  const reportsSource = fs.readFileSync(path.join(__dirname, 'commands', 'reports.js'), 'utf8');
+  const reportsBools = new Set();
+  for (const spec of reportsSource.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
+    for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) reportsBools.add(flag[1]);
+  }
+  assert.deepEqual([...BOOLEAN_FLAGS.reports].sort(), [...reportsBools].sort(), 'reports');
   for (const command of REGISTRY_COMMANDS) {
-    if (command === 'turns' || command === 'search' || command === 'nodes') continue;
+    if (command === 'turns' || command === 'search' || command === 'nodes' || command === 'reports') continue;
     const at = starts.findIndex((entry) => entry.name === command);
     assert.ok(at >= 0, `keep.js defines ${command}`);
     // To the next top-level definition of any kind: a helper after a command (the

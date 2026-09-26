@@ -43,6 +43,7 @@ const reviewGroup = require('./commands/review.js');
 const stepGroup = require('./commands/step.js');
 const turnsGroup = require('./commands/turns.js');
 const watcherGroup = require('./commands/watcher.js');
+const reportsGroup = require('./commands/reports.js');
 const secretGroup = require('./commands/secret.js');
 const browserGroup = require('./commands/browser.js');
 const {
@@ -4140,6 +4141,13 @@ ${stepUsage()}
   keep incidents parse <file|-> [--json]
                          # parse one Slack message (or a JSON array of them) the way the
                          # poll does — the way to debug an alert shape without polling
+  keep reports [--all] [--area a] [--json]
+                         # user reports from Discord and Slack, grouped by symptom; a group
+                         # wakes its area's responder past the bar in watch/reports.json
+  keep reports show <group|report-key> | replies
+  keep reports mark <group> noise|known|real [--card <id>] -m "why"
+  keep reports reply <group|report-key> -m "the reply you would send" | answered <report-key>
+  keep reports merge <from-group> <into-group>
   keep incidents close <card-id|signature> -m "why"
                          # close an incident that will never resolve itself (a merged
                          # signature, diagnosed noise): same locked close as the sweep
@@ -4311,7 +4319,7 @@ commands.help = (argv) => {
 };
 
 // Each command group lives in its own file; their tables merge into this one.
-Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands, secretGroup.commands, browserGroup.commands);
+Object.assign(commands, hookGroup.commands, hostGroup.commands, nodesGroup.commands, reviewGroup.commands, stepGroup.commands, turnsGroup.commands, watcherGroup.commands, reportsGroup.commands, secretGroup.commands, browserGroup.commands);
 
 // ---------- main / module ----------
 

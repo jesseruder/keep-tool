@@ -413,6 +413,11 @@ keep incidents [--json]
 keep incidents parse <file|-> [--json]
 keep incidents close <card-id|signature> -m "why"  # close one that will never resolve itself
 keep incidents session <area> [--dry] [--json]   # one area-session tick by hand
+keep reports [--all] [--area a] [--json]         # user-report groups (see User reports)
+keep reports show <group|report-key> | replies
+keep reports mark <group> noise|known|real [--card <id>] -m "why"
+keep reports reply <group|report-key> -m "text" | answered <report-key>
+keep reports merge <from-group> <into-group>
 keep agents [--json]   # agent records: lifecycle, current session, unseen events
 keep agents events <name> [--unseen] [--limit N] [--json]
 keep agents emit <name> --kind <k> [--card <id>] [--severity low|med|high] [--needs-you] [--badge] -m "text"
@@ -2170,6 +2175,59 @@ area agent's feed. That last part is the one
 place outside the daemon's poll that writes into a feed, deliberately: a hand close is a
 lifecycle change like any other, and the agent's own console row is where it is read.
 An unknown target and a missing `-m` are both errors, and nothing is written for either.
+
+## User reports
+
+`bin/reports.js` treats what players post on Discord and Slack the way the incident
+feed treats alerts: most of it is noise one message at a time and signal in aggregate,
+so no card is filed per report. The Discord and Slack watchers hand every message they
+classify to `reports.ingest`, which keeps one record per report in
+`.keep/reports/state.json` — a Discord forum thread, a Discord message in a text
+channel, or a Slack top-level message with its thread — keyed on that thread or
+message, so a report is never recorded twice however many polls see it.
+
+`watch/reports.json` turns it on and says which channels are report sources:
+
+```json
+{
+  "enabled": true,
+  "sources": {
+    "discord:bug-reports": "all", "discord:feedback": "bugs", "discord:cauldron-testing": "bugs",
+    "slack:dev-issue-reports": "all", "slack:wg-multiplayer-bugs": "all", "slack:wg-cauldron": "bugs"
+  },
+  "wakeReporters": 3,
+  "majorTags": ["Major bug"],
+  "incidentWindowMin": 120,
+  "team": ["nikki", "ben"]
+}
+```
+
+`all` makes every thread in the channel a report; `bugs` only a thread the watcher's
+own classifier called a bug. A Slack channel must also be in `watch/slack.json`
+`channels` to be read at all. New reports go to a second Haiku call (`model`, default
+`haiku`) that decides whether each is a report, whether it may be a security report,
+which responder area owns it (`app-server`, `cauldron`, `sandboxes`, or `other` for the
+client, the editors and anything no responder owns; `areas` overrides the descriptions
+it is given) and which symptom group it joins. A report the classifier has not answered
+for stays `new` and is offered again on the next poll.
+
+A group's reporters are the distinct non-team authors across its reports; each Slack
+report counts as one. The team is `team` plus every name the Slack watcher has seen
+post, matched against Discord authors by whole name or first word, and a reply from
+the team marks a report answered instead of adding a reporter. A group in a responder
+area wakes that area's agent with one `user-reports` event, once, when it has
+`wakeReporters` reporters, a `majorTags` tag, a possible security report, or a report
+while an incident in the same area is open or resolved within `incidentWindowMin`.
+`other` groups never wake anyone.
+
+The responder records its verdict with `keep reports mark`: `noise` (the group stays
+quiet until `wakeReporters` more reporters arrive, then wakes again), `known --card` or
+`real --card` (later reports are added to that card as check-ins and never wake
+anyone). `keep reports reply` saves the reply someone should post; `keep reports
+replies` lists the ones whose report the team has not answered, and `answered` clears
+one by hand. `keep reports merge` moves every report of one group into another. The
+daily digest carries a **User reports** section: the groups active since the previous
+morning and the size of the reply queue.
 
 ## Agents
 

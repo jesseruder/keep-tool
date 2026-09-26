@@ -79,6 +79,10 @@ const REGISTRY_COMMANDS = Object.freeze([
   'review-bundle', 'review-stats', 'review-replay',
   'review-note', 'review-ack', 'review-dismiss', 'review-outcome', 'review-idea', 'review-land',
   'alert',
+  // User-report groups (bin/reports.js): a responder on a node reads the groups it
+  // was woken for and records its verdict, reply or merge. Every write is to the
+  // daemon's report store; nothing in a request is run or read from the node.
+  'reports',
 ]);
 // A forwarded `review-land -` document: one reviewer tick's batch.
 const REVIEW_LAND_STDIN_MAX = 1024 * 1024;
@@ -253,6 +257,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   search: ['json', 'all', 'cards', 'conversations'],
   nodes: ['json', 'no-reload'],
   agents: ['json', 'unseen', 'needs-you', 'badge', 'daemon'],
+  reports: ['json', 'all'],
   'review-bundle': ['queue', 'raw', 'force'],
   'review-stats': ['json'],
   'review-note': ['force', 'no-digest'],

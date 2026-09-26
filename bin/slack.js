@@ -1086,6 +1086,32 @@ function advanceContiguous(current, messages, isProcessed) {
   return next;
 }
 
+// User reports ride on the same poll (bin/reports.js). Every Slack poster is on
+// the team, so their names also teach the report store who the team is on
+// Discord. A failure is logged and never holds this watcher's cursor back.
+async function ingestReports(channel, messages, parentByTs, domain, deps) {
+  const units = messages.map((message) => {
+    const unitTs = messageUnitTs(message);
+    const decision = parentByTs.get(unitTs);
+    const starter = !isReply(message);
+    return {
+      source: 'slack', channel, key: `slack:${String(channel).replace(/^#/, '')}:${unitTs}`,
+      id: String(message.ts), from: message.from || 'unknown', text: messageBody(message),
+      at: Math.round(tsNumber(message.ts) * 1000) || Date.now(),
+      permalink: permalink(domain, channel, unitTs),
+      title: starter ? oneLine(messageBody(message), 120) : '',
+      bug: Boolean(decision && decision.kind === 'bug'), starter,
+    };
+  });
+  try {
+    await (deps.ingestReports || require('./reports.js').ingest)({
+      units, slackNames: messages.map((message) => message.from).filter(Boolean),
+    });
+  } catch (error) {
+    process.stderr.write(`keep slack: user reports not recorded: ${String(error && error.message || error).split('\n')[0]}\n`);
+  }
+}
+
 async function poll(options = {}) {
   const dry = Boolean(options.dry);
   const cfg = options.config || config();
@@ -1243,6 +1269,7 @@ async function poll(options = {}) {
         domain, seen, threadRecords: item.records, input, dry,
       }, deps);
       results.push(...landed);
+      if (!dry) await ingestReports(item.channel, selectedBatch, parentByTs, domain, deps);
       if (!dry) {
         for (const [message, decision, entry] of selectedBatch.map((message, index) => [message, decisions[index], landed[index]])) {
           const parentTs = isReply(message) ? String(message.thread_ts || '') : String(message.ts);
@@ -1390,6 +1417,7 @@ module.exports = {
   whoamiDomain,
   workspaceDomain,
   parseClassification,
+  extractJsonArray,
   buildPrompt,
   messageForPrompt,
   messageBody,

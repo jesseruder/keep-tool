@@ -64,6 +64,9 @@ function buildDigest(options = {}) {
   }).filter((idea) => idea.at >= since.getTime() && idea.at <= now.getTime())
     .sort((a, b) => b.at - a.at);
   section('Ideas', ideas, ({ task, proposal }) => `- **${task.fm.title || task.id || 'Untitled idea'}**${proposal ? ` — ${proposal}` : ''}`);
+  let reportsSection = '';
+  try { reportsSection = require('../reports.js').digestSection(since.getTime()); } catch {}
+  if (reportsSection) lines.push(...reportsSection.split('\n'));
   const ideaIds = new Set(ideas.map(({ task }) => task.id));
   const statusTasks = tasks.filter((task) => !ideaIds.has(task.id));
   section('Needs you', statusTasks.filter((t) => t.fm.status === 'review'), (t) => `- **${t.id}**: ${t.fm.title}${last(t)}`);

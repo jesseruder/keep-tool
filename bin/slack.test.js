@@ -647,6 +647,26 @@ test('cards mode creates one card and two thread check-ins for a folded bug thre
   }
 });
 
+test('a poll hands a report channel thread to the report store as one report and learns the posters as team', () => {
+  const fixture = foldedThreadScenario();
+  try {
+    fs.writeFileSync(path.join(fixture.root, 'watch', 'reports.json'), JSON.stringify({ enabled: true }));
+    const result = pollProcess(fixture.root, path.join(__dirname, 'slack.js'), {
+      KEEP_JESSE_MCP: fixture.mcp, KEEP_CLAUDE: fixture.claude,
+    });
+    assert.equal(result.status, 0, result.stderr);
+    const state = JSON.parse(fs.readFileSync(path.join(fixture.root, '.keep', 'reports', 'state.json'), 'utf8'));
+    const record = state.reports[`slack:wg-cauldron:${fixture.parentTs}`];
+    assert.ok(record, 'the bug thread is a report');
+    assert.equal(record.messages, 3);
+    assert.equal(record.title, 'the files panel is broken');
+    assert.match(record.permalink, /^https:\/\/example\.slack\.com\/archives\/wg-cauldron\/p2000000000001000$/);
+    assert.ok(state.slackNames.Ben, 'Slack posters are remembered as team names');
+  } finally {
+    fs.rmSync(fixture.root, { recursive: true, force: true });
+  }
+});
+
 test('poll lands log decisions, cards and thread check-ins, and correlated alerts end to end', () => {
   const slackModule = path.join(__dirname, 'slack.js');
   const roots = [];

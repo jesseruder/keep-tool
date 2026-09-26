@@ -685,3 +685,39 @@ test('scheduler health uses the configured Discord polling interval', () => {
     detail: 'waiting for first poll',
   });
 });
+
+test('a poll hands each classified message to the report store as its thread, with tags and the bug verdict', () => {
+  const root = fixture({ enabled: true }, { cursor: 0 });
+  const starter = row(1, { channel: 'bug-reports', id: '1528000000000000001', title: 'Passes broken', author: 'alice', text: 'cannot buy a pass' });
+  starter.thread_tags = ['Major bug'];
+  const reply = row(2, { channel: 'bug-reports', title: 'Passes broken', author: 'nikki', text: 'looking' });
+  reply.thread_tags = ['Major bug'];
+  const chat = row(3, { channel: 'cauldron-testing', author: 'bob', text: 'my deck crashes' });
+  const result = run(root, pollScript([starter, reply, chat], `
+    const units = [];
+    deps.ingestReports = async ({ units: batch }) => { units.push(...batch); };
+    deps.classify = async (prompt) => {
+      const input = JSON.parse(prompt.slice(prompt.indexOf('<<<KEEP_INPUT') + 13, prompt.indexOf('KEEP_INPUT>>>')));
+      return JSON.stringify(input.map((message) => ({
+        ts: message.ts, kind: message.text.includes('crashes') ? 'bug' : 'other', summary: 's', severity: 'low',
+        resolved: false, related: [], duplicate_of: null, confidence: 1,
+      })));
+    };
+    await discord.poll({ deps });
+    process.stdout.write(JSON.stringify(units));
+  `));
+  assert.equal(result.status, 0, result.stderr);
+  const units = JSON.parse(result.stdout);
+  assert.equal(units.length, 3);
+  const [first, second, third] = units;
+  assert.equal(first.key, 'discord:1528000000000000001');
+  assert.equal(first.starter, true);
+  assert.deepEqual(first.tags, ['Major bug']);
+  assert.equal(first.title, 'Passes broken');
+  assert.equal(first.text, 'cannot buy a pass', 'the report text is the message, not the classifier prefix');
+  assert.equal(second.key, first.key);
+  assert.equal(second.starter, false);
+  assert.equal(third.key, `discord:${chat.message_id}`);
+  assert.equal(third.bug, true);
+  assert.equal(first.bug, false);
+});

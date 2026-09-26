@@ -44,7 +44,7 @@ how releases and crashes work there:
 
 ## What you read, and how
 
-Load the tools once: `ToolSearch "select:mcp__castle__play_vitals,mcp__castle__play_vitals_freshness,mcp__castle__play_release_status,mcp__castle__play_list_reviews,mcp__castle__ga4_run_report,mcp__castle__sentry_search_events,mcp__castle__sentry_search_issues,mcp__castle__discord_search,mcp__castle__discord_recent,mcp__castle__discord_thread,mcp__jesse__slack_search,mcp__jesse__slack_thread"`.
+Load the tools once: `ToolSearch "select:mcp__castle__play_vitals,mcp__castle__play_vitals_freshness,mcp__castle__play_release_status,mcp__castle__play_list_reviews,mcp__castle__ga4_run_report,mcp__castle__sentry_search_events,mcp__castle__sentry_search_issues,mcp__castle__discord_search"`.
 Then, all read-only:
 
 1. `play_vitals_freshness` — the newest complete DAILY bucket (Los Angeles time). The
@@ -84,23 +84,20 @@ Then, all read-only:
    new review's last-modified time — so it never moves backward — and only when paging
    reached a null `next_page_token`; if any page failed, judge what you got and write
    the previous cursor unchanged, so the next pass reads the rest.
-7. Bug reports from people rather than stores, over the same window as the reviews
-   (since the previous `Reviews cursor:`, or 24 hours):
-   - **Discord**: `discord_recent` with `channel "bug-reports"` and `since` the window
-     start (forum posts carry `thread_title` and tags such as `Major bug`; open one with
-     `discord_thread` only when its title is about the app), then the same for
-     `feedback`. When a vitals or Sentry finding names a symptom, `discord_search` for
-     its words (`crash`, `freeze`, `black screen`, `won't open`, `android`) over the
-     last 7 days. The store refreshes about every 15 minutes and is not complete.
-   - **Slack**: `slack_search` with `"in:#dev-issue-reports after:<yesterday's date>"`
-     and `sort timestamp`: the team's own bug reports, often with a device and a build.
-     `slack_thread` for the replies under one that matters.
-   Count only reports about the mobile app itself — crashes, freezes, not opening,
-   losing work, login, a device or build named — and set aside ones about a deck's own
-   content, the web editor or Cauldron multiplayer (those are other agents' areas).
-   Everyone who posts in Castle's Slack is on the team, and so is a Discord author whose
-   name matches one of them (nikki and ben answer there most): a team reply means
-   someone has the report, so cite it rather than counting the report as unanswered.
+7. Bug reports from people rather than stores. Keep records every report from Discord
+   (the `bug-reports` and `feedback` forums, bugs in `#cauldron-testing`) and the Slack
+   bug channels and groups them by symptom, so read the groups rather than the channels:
+   `keep reports --all --json`, keeping those whose `lastAt` is inside the review window
+   (since the previous `Reviews cursor:`, or 24 hours). The mobile app's groups are
+   mostly in area `other`, since no server responder owns the client; `keep reports show
+   <group>` prints a group's reports and links. Count only groups about the mobile app
+   itself — crashes, freezes, not opening, losing work, login, a device or build named —
+   and set aside a deck's own content, the web editor and Cauldron multiplayer. A group's
+   `reporters` already leaves out the team (everyone in Castle's Slack, and Discord
+   authors whose names match), and `unanswered` counts reports no team member has
+   replied to. When a vitals or Sentry finding names a symptom, `discord_search` for its
+   words (`crash`, `freeze`, `black screen`, `won't open`, `android`) over the last 7
+   days as well: the store refreshes about every 15 minutes and is not complete.
 
 ## Today's baselines (measured 2026-09-25; update when they drift)
 
@@ -141,12 +138,14 @@ Then, all read-only:
   the same breakage (crash on open, can't save, can't log in, a black screen) — and on the
   same `app_version` makes it stronger. Bans, moderation complaints, ads, translation
   requests and one-word reviews are not breakage. Quote the review ids, not the authors.
-- **Bug reports**: Discord and Slack reports count toward a cluster alongside reviews —
-  three or more across the three sources naming the same breakage since the last pass is
-  a cluster — and two independent reports of the same crash on the rolling version are
-  enough to name it as a finding. A report that matches a Sentry issue or a version's
-  errored-user ratio is the strongest evidence you have: cite both. Cite a Discord
-  report by its permalink or thread id and a Slack one by its permalink, never by author.
+- **Bug reports**: a report group's reporters count toward a cluster alongside reviews —
+  three or more across reviews and groups naming the same breakage since the last pass
+  is a cluster — and two independent reporters of the same crash on the rolling version
+  are enough to name it as a finding. A group that matches a Sentry issue or a version's
+  errored-user ratio is the strongest evidence you have: cite both. Cite a group by its
+  id and its reports by their links, never by author. A mobile-app group you name in a
+  finding and open a card for gets `keep reports mark <group> real --card <id> -m
+  "why"`, so later reports land on that card.
 - **Stale vitals** (`play_vitals_freshness` two or more days behind) is not a failure:
   judge the last complete day and say it is stale; only a week's lag is worth a
   needs-you.
@@ -192,7 +191,7 @@ Vitals (<day judged>): crash <x>% (14d median <y>%), ANR <x>% (median <y>%); fre
 Rollout: production <versions serving>; <rolling> at <share>% of GA4 users (<trend>).
 Versions: errored-user ratio <v>: <r>%, <v>: <r>%, <v>: <r>%.
 Reviews: <n> new, <n> at 1–2 stars; cluster: <what, ids> | none. Reviews cursor: <newest last-modified, ISO>.
-Reports: Discord <n> app reports, Slack <n>; <what, links> | none.
+Reports: <n> mobile-app groups active, <n> reporters; <group ids, links> | none.
 iOS: not covered.
 Followup: <card id opened or cited> | none.
 Known: <carried list, or none>." --check-after <tomorrow>T07:45

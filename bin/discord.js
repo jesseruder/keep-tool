@@ -378,7 +378,29 @@ function normalizeRow(row) {
     channelKind: row.channel_kind === 'forum' ? 'forum' : 'text',
     threadId: row.thread_id == null ? null : String(row.thread_id),
     threadTitle: title || null,
+    threadTags: Array.isArray(row.thread_tags) ? row.thread_tags.map(String).slice(0, 8) : [],
+    rawText: text,
     permalink: row.permalink ? String(row.permalink) : null,
+  };
+}
+
+// What bin/reports.js is handed for one classified message: the report is the
+// forum thread, or the message itself in a text channel. A forum post's starter
+// message carries the thread's own id.
+function reportUnit(message, decision) {
+  return {
+    source: 'discord',
+    channel: message.channel,
+    key: message.threadId ? `discord:${message.threadId}` : `discord:${message.id}`,
+    id: message.id,
+    from: message.from,
+    text: message.rawText || message.text,
+    at: Date.parse(String(message.timestamp || '')) || Date.now(),
+    permalink: message.permalink || '',
+    title: message.threadTitle || '',
+    tags: message.threadTags || [],
+    bug: Boolean(decision && decision.kind === 'bug'),
+    starter: !message.threadId || message.threadId === message.id,
   };
 }
 
@@ -487,6 +509,18 @@ async function poll(options = {}) {
     seen[entry.ts] = { state: 'done', classifiedAt: entry.at };
   }
   writeJsonAtomic(SEEN_FILE, seen);
+  // User reports ride on the same poll. A failure there is logged and retried by
+  // the report store itself; it never holds this watcher's cursor back.
+  if (selected.length) {
+    const decisionById = new Map(decisions.map((decision) => [decision.ts, decision]));
+    try {
+      await (deps.ingestReports || require('./reports.js').ingest)({
+        units: selected.map((message) => reportUnit(message, decisionById.get(message.id))),
+      });
+    } catch (error) {
+      process.stderr.write(`keep discord: user reports not recorded: ${String(error && error.message || error).split('\n')[0]}\n`);
+    }
+  }
   // Last, after the decisions and the seen set are on disk: a crash before this line
   // re-reads rows the seen set already skips, never loses one.
   if (advanceTo != null && (advanceTo !== cursor || Boolean(nextBootstrap) !== Boolean(storedBootstrap))) {
@@ -603,6 +637,7 @@ module.exports = {
   isGatewayFailure,
   config,
   agentServerEntries,
+  reportUnit,
   resolveGateway,
   callGateway,
   collectorState,
