@@ -215,6 +215,9 @@ function describeRef(ref, known = {}, loaded = {}, now = Date.now()) {
   return null;
 }
 
+const PATTERNS = { SESSION_REF, NOT_SESSION, CARD_REF, HOLD_ID, SCOPE_LIST, SHA_REF };
+
 module.exports = {
+  PATTERNS,
   findSessionRefs, findCardRefs, findHoldRefs, findShaRefs, findRefs, holdsFor, splitSegments, latestLogEntry, describeRef,
 };

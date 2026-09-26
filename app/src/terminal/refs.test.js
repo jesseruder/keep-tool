@@ -29,6 +29,12 @@ function generatedLines(count) {
     () => pieces[Math.floor(random() * pieces.length)]).join(''));
 }
 
+test('every pattern is the console\'s, character for character', async () => {
+  const web = await import(pathToFileURL(path.join(__dirname, '../../../web/app/terminal-refs.js')).href);
+  const shape = (patterns) => Object.fromEntries(Object.keys(refs.PATTERNS).map((name) => [name, [patterns[name].source, patterns[name].flags]]));
+  assert.deepEqual(shape(refs.PATTERNS), shape(web.PATTERNS));
+});
+
 test('the app finds what the console finds, on every line', async () => {
   const web = await import(pathToFileURL(path.join(__dirname, '../../../web/app/terminal-refs.js')).href);
   for (const line of [...CORPUS, ...generatedLines(3000)]) {

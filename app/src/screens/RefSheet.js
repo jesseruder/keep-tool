@@ -6,6 +6,8 @@ import { mono } from '../ui';
 
 const { describeRef } = require('../terminal/refs');
 
+const SUPERSEDED_RETRY_MS = 2000;
+
 // The sheet a tapped reference in the native terminal opens: the console's hover card
 // for a phone. It shows what the refs view already had at once, then loads the rest
 // (a card's latest check-in, who mentions a session, what a commit is) and redraws.
@@ -18,6 +20,7 @@ export default function RefSheet({ colors, config, known, onClose, onCopy, onOpe
     setLoaded({});
     if (!target) return undefined;
     let live = true;
+    let retry = null;
     const load = (name, promise) => {
       setLoaded((current) => ({ ...current, [name]: { status: 'loading', value: null } }));
       promise.then(
@@ -27,9 +30,16 @@ export default function RefSheet({ colors, config, known, onClose, onCopy, onOpe
       );
     };
     if (target.kind === 'card') load('detail', api.cardDetail(config, target.key));
-    if (target.kind === 'session') load('mentions', api.sessionMentions(config, target.key));
+    // A mentions search another viewer's replaced answers undefined: ask again after
+    // a pause, as the console's hover does, rather than showing it as a failure.
+    if (target.kind === 'session') {
+      const ask = (tries) => api.sessionMentions(config, target.key).then((value) => (value === undefined && tries > 1 && live
+        ? new Promise((resolve) => { retry = setTimeout(resolve, SUPERSEDED_RETRY_MS); }).then(() => ask(tries - 1))
+        : value));
+      load('mentions', ask(4));
+    }
     if (target.kind === 'sha') load('commit', api.commitInfo(config, target.key, project));
-    return () => { live = false; };
+    return () => { live = false; if (retry) clearTimeout(retry); };
   }, [config, project, target]);
 
   const info = target ? describeRef(target, known, loaded) : null;

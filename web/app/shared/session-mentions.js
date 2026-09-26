@@ -31,7 +31,7 @@
     return hit ? hit.start : -1;
   }
 
-  const api = { findSessionMentions, mentionIndex };
+  const api = { findSessionMentions, mentionIndex, PATTERNS: { SESSION_REF: REF, NOT_SESSION } };
   if (typeof module !== 'undefined' && module.exports) module.exports = api;
   root.KeepSessionMentions = api;
 })(globalThis);

@@ -28,6 +28,17 @@ export function findSessionRefs(text) {
 // `in-flight` reach the lookup and stay text unless a card has that id.
 const CARD_REF = /(?<![\w./@:-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w/@-]|\.\w)/g;
 
+// The patterns themselves, so the phone app's copies (app/src/terminal/refs.js) can
+// be checked against them exactly.
+export const PATTERNS = {
+  get SESSION_REF() { return globalThis.KeepSessionMentions.PATTERNS.SESSION_REF; },
+  get NOT_SESSION() { return globalThis.KeepSessionMentions.PATTERNS.NOT_SESSION; },
+  get CARD_REF() { return CARD_REF; },
+  get HOLD_ID() { return HOLD_ID; },
+  get SCOPE_LIST() { return SCOPE_LIST; },
+  get SHA_REF() { return SHA_REF; },
+};
+
 export function findCardRefs(text) {
   return [...String(text || '').matchAll(CARD_REF)].map((match) => ({ key: match[0], start: match.index, end: match.index + match[0].length }));
 }
