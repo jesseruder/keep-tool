@@ -24,7 +24,8 @@ import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { nodeStripHTML, nodeStatsHealthRowsHTML } from './node-stats.js';
 import { numLabel } from './session-number.js';
-import { describeSession } from './session-links.js';
+import { describeCard, describeHolds, describeSession, findCardRefs, findHoldRefs, findSessionRefs, holdsFor } from './terminal-refs.js';
+import { recentLogEntries } from './card-log.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser, defaultModels } from './session-launcher.js';
 import { providerIconHTML } from './provider-icon.js';
@@ -782,35 +783,90 @@ async function removePane(pane) {
   await api.removePane(pane);
   await dropPane(pane);
 }
-// `#n` in any terminal names a session: the hover card and ⌘-click read the
-// console's current rows, so they follow the session as it moves on. xterm asks
-// about every reference on each row the pointer crosses, so the numbers are indexed
-// once per published session list rather than scanned per question.
-let sessionNumIndex = { sessions: null, byNum: new Map() };
-function sessionByNum(num) {
-  if (sessionNumIndex.sessions !== data.sessions) {
+// What agents print about each other in a terminal: `#n` sessions, card ids, and
+// holds by id or scope. The hover cards and ⌘-click read the console's current
+// rows, so they follow what they name as it moves on. xterm asks about every
+// reference on each row the pointer crosses, so sessions and cards are indexed once
+// per published list rather than scanned per question.
+let refIndex = { sessions: null, tasks: null, byNum: new Map(), byCard: new Map(), cardSession: new Map() };
+function refLists() {
+  if (refIndex.sessions !== data.sessions || refIndex.tasks !== data.tasks) {
     const byNum = new Map();
-    for (const session of data.sessions || []) if (Number.isInteger(session?.num)) byNum.set(session.num, session);
-    sessionNumIndex = { sessions: data.sessions, byNum };
+    const cardSession = new Map();
+    const live = (session) => Boolean(session.pane && paneMap().get(session.pane)?.alive);
+    for (const session of data.sessions || []) {
+      if (Number.isInteger(session?.num)) byNum.set(session.num, session);
+      // A card's own session: a live one before an exited one, then the newest.
+      if (!session?.taskId || session.reviewer) continue;
+      const held = cardSession.get(session.taskId);
+      if (!held || (live(session) && !live(held)) || (live(session) === live(held) && (session.mtime || 0) > (held.mtime || 0))) {
+        cardSession.set(session.taskId, session);
+      }
+    }
+    const byCard = new Map((data.tasks || []).filter((task) => task?.id).map((task) => [task.id, task]));
+    refIndex = { sessions: data.sessions, tasks: data.tasks, byNum, byCard, cardSession };
   }
-  const session = sessionNumIndex.byNum.get(num);
+  return refIndex;
+}
+function sessionByNum(num) {
+  const session = refLists().byNum.get(num);
   return session && !isClosingSession(session.id, session.pane) ? session : null;
 }
-const sessionLinks = {
+function openSessionRef(session) {
+  if (!session) return;
+  rememberSession(session.id, 'triage');
+  navigateHistory({ sessionId: session.id, view: 'triage' });
+  refresh();
+}
+const refProject = (path) => projectOf(path).name;
+const terminalRefs = {
   esc,
-  has: (num) => Boolean(sessionByNum(num)),
-  lookup: (num) => describeSession(sessionByNum(num), {
-    tasks: data.tasks, rel, statusOf: sessionLabel,
-    projectName: (path) => projectOf(path).name,
-    nodeOf: (session) => sessionNode(ctx, session),
-  }),
-  open(num) {
-    const session = sessionByNum(num);
-    if (!session) return;
-    rememberSession(session.id, 'triage');
-    navigateHistory({ sessionId: session.id, view: 'triage' });
-    refresh();
-  },
+  kinds: [
+    {
+      find: findSessionRefs,
+      has: (num) => Boolean(sessionByNum(num)),
+      describe: (num) => describeSession(sessionByNum(num), {
+        tasks: data.tasks, rel, statusOf: sessionLabel, projectName: refProject,
+        nodeOf: (session) => sessionNode(ctx, session),
+      }),
+      open: (num) => openSessionRef(sessionByNum(num)),
+    },
+    {
+      find: findCardRefs,
+      has: (id) => refLists().byCard.has(id),
+      describe(id, update) {
+        const task = refLists().byCard.get(id);
+        if (!task) return null;
+        // The console row has no log; the card's body loads on first hover and the
+        // card redraws when it lands.
+        let detail = null;
+        if (task._detailVersion) {
+          const entry = detailStore.peek('task', id, task._detailVersion);
+          if (entry.status === 'idle') detailStore.ensure('task', id, task._detailVersion).then(update, update);
+          const status = entry.status === 'idle' ? 'loading' : entry.status;
+          detail = { status, entry: entry.value?.body ? recentLogEntries(entry.value.body, 1)[0] : null };
+        }
+        return describeCard(task, { session: refLists().cardSession.get(id), projectName: refProject, statusOf: sessionLabel, rel, detail });
+      },
+      open(id) {
+        const session = refLists().cardSession.get(id);
+        if (session) openSessionRef(session);
+        else toast(`${refLists().byCard.get(id)?.fm?.title || id} has no session to open`);
+      },
+    },
+    {
+      find: findHoldRefs,
+      has: (key) => holdsFor(key, data.holds).length > 0,
+      describe: (key) => describeHolds(key, holdsFor(key, data.holds), {
+        sessionFor: (hold) => (data.sessions || []).find((session) => session.id === hold.sessionId) || null,
+      }),
+      // The holder's session: the one to talk to about the resource.
+      open(key) {
+        const [hold] = holdsFor(key, data.holds);
+        openSessionRef(hold && ((hold.num && sessionByNum(hold.num)) || (data.sessions || []).find((session) => session.id === hold.sessionId)));
+      },
+    },
+  ],
 };
 function mount(container, pane, options = {}) {
   // Triage and Watch are mutually exclusive views of the same local terminal.
@@ -842,7 +898,7 @@ function mount(container, pane, options = {}) {
       // mounting xterm, so it needs the names this pane is known by.
       session: entity.session?.id || currentPane?.meta?.sessionId || '',
       title: entity.title,
-      sessionLinks,
+      terminalRefs,
       onFocus(terminal, element) {
         state.focused = true;
         document.querySelectorAll('.term.focused').forEach((term) => term.classList.remove('focused'));

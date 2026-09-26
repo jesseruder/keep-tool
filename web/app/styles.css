@@ -309,6 +309,7 @@ html.mobile .artifact-save { padding: 4px 0; }
 .session-link-pop .sl-meta { color: var(--muted); margin-bottom: 4px; }
 .session-link-pop .sl-row { display: flex; gap: 8px; }
 .session-link-pop .sl-key { color: var(--faint); min-width: 44px; flex: none; }
+.session-link-pop .sl-quote { margin-top: 4px; padding-left: 8px; border-left: 2px solid var(--line-2); color: var(--muted); }
 .session-link-pop .sl-hint { color: var(--faint); margin-top: 4px; font-size: 11px; }
 .session-actions-content > .btn, .session-actions-content > div > .btn,
 .session-actions-content .account-handoff > summary, .session-actions-content .session-move > summary { width: 100%; justify-content: space-between; padding: 6px 8px; text-align: left; }
