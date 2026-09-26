@@ -575,11 +575,18 @@ export function renderRail(ctx, items) {
         ctx.state.providerFilter = null;
         ctx.state.nodeFilter = null;
         // openReviewPane keeps the pane selected until its own running row exists.
-        if (ctx.paneMap().get(pane.id)?.alive) ctx.openReviewPane(pane.id);
+        const listed = Boolean(ctx.paneMap().get(pane.id)?.alive);
+        if (listed) ctx.openReviewPane(pane.id);
         ctx.state.ensureSelectedVisible = true;
         ctx.state.focused = true;
         ctx.state.focusPane = pane.id;
         ctx.refresh();
+        // On the phone "+ session" lives in the Filters sheet; opening a session goes
+        // on to it, the way a queue tap does, instead of leaving the sheet over the
+        // queue. (A no-op on the desktop.) Only when the new pane is the selection: a
+        // remote launch can answer before its pane is listed, and the stage would then
+        // be some other row's.
+        if (listed) ctx.openMobileStage();
         ctx.toast(`${({ shell: 'Shell', claude: 'Claude Code', codex: 'Codex', pi: 'Pi' })[selection.kind]} opened in ${project.name}`,
           { label: 'Pin', run: () => ctx.pinPane(pane.id, title) });
       });

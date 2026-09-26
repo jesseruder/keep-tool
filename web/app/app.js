@@ -1434,7 +1434,7 @@ const ctx = {
   state, get data() { return data; }, closingSessions, isClosingSession, beginClose, esc, rel, projectOf, projectIcon, projectHTML, tagsHTML, knownProjects,
   queueItems, runningItems, pinnedItems, recentItems, triageItems, toggleCollapsed, toggleRunning, toggleRecent, setSelected,
   itemKey, triageKey, eventKey, sessionFor, taskFor, paneMap, entityForPane, kindLabel, limitResumeFor, toast, dismiss, restore, setAside, setAsideFor, isMarkedRunning,
-  pinPane, startShell, newSession, reopenSession, removePane, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
+  pinPane, startShell, newSession, reopenSession, removePane, openMobileStage, isPanePinned, knownPaneCount, saveLayouts, dropPane, mount, patchHTML, clearElement, refresh, reload,
   scheduleTerminalFit, setTerminalRenderer, setPredictTyping, setMode, setDock, toggleFocus, focusTerminal, focusDebug, retainedSelectionItem,
   detail(kind, item) { return item ? detailStore.peek(kind, item.id, item._detailVersion) : { status: 'idle', value: null, error: '' }; },
   ensureDetail(kind, item) { return item && item._detailVersion ? detailStore.ensure(kind, item.id, item._detailVersion) : Promise.resolve(item || null); },
