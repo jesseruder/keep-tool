@@ -17,8 +17,10 @@ import Setup from './src/screens/Setup';
 import Spike from './src/screens/Spike';
 import Terminal from './src/screens/Terminal';
 import { makeStyles } from './src/ui';
+import { useKeyboardTop, useViewBottom } from './src/keyboard';
 
 const push = require('./src/push');
+const { keyboardPadding } = require('./src/keyboard-padding');
 const servers = require('./src/servers');
 const { drainShellQueue, queueShellMessage } = require('./src/bridge');
 
@@ -286,10 +288,17 @@ export default function App() {
   );
 }
 
+// Every screen's frame: clear of the status bar and gesture bar, and with the keyboard
+// open, clear of the keyboard too (src/keyboard-padding.js says why the app does that).
 function Frame({ background, children }) {
   const insets = useSafeAreaInsets();
+  const keyboardTop = useKeyboardTop();
+  // The frame's outer bottom edge: padding sits inside it, so changing the padding never
+  // moves the edge being measured.
+  const { ref, onLayout, bottom } = useViewBottom(keyboardTop);
+  const paddingBottom = keyboardPadding({ insetBottom: insets.bottom, frameBottom: bottom, keyboardTop });
   return (
-    <View style={{ backgroundColor: background, flex: 1, paddingBottom: insets.bottom, paddingTop: insets.top }}>
+    <View onLayout={onLayout} ref={ref} style={{ backgroundColor: background, flex: 1, paddingBottom, paddingTop: insets.top }}>
       {children}
     </View>
   );

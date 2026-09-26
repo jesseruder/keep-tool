@@ -5,6 +5,7 @@ import {
   ActivityIndicator,
   AppState,
   BackHandler,
+  Keyboard,
   Linking,
   Platform,
   Pressable,
@@ -166,6 +167,29 @@ export default function Console({ colors, config, onBadge, onNotify, onOpenSetup
     });
     return () => subscription.remove();
   }, [trigger]);
+
+  // Dismissing the keyboard (Back, or the keyboard's own hide key) leaves the page's
+  // field focused, and a WebView does not raise the keyboard again for a tap on a field
+  // that is already focused: the reply box went dead until the stage was reopened. So
+  // the field is let go when the keyboard goes, and the next tap is a fresh focus.
+  // (Android 10 and earlier with adjustResize send no keyboardDidHide, so there the
+  // field is not let go; the window still resizes, so the box is at least not hidden.)
+  useFocusEffect(useCallback(() => {
+    let pending = null;
+    const hidden = Keyboard.addListener('keyboardDidHide', () => {
+      // A hide that is only a moment (a rotation, the keyboard switching) is followed by
+      // a show; the field the user is typing into must not be let go then.
+      if (pending) clearTimeout(pending);
+      pending = setTimeout(() => {
+        pending = null;
+        if (Keyboard.isVisible()) return;
+        webRef.current?.injectJavaScript(
+          "(function(){var a=document.activeElement;if(a&&a!==document.body&&typeof a.blur==='function'&&/^(INPUT|TEXTAREA)$/.test(a.tagName))a.blur();})(); true;",
+        );
+      }, 250);
+    });
+    return () => { hidden.remove(); if (pending) clearTimeout(pending); };
+  }, []));
 
   // The console is a full app with its own history; the hardware back button walks
   // that first and only then falls through to the navigator.
