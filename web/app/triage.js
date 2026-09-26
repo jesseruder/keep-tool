@@ -240,6 +240,8 @@ export function agentForStage(ctx, item, session) {
   if (live) return live;
   return (pane && agents.find((agent) => agent.session?.pane === pane))
     || (sessionId && agents.find((agent) => agent.session?.id === sessionId))
+    // An idle agent's last run, opened from its row: still that agent's stage.
+    || (sessionId && agents.find((agent) => !agent.session?.id && agent.lastSession?.id === sessionId))
     || null;
 }
 
@@ -413,9 +415,13 @@ function openAgent(ctx, name) {
     return;
   }
   const session = agentSession(ctx, agent);
-  const id = session?.id || agent.session?.id || agent.lastSession?.id;
+  const id = session?.id || agent.session?.id;
   if (id) { ctx.openReviewSession?.(id); return; }
-  ctx.toast?.(`${name} has no session to open`);
+  // The last run opens only while the session list still carries it (48 hours):
+  // an id it does not list reads to the stage as a conversation still being made.
+  const last = agent.lastSession?.id;
+  if (last && (ctx.data?.sessions || []).some((candidate) => candidate.id === last)) { ctx.openReviewSession?.(last); return; }
+  ctx.toast?.(last ? `${name}'s last run is older than the session list; it has no session to open` : `${name} has no session to open`);
 }
 
 // Collapsing the log column is Owner's, and it outlives a reload: the same

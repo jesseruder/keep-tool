@@ -186,6 +186,15 @@ test('a stale agent record resolves the live stamped session for filtering and s
     'the selected agent moves to its live session even when the record still names the old one');
 });
 
+test('an idle agent\'s last run is still that agent\'s stage', async () => {
+  const { agentForStage } = await import('./triage.js');
+  const idle = { name: 'ci-health', session: null, lastSession: { id: 'sid-run', card: 'ci', at: 1 } };
+  const working = { name: 'other', session: { id: 'sid-now' }, lastSession: { id: 'sid-run' } };
+  const ctx = ctxFor({ agents: [working, idle], sessions: [{ id: 'sid-run', kind: 'claude', state: 'exited', exited: true, mtime: 5 }], panes: [] });
+  assert.equal(agentForStage(ctx, { kind: 'session', sessionId: 'sid-run' })?.name, 'ci-health',
+    'only an agent with no current session claims its last run');
+});
+
 test('Recent limits after filtering so older matching clients remain reachable', async () => {
   const fs = await import('node:fs');
   const vm = await import('node:vm');
