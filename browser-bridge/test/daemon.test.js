@@ -226,6 +226,8 @@ test("a rename the host fails is reported, and the session keeps its name", asyn
   const refused = await rename(port, { owner, name: "#405" });
   assert.equal(refused.status, 502);
   assert.match((await refused.json()).error, /the host is busy/);
+  const status = await client.callTool({ name: "browser_status", arguments: {} });
+  assert.match(status.content[0].text, /Session: old/);
 });
 
 test("without the header the session is named after the client, numbered", async (t) => {

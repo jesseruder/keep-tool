@@ -178,19 +178,26 @@ export class BridgeClient {
    * rename is reconnected: either way the hello carries it, and this resolves only then.
    */
   async rename(name) {
+    const previous = this.name;
     this.name = name;
-    // Not connected: the hello that connects carries the name.
-    if (!this.connected) {
-      await this.#ensureConnected();
-      return;
-    }
     try {
-      await this.#send("rename", { name });
+      // Not connected: the hello that connects carries the name.
+      if (!this.connected) {
+        await this.#ensureConnected();
+        return;
+      }
+      try {
+        await this.#send("rename", { name });
+      } catch (error) {
+        // A host from before rename: start again, and the new hello carries the name.
+        if (!/Unknown method: rename/.test(error?.message ?? "")) throw error;
+        this.#teardown(new BridgeUnavailableError("reconnecting with a new name"));
+        await this.#ensureConnected();
+      }
     } catch (error) {
-      // A host from before rename: start again, and the new hello carries the name.
-      if (!/Unknown method: rename/.test(error?.message ?? "")) throw error;
-      this.#teardown(new BridgeUnavailableError("reconnecting with a new name"));
-      await this.#ensureConnected();
+      // Refused: a later reconnect must not slip the name in behind the daemon's back.
+      this.name = previous;
+      throw error;
     }
   }
 

@@ -433,8 +433,13 @@ export function createDaemon({
       } finally {
         entry.inFlight -= 1;
       }
-      // Ended (or ended and adopted again) meanwhile: its record is not ours to write.
-      if (sessions.get(id) !== entry) return reply(409, { error: "the session ended while it was being renamed" });
+      // Ended (or ended and adopted again) meanwhile: its record is not ours to write, and
+      // the connection the rename may have just opened goes with it (endSession's close
+      // was a no-op while that connection was still being made).
+      if (sessions.get(id) !== entry) {
+        await closeQuietly(entry.client);
+        return reply(409, { error: "the session ended while it was being renamed" });
+      }
       log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
       entry.name = name;
       known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
