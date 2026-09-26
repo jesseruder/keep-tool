@@ -340,7 +340,7 @@ test('the pool names the target when the configured one is spent, holds when eve
   assert.deepEqual(queue.list(f.root).map((entry) => [entry.sourceAccountId, entry.targetAccountId]), [['two', 'three']]);
 });
 
-test('a rate-limited session on another node is never queued for a transfer', async () => {
+test('a rate-limited session on another node is queued for the parked stop, and only with its limit and source named', async () => {
   const f = fixture();
   f.write({ rateLimitHandoff: { one: 'two' } });
   // The same session twice over, once here and once on aws1, with the qualified
@@ -348,23 +348,82 @@ test('a rate-limited session on another node is never queued for a transfer', as
   const sessions = [
     session({ id: 'session-here' }),
     session({ id: 'session-far', pane: 'pane-1@aws1', node: 'aws1' }),
+    // No limit event to name: nothing the transfer could prove is still current.
+    session({ id: 'session-far-bare', pane: 'pane-2@aws1', node: 'aws1', rateLimit: { type: 'fable_weekly' } }),
   ];
   const usage = { accounts: { two: { agent: 'claude', limits: [{ label: 'Fable wk', percent: 31 }] } } };
+  const asked = [];
   await queue.tick({ root: f.root, env: f.env, now: () => T, log: () => {},
     sessions: async () => sessions, readUsageCache: () => usage,
-    handoffSession: async () => { throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
-  assert.deepEqual(queue.list(f.root).map((entry) => entry.sessionId), ['session-here'],
-    'the policy still queues this machine\'s own, and only it');
+    handoffSession: async (body) => { asked.push(body); throw Object.assign(new Error('Waiting for the turn and background work to finish'), { status: 409 }); } });
+  assert.deepEqual(queue.list(f.root).map((entry) => entry.sessionId).sort(), ['session-far', 'session-here']);
+  const far = queue.readOne(f.root, 'session-far');
+  assert.deepEqual([far.pane, far.sourceAccountId, far.targetAccountId, far.rateLimitAt, far.parkedForce, far.force],
+    ['pane-1@aws1', 'one', 'two', T, true, false]);
+  assert.equal(queue.readOne(f.root, 'session-here').parkedForce, undefined, 'this machine\'s own keeps the graceful stop');
 
-  // The batch the console's button runs says why, rather than passing it over, and
-  // names the pane and node so the console can move it with a forced transfer.
-  fs.rmSync(path.join(queue.dir(f.root), 'session-here.json'));
-  const result = queue.batch({ root: f.root, env: f.env, now: T, log: () => {}, sessions,
+  // The attempt asks for the parked stop only for the node session, and always with
+  // the source account and the limit named; never Owner's force.
+  const farBody = asked.find((body) => body.sessionId === 'session-far');
+  assert.deepEqual(farBody, { sessionId: 'session-far', pane: 'pane-1@aws1', accountId: 'two', intent: 'continue',
+    parkedForce: true, expectedSourceAccountId: 'one', expectedRateLimitAt: T });
+  const hereBody = asked.find((body) => body.sessionId === 'session-here');
+  assert.equal('parkedForce' in hereBody, false);
+  assert.equal(asked.some((body) => 'ownerForce' in body || 'force' in body), false);
+  // Mid-turn on the node is transient: it waits and is asked again, like any other.
+  assert.deepEqual([far.status, far.attempts, far.lastClass], ['queued', 1, 'transient']);
+
+  // The batch the console's button runs reports a node session the policy has already
+  // queued as queued, rather than handing it back for a forced transfer of its own;
+  // one the policy has not queued still comes back with its pane, node and limit.
+  const result = queue.batch({ root: f.root, env: f.env, now: T, log: () => {},
+    sessions: [...sessions, session({ id: 'session-far-2', pane: 'pane-3@aws1', node: 'aws1' })],
     sourceAccountId: 'one', targetAccountId: 'two' });
-  assert.deepEqual(result.queued.map((row) => row.sessionId), ['session-here']);
-  assert.deepEqual(result.skipped, [{ sessionId: 'session-far', pane: 'pane-1@aws1', node: 'aws1',
-    rateLimitAt: T, reason: 'session runs on aws1' }]);
-  assert.equal(queue.readOne(f.root, 'session-far'), null, 'still never queued');
+  assert.deepEqual(result.queued, []);
+  assert.deepEqual(result.skipped, [
+    { sessionId: 'session-here', reason: 'already queued' },
+    { sessionId: 'session-far', reason: 'already queued' },
+    { sessionId: 'session-far-bare', pane: 'pane-2@aws1', node: 'aws1', rateLimitAt: null, reason: 'session runs on aws1' },
+    { sessionId: 'session-far-2', pane: 'pane-3@aws1', node: 'aws1', rateLimitAt: T, reason: 'session runs on aws1' },
+  ]);
+  assert.equal(queue.readOne(f.root, 'session-far-2'), null, 'the batch itself never queues a node session');
+});
+
+test('a parked-stop entry names its limit and source, and its refusals retire or park it like any other', async () => {
+  const f = fixture();
+  assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@aws1', sourceAccountId: 'one',
+    targetAccountId: 'two', parkedForce: true }), /must name its source account and rate limit/);
+  assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@aws1',
+    targetAccountId: 'two', parkedForce: true, rateLimitAt: T }), /must name its source account and rate limit/);
+  assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@aws1', sourceAccountId: 'one',
+    targetAccountId: 'two', parkedForce: 'yes', rateLimitAt: T }), /parkedForce must be a boolean/);
+  assert.throws(() => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@AWS 1', sourceAccountId: 'one',
+    targetAccountId: 'two' }), /exact session and pane/);
+  assert.equal(queue.list(f.root).length, 0);
+
+  const far = (overrides = {}) => session({ id: 'session-far', pane: 'pane-1@aws1', node: 'aws1', ...overrides });
+  const queueIt = () => queue.enqueue(f.root, { sessionId: 'session-far', pane: 'pane-1@aws1', sourceAccountId: 'one',
+    targetAccountId: 'two', rateLimitAt: T, parkedForce: true }, { now: T, log: () => {} });
+  const refuse = (reason) => async () => { throw Object.assign(new Error(reason), { status: 409 }); };
+
+  // The limit cleared in the queue's own snapshot: cancelled before anything is asked.
+  queueIt();
+  await queue.tick(tickDeps(f, async () => assert.fail('a cleared limit is never transferred'),
+    { sessions: async () => [far({ rateLimit: null })] }));
+  assert.deepEqual([queue.readOne(f.root, 'session-far').status, queue.readOne(f.root, 'session-far').note], ['cancelled', 'rate limit cleared']);
+
+  // The transfer's own fresh read from the node found it used since the limit: parked.
+  queueIt();
+  await queue.tick(tickDeps(f, refuse('Session was used after the transfer was requested'), { sessions: async () => [far()] }));
+  let entry = queue.readOne(f.root, 'session-far');
+  assert.deepEqual([entry.status, entry.lastClass], ['parked', 'blocked']);
+
+  // A turn the node's screen shows running is transient; a changed transcript too.
+  queue.cancel(f.root, 'session-far', { now: T, log: () => {} });
+  queueIt();
+  await queue.tick(tickDeps(f, refuse('Session changed before the forced stop; nothing was stopped'), { sessions: async () => [far()] }));
+  entry = queue.readOne(f.root, 'session-far');
+  assert.deepEqual([entry.status, entry.lastClass, entry.parkedForce], ['queued', 'transient', true]);
 });
 
 test('an unusable automationPool is said once per process, not on every tick, and held sessions write no health', async () => {

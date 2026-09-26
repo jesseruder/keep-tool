@@ -693,6 +693,24 @@ function nodeTransferNotForced(node) {
   return error;
 }
 
+function parkedNeedsExpectations(node) {
+  const error = new Error(`A parked-session transfer on ${node} must name the source account and the limit it is for`);
+  error.status = 409;
+  return error;
+}
+
+// A recorded transaction for this same transfer that has already passed its stop: the
+// source was proven stopped, or its artifacts and target are staged behind it. Nothing
+// is left to stop, so its Retry names no limit (handoff-queue.js transferPastStop says
+// the same about the queue's side of it).
+function recordPastStop(record, body) {
+  if (!record || record.pane !== body.pane || record.targetAccountId !== body.accountId
+      || ['done', 'failed'].includes(record.status)) return false;
+  return Boolean(record.sourceStopVerifiedAt)
+    || ['copying', 'staged', 'starting', 'verifying', 'delivering'].includes(record.status)
+    || ['copying-artifacts', 'starting-target', 'verifying-target', 'delivering-continuation'].includes(record.phase);
+}
+
 // Whether a live pane is still the source a recorded transaction was stopping. A Retry
 // arrives here with the pane alive when the recovery branches above did not take it:
 // a transaction that never touched its stop may start it afresh (and adopts the
@@ -764,6 +782,9 @@ async function run(body, deps = {}) {
   if (body.ownerForce !== undefined && typeof body.ownerForce !== 'boolean') {
     const error = new Error('Account handoff ownerForce must be a boolean'); error.status = 400; throw error;
   }
+  if (body.parkedForce !== undefined && typeof body.parkedForce !== 'boolean') {
+    const error = new Error('Account handoff parkedForce must be a boolean'); error.status = 400; throw error;
+  }
   // Which node the pane is on, when it is not this one. Only a caller that wired that
   // node's answers (serve.js handoffSession) may name one, and it must be the pane's.
   const paneNode = deps.paneNode || null;
@@ -799,12 +820,30 @@ async function run(body, deps = {}) {
   // The rate-limit queue never sends it.
   const ownerForce = body.ownerForce === true;
   const force = body.force === true || ownerForce;
+  // parkedForce is the rate-limit queue's stop for a session on another node that is
+  // parked on its limit. The stop signals the captured process tree as Owner's does,
+  // because the graceful stop's job-ledger proof cannot be taken off that node; but it
+  // is nothing else of ownerForce: every preflight and artifact proof runs, and
+  // restartSession stops only after a fresh read from the node shows the same limit,
+  // no turn, tool, background work or question, and an empty prompt with no dialog.
+  const parkedForce = body.parkedForce === true && !ownerForce;
   // A stop that is not Owner's own proves the session idle from its job ledger, which
   // is verified against the transcript on the machine that writes it; for a session
   // on another node that proof cannot be taken here (restartSession refuses the same
   // in-place restart for the same reason). Refused first, before the session, its pane
   // or its node is asked anything and before any record is read or rewritten.
-  if (paneNode && !ownerForce) throw nodeTransferNotForced(paneNode);
+  if (paneNode && !ownerForce) {
+    if (!parkedForce) throw nodeTransferNotForced(paneNode);
+    // The parked stop is only for a session whose account and limit event the caller
+    // names, so the transfer can prove it is still that one; only a Retry of a
+    // transaction already past its stop (nothing left to stop) may omit the limit,
+    // which is asked of the record as soon as it is read, below.
+    if (body.expectedSourceAccountId == null) throw parkedNeedsExpectations(paneNode);
+  }
+  if (parkedForce && !paneNode) {
+    const error = new Error('A parked-session stop is only for a session on another node; this machine\'s sessions stop gracefully');
+    error.status = 409; throw error;
+  }
   const requestedIntent = body.intent == null ? null : body.intent;
   if (requestedIntent != null && !['continue', 'open-only'].includes(requestedIntent)) {
     const error = new Error('Account handoff intent must be continue or open-only'); error.status = 400; throw error;
@@ -819,6 +858,8 @@ async function run(body, deps = {}) {
   }
   const pending = (async () => {
     let current = readOne(root, body.sessionId);
+    // Before the session or its node is asked anything and before the record is touched.
+    if (parkedForce && body.expectedRateLimitAt == null && !recordPastStop(current, body)) throw parkedNeedsExpectations(paneNode);
     const sameTransfer = current?.pane === body.pane && current.targetAccountId === body.accountId;
     const resumable = current && (['stopping', 'copying', 'staged', 'starting', 'verifying', 'delivering', 'recovery-needed'].includes(current.status)
       || current.status === 'failed' && current.phase === 'preflight');
@@ -1061,6 +1102,11 @@ async function run(body, deps = {}) {
     if (!sourceIdentity) {
       const error = new Error('Source agent process identity could not be verified'); error.status = 409; throw error;
     }
+    // Belt and braces for the guard at the top: a parked stop that is about to stop
+    // something always names the limit it is for, which restartSession proves again.
+    if (parkedForce && (body.expectedRateLimitAt == null || agent !== 'claude')) {
+      const error = new Error('A parked-session stop needs the Claude session\'s limit it was requested for'); error.status = 409; throw error;
+    }
     current ||= { id: crypto.randomUUID(), transactionId: null, sessionId: session.id, pane: pane.id,
       agent, sourceAccountId: source.id, targetAccountId: target.id };
     current.transactionId ||= current.id;
@@ -1077,8 +1123,10 @@ async function run(body, deps = {}) {
     // A new stop attempt is forced only if this request is Owner's own; an earlier forced
     // attempt on the same record says nothing about this one.
     if (!ownerForce) delete current.ownerForce;
+    if (!parkedForce) delete current.parkedForce;
     Object.assign(current, { status: 'stopping', phase: 'stopping-source', reason: '', cwd: resumeCwd,
       pid: pane.pid, cols: pane.cols, rows: pane.rows, ...(force ? { force: true } : {}), ...(ownerForce ? { ownerForce: true } : {}),
+      ...(parkedForce ? { parkedForce: true } : {}),
       // Which handoff, if any, launched the pane this transaction is about to stop — the
       // post-hoc stop proof tells that history from a relaunch after this point.
       sourcePaneHandoffTransactionId: pane.meta?.handoffTransactionId || null,
@@ -1134,6 +1182,7 @@ async function run(body, deps = {}) {
       const result = await deps.restartSession({ sessionId: session.id, pane: pane.id, pid: pane.pid, mode: 'now',
         ...(force ? { force: true } : {}) }, {
         ...(paneNode ? restartBase : deps.restartDeps), root, env, ...restartHost, resumeAccount: target, ownerForce,
+        ...(parkedForce ? { parkedForce: true } : {}),
         priorForcedProcesses: Array.isArray(current.forcedProcesses) ? current.forcedProcesses : [], resumeMcpConfig: compatibility.mcpConfig,
         resumeModel: current.model, resumeArgv: current.resumeSpec?.argv, resumeCwd: current.resumeSpec ? current.cwd : null,
         allowTerminalRateLimit: true,
@@ -1144,7 +1193,8 @@ async function run(body, deps = {}) {
         // submit, and a source that dies on its own after that was never stopped by this
         // transaction. A host that refused the Enter outright takes the mark back.
         onExitEnter: () => { current.sourceExitEnterAt = Date.now(); writeOne(root, current); },
-        // An Owner-forced stop signals the captured process tree instead of typing /exit.
+        // An Owner-forced stop, and the queue's parked stop of a node session, signal the
+        // captured process tree instead of typing /exit.
         // Its first signal is this transaction's Enter, and recovery accepts the stop only
         // once every one of these exact processes is gone.
         onForcedStop: (processes, { incomplete = false } = {}) => {

@@ -204,8 +204,9 @@ export function installHandoffControls(container, ctx, sessionId, pane) {
       try {
         const result = await write('/api/handoff-rate-limited', { sourceAccountId, targetAccountId }, 'POST',
           { label: 'Queueing transfers', retry: () => button.click() });
-        // The queue never force-stops a session, and a session on another node moves
-        // only when forced, so the batch hands those back with their pane. This click
+        // A session on another node moves by a forced stop, and the queue's own (the
+        // parked stop) waits for proof the session is idle; so the batch hands those it
+        // has not already queued back with their pane. This click
         // is Owner's own, so each moves now as its own Continue button would move it,
         // except that he saw a count rather than the session: each transfer names the
         // limit and account the batch saw, and refuses a session that has since resumed

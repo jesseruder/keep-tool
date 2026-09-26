@@ -7642,6 +7642,11 @@ async function restartSession(body, deps = {}) {
   // resume below starts the conversation again. The rate-limit handoff queue never
   // sets this; automatic work keeps every proof.
   const ownerForce = deps.ownerForce === true;
+  // The rate-limit queue's stop of a session on another node that is parked on its
+  // limit (account-handoff.js parkedForce): the same forced stop, taken only once
+  // requireParkedAtLimit has proven, from fresh reads, that there is nothing to lose.
+  const parkedForce = deps.parkedForce === true && !ownerForce;
+  const forcedStop = ownerForce || parkedForce;
   let exitInputStarted = false;
   const transient = (reason) => body.mode === 'idle' && !exitInputStarted
     ? new (require('./session-restart').RestartDeferred)(reason) : new InjectionError(409, reason);
@@ -7689,10 +7694,10 @@ async function restartSession(body, deps = {}) {
       && !require('./session-restart').blockingUnknownJobs(session).length;
     const restartSessionState = terminalLimit ? { ...session, endedTurn: true, rateLimit: null } : session;
     // Forced or not, there has to be a live session in its own pane to stop.
-    const reason = ownerForce
+    const reason = forcedStop
       ? (!session || !pane?.alive || pane.meta?.sessionId !== session.id ? 'Session is not live in its original pane' : null)
       : require('./session-restart').refusal(restartSessionState, pane, body.mode === 'idle', { force });
-    if (ownerForce && reason) throw new InjectionError(409, reason);
+    if (forcedStop && reason) throw new InjectionError(409, reason);
     if (pane.pid !== body.pid) throw new InjectionError(409, 'Session process changed');
     if (reason) {
       if (/^Waiting |^Pause session-local scheduled jobs/.test(reason)) throw transient(reason);
@@ -7818,7 +7823,10 @@ async function restartSession(body, deps = {}) {
     };
     // A session move (bin/session-move.js) stops the session here and resumes it on
     // another machine: `afterStop` is handed the stopped pane in place of the resume.
-    if (ownerForce) return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume }, deps);
+    if (forcedStop) {
+      if (parkedForce) await requireParkedAtLimit(session, pane, remotePane ? paneNode : null, deps);
+      return forceStopThenResume({ session, pane, identity: originalIdentity, resume: deps.afterStop || resume }, deps);
+    }
     const ledger = require('./restart-ledger');
     // The job ledger is verified against the session's own transcript. A session on
     // another node has at most a mirror here, which trails it by a hook post, and a
@@ -8079,6 +8087,60 @@ function forceStopDeps(entry, deps, host, save) {
 function priorForcedSurvivors(table, prior) {
   return (Array.isArray(prior) ? prior : []).filter((old) => old && Number.isInteger(old.pid) && typeof old.pidStart === 'string'
     && old.pidStart && (table || []).some((p) => p && !p.zombie && p.pid === old.pid && p.pidStart === old.pidStart));
+}
+
+// Whether a session the rate-limit queue is about to force-stop (parkedForce) is
+// parked on its limit with nothing to lose, taken inside the injection lock just
+// before the stop. The graceful stop's proof reads the job ledger against a
+// transcript on this machine, which a session on another node does not have here;
+// this reads what can be read there, fresh, and refuses on anything short of a
+// session sitting at an empty prompt under the very limit it was queued for:
+//   - the node's own transcript (never the mirror), read twice around the screen check,
+//     must carry the same rate-limit event, no later user turn, and no running turn,
+//     tool, background work, question or plan (the restart refusal a terminal-limit
+//     session passes on this machine), and must not change between the two reads;
+//   - the pane's screen must show no running turn, no dialog and no draft (a ghost
+//     suggestion is told from a draft the way a message send tells it).
+// A running turn or a changed transcript is transient; a draft or dialog parks.
+async function requireParkedAtLimit(session, pane, remoteNode, deps = {}) {
+  if (session?.kind !== 'claude') throw new InjectionError(409, 'Only a Claude session parked on its limit is stopped this way');
+  if (deps.expectedRateLimitAt == null) throw new InjectionError(409, 'A parked-session stop needs the limit it was requested for');
+  const read = async () => {
+    if (!remoteNode) return freshSessionRead(session, deps);
+    try { return await (deps.remoteSessionRead || remoteSessionRead)(session.id, { ...deps, readNode: remoteNode }); }
+    catch (error) {
+      throw new InjectionError(409, `Session activity on ${remoteNode} could not be verified: ${String(error && error.message || error).slice(0, 200)}`);
+    }
+  };
+  const check = (fresh) => {
+    if (!fresh || !Number.isFinite(fresh.mtime)) throw new InjectionError(409, 'Session activity could not be verified');
+    if (String(fresh.rateLimit?.at ?? '') !== String(deps.expectedRateLimitAt)) {
+      throw new InjectionError(409, 'Session no longer carries the account limit this transfer was requested for');
+    }
+    const limitAt = typeof fresh.rateLimit.at === 'number' ? fresh.rateLimit.at : Date.parse(fresh.rateLimit.at);
+    const lastUserAt = Number(fresh.lastUserAt);
+    if (Number.isFinite(limitAt) && Number.isFinite(lastUserAt) && lastUserAt > limitAt) {
+      throw new InjectionError(409, 'Session was used after the transfer was requested');
+    }
+    requireNoUserActivityAfter(deps.expectedNoUserActivityAfter, fresh);
+    const restart = require('./session-restart');
+    const parked = !fresh.toolRunning && !fresh.pendingBackground && !fresh.pendingQuestion && !fresh.pendingPlan
+      && !restart.blockingUnknownJobs(fresh).length;
+    // The daemon's own row carries what the node's tail cannot (the job ledger its
+    // hooks post here); both have to agree that nothing is running.
+    const reason = parked ? restart.refusal({ ...session, ...fresh, endedTurn: true, rateLimit: null }, pane, false) : null;
+    if (!parked) throw new InjectionError(409, 'Waiting for the turn and background work to finish');
+    if (reason) throw new InjectionError(409, reason);
+  };
+  const first = await read();
+  check(first);
+  const target = claimInjectionTarget({ pane: pane.id });
+  const screen = await (deps.readScreen || ((t, lines, scrollback) => readScreen(t, lines, scrollback, deps)))(target, 30, false);
+  if (claudeTurnRunningOutsideDraft(screen, 'claude')) throw new InjectionError(409, 'Waiting for the turn and background work to finish');
+  await probeSuggestion(target, screen, deps);
+  const second = await read();
+  check(second);
+  if (second.mtime !== first.mtime) throw new InjectionError(409, 'Session changed before the forced stop; nothing was stopped');
 }
 
 // Owner-forced restart or handoff. Nothing is typed into the session and the host is
@@ -9553,18 +9615,20 @@ async function handoffQueueSessions(deps = {}) {
 async function handoffPolicySessions(deps = {}) {
   const panes = await (deps.listHostPanes || listHostPanes)({}, true);
   if (!Array.isArray(panes)) return [];
-  // The policy's transfers are never forced, and an unforced transfer of a session on
-  // another node is refused, so a pane there is never a candidate, as policyEnqueue
-  // itself refuses.
+  // A pane on another node is a candidate too: policyEnqueue queues it for the parked
+  // stop (account-handoff.js parkedForce). Its row comes from the daemon's mirror of
+  // its transcript, the cheap local read the compaction tick uses for the same pane;
+  // the transfer itself reads the node.
   const live = panes.filter((pane) => pane && pane.alive === true && pane.agentAlive !== false
-    && pane.meta?.agent === 'claude' && !nodes.isRemotePane(pane));
+    && pane.meta?.agent === 'claude');
   const lookup = deps.claudeSessionFor || ((id) => claudeSessionFor(id, { allowCachedMiss: true }));
+  const mirrored = deps.mirroredCompactRow || mirroredCompactRow;
   const sessions = [];
   for (const pane of hostPanesBySession(live).values()) {
     const id = pane.meta?.sessionId;
     if (typeof id !== 'string' || !/^[A-Za-z0-9_-]+$/.test(id)) continue;
     let session = null;
-    try { session = lookup(id); } catch {}
+    try { session = nodes.isRemotePane(pane) ? mirrored(id, pane, deps) : lookup(id); } catch {}
     if (!session || !session.rateLimit) continue;
     // The pane's account wins over the transcript's, as it does in addHostSessionState.
     const accountId = typeof pane.meta.accountId === 'string' && pane.meta.accountId ? pane.meta.accountId : session.accountId;
@@ -9573,7 +9637,8 @@ async function handoffPolicySessions(deps = {}) {
     // Whether Keep started it by itself: without a rateLimitHandoff key for its
     // source, only these are moved onto the automation pool.
     const unattended = pane.meta?.unattended === true || pane.meta?.reviewer === true;
-    sessions.push({ ...session, id, kind: 'claude', pane: pane.id, ...(accountId ? { accountId } : {}),
+    sessions.push({ ...session, id, kind: 'claude', pane: pane.id, ...(nodes.isRemotePane(pane) ? { node: pane.node } : {}),
+      ...(accountId ? { accountId } : {}),
       ...(model ? { model } : {}), unattended });
   }
   return sessions;
@@ -15179,9 +15244,9 @@ async function handoffSession(body, deps = {}) {
   // the account that holds the conversation now (nodeTranscriptAccount).
   const readDeps = node ? { ...deps, nodeTranscriptPreferStaged: true } : deps;
   if (node) {
-    // Only Owner's forced transfer runs on a node (account-handoff.js says why); said
-    // before the node is asked anything.
-    if (body?.ownerForce !== true) {
+    // Only Owner's forced transfer, or the rate-limit queue's parked stop, runs on a
+    // node (account-handoff.js says why); said before the node is asked anything.
+    if (body?.ownerForce !== true && body?.parkedForce !== true) {
       throw new InjectionError(409, `A session on ${node} is transferred only when forced: use the console's transfer, or keep handoff --force`);
     }
     // An older host is refused by name, before anything is asked of it or journalled.
@@ -18230,6 +18295,7 @@ module.exports = {
   reviewerResumeSpec,
   forceRestartSession,
   priorForcedSurvivors,
+  requireParkedAtLimit,
   applyHostedExitState,
   coldReplayDue,
   backgroundChildFile,

@@ -11379,6 +11379,13 @@ test('an account handoff of a session on another node asks that node first; a ra
     hostRequest: async () => { throw new Error('terminal host is unavailable'); },
     restartSession: async () => { throw new Error('stopped a session its node was never asked about'); },
   }), unreachable);
+  // The rate-limit queue's parked stop gets past that first refusal and asks the node
+  // like Owner's transfer does; account-handoff decides what it may stop.
+  await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws1', accountId: 'two', parkedForce: true,
+    expectedSourceAccountId: 'one', expectedRateLimitAt: 'at' }, {
+    hostRequest: async () => { throw new Error('terminal host is unavailable'); },
+    restartSession: async () => { throw new Error('stopped a session its node was never asked about'); },
+  }), unreachable);
   // One whose host predates the transfer ops is refused by name and version.
   await assert.rejects(handoffSession({ sessionId: 'far', pane: 'p1@aws2', accountId: 'two', ownerForce: true }, {
     hostRequest: async (type) => (type === 'hello' ? { artifacts: 2, transcript: 4 } : assert.fail(`asked ${type}`)),
@@ -13047,17 +13054,22 @@ test('the rate-limit policy reads only live Claude panes, with the pane account 
     { id: 'dead', alive: false, meta: { sessionId: 'dead', agent: 'claude' } },
     { id: 'gone', alive: true, agentAlive: false, meta: { sessionId: 'gone', agent: 'claude' } },
     { id: 'codex', alive: true, meta: { sessionId: 'codex', agent: 'codex' } },
-    { id: 'far@aws1', node: 'aws1', alive: true, meta: { sessionId: 'far', agent: 'claude' } },
+    { id: 'far@aws1', node: 'aws1', alive: true, meta: { sessionId: 'far', agent: 'claude', accountId: 'one' } },
   ];
+  const mirrored = [];
   const sessions = await handoffPolicySessions({
     listHostPanes: async () => panes,
     claudeSessionFor: (id) => {
       looked.push(id);
       return { id, kind: 'claude', accountId: 'one', rateLimit: id === 'limited' ? { at: 5 } : null };
     },
+    // A pane on another node is read from the daemon's mirror of its transcript.
+    mirroredCompactRow: (id, pane) => { mirrored.push([id, pane.id]); return { id, kind: 'claude', node: 'aws1', rateLimit: { at: 7 } }; },
   });
   assert.deepEqual(looked, ['limited', 'calm']);
-  assert.deepEqual(sessions.map((row) => [row.id, row.pane, row.accountId, row.rateLimit.at]), [['limited', 'live', 'two', 5]]);
+  assert.deepEqual(mirrored, [['far', 'far@aws1']]);
+  assert.deepEqual(sessions.map((row) => [row.id, row.pane, row.accountId, row.rateLimit.at, row.node]),
+    [['limited', 'live', 'two', 5, undefined], ['far', 'far@aws1', 'one', 7, 'aws1']]);
   assert.deepEqual(await handoffPolicySessions({ listHostPanes: async () => null, claudeSessionFor: () => assert.fail() }), []);
 });
 
@@ -13612,6 +13624,89 @@ test('an Owner-forced restart signals only the captured process tree and resumes
     await assert.rejects(restartSession(body, relaunched), /Pane changed/);
     assert.deepEqual(state.signals, []);
   } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('the queue\'s parked stop signals the captured tree only after fresh reads show the session idle on the same limit', async () => {
+  const { restartSession } = require('./serve');
+  const cwd = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-parked-force-'));
+  try {
+    const LIMIT = '2026-09-25T10:00:00.000Z';
+    // A session cut off by the limit mid-turn, as the terminal-limit path sees one.
+    const session = { id: 'parked', kind: 'claude', state: 'waiting', project: cwd, endedTurn: false,
+      rateLimit: { at: LIMIT, type: 'seven_day' }, lastUserAt: Date.parse(LIMIT) - 60e3, mtime: 1000 };
+    const state = { live: new Set([10, 11]), signals: [], reads: 0 };
+    const pane = () => ({ id: 'p', pid: 10, createdAt: 'created', alive: state.live.has(10), cwd, cols: 80, rows: 24, attached: 0,
+      meta: { sessionId: 'parked', agent: 'claude' } });
+    const agentRow = { pid: 11, ppid: 10, pidStart: 'agent-start', agent: 'claude', interactive: true, args: 'claude --resume parked' };
+    const table = () => [{ pid: 10, ppid: 1, pidStart: 'shell-start', args: '-zsh' }, agentRow].filter((p) => state.live.has(p.pid));
+    const target = { id: 'claude-two', label: 'Claude Two', agent: 'claude', configDir: cwd };
+    const deps = (fresh = () => session, screen = '❯', extra = {}) => ({ withInjectionLock: (fn) => fn(), sleep: async () => {},
+      resumeAccount: target, parkedForce: true, expectedRateLimitAt: LIMIT, allowTerminalRateLimit: true,
+      buildState: async () => ({ sessions: [session], tasks: [] }),
+      claudeSessionFor: () => { state.reads += 1; return fresh(state.reads); },
+      readScreen: async () => screen,
+      agentProcessRows: async () => table().filter((p) => p.pid === 11),
+      forceRows: async () => table(),
+      forceSignal: async (pid, signal) => { state.signals.push([pid, signal]); state.live.delete(pid); },
+      closeIdleSession: async () => assert.fail('a parked stop types nothing into the session'),
+      waitForHostAgent: async () => {},
+      host: { request: async (type, params) => {
+        if (type === 'hello') return { replaceExited: true };
+        if (type === 'get') return { pane: pane() };
+        if (type === 'replace-exited') { state.replace = params; return { pane: { id: 'p', pid: 99, createdAt: 'again' } }; }
+        throw new Error(`unexpected host request ${type}`);
+      } },
+      ...extra });
+    const body = { sessionId: 'parked', pane: 'p', pid: 10, mode: 'now' };
+    const reset = () => Object.assign(state, { live: new Set([10, 11]), signals: [], reads: 0 });
+
+    // Every refusal lands before anything is signalled.
+    const refusals = [
+      ['mid-turn on a tool', deps(() => ({ ...session, toolRunning: true })), /^Waiting for the turn and background work to finish$/],
+      ['background work', deps(() => ({ ...session, pendingBackground: true })), /^Waiting for the turn and background work to finish$/],
+      ['a question', deps(() => ({ ...session, pendingQuestion: { text: 'which?' } })), /^Waiting for the turn and background work to finish$/],
+      ['the limit cleared', deps(() => ({ ...session, rateLimit: null })), /^Session no longer carries the account limit/],
+      ['a newer limit', deps(() => ({ ...session, rateLimit: { at: '2026-09-25T11:00:00.000Z' } })), /^Session no longer carries the account limit/],
+      ['used since the limit', deps(() => ({ ...session, lastUserAt: Date.parse(LIMIT) + 1000 })), /^Session was used after the transfer was requested$/],
+      ['a turn running on screen', deps(undefined, '✻ Thinking… (esc to interrupt)\n❯'), /^Waiting for the turn and background work to finish$/],
+      ['a dialog on screen', deps(undefined, 'Allow this?\n  1. Yes\nEnter to confirm · Esc to cancel'), /showing a modal/],
+      ['a transcript that moved during the check', deps((n) => ({ ...session, mtime: n === 1 ? 1000 : 2000 })), /^Session changed before the forced stop/],
+      ['no limit named', deps(undefined, '❯', { expectedRateLimitAt: undefined }), /needs the limit it was requested for/],
+    ];
+    for (const [why, refusing, pattern] of refusals) {
+      reset();
+      await assert.rejects(restartSession(body, refusing), (error) => pattern.test(error.message), why);
+      assert.deepEqual(state.signals, [], `${why}: nothing is signalled`);
+    }
+
+    // Parked, idle, at an empty prompt: the captured tree is signalled and the session resumes.
+    reset();
+    let journalled;
+    const result = await restartSession(body, deps(undefined, '❯', { onForcedStop: (processes) => { journalled = processes; } }));
+    assert.equal(result.ok, true);
+    assert.equal(state.reads, 2, 'the transcript is read before and after the screen check');
+    assert.deepEqual(journalled.map((p) => p.pid).sort(), [10, 11]);
+    assert.deepEqual(state.signals.map(([pid]) => pid).sort(), [10, 11]);
+    assert.equal(state.replace.meta.accountId, 'claude-two');
+  } finally { fs.rmSync(cwd, { recursive: true, force: true }); }
+});
+
+test('the parked-stop proof reads a node session from that node, never from here', async () => {
+  const { requireParkedAtLimit } = require('./serve');
+  const LIMIT = '2026-09-25T10:00:00.000Z';
+  const session = { id: 'far', kind: 'claude', rateLimit: { at: LIMIT } };
+  const pane = { id: 'p1@aws1', alive: true, meta: { sessionId: 'far', agent: 'claude' } };
+  const nodes = [];
+  const deps = (read) => ({ expectedRateLimitAt: LIMIT, readScreen: async () => '❯',
+    claudeSessionFor: () => assert.fail('a node session is never read from this machine'),
+    remoteSessionRead: async (id, given) => { nodes.push(given.readNode); return read(id); } });
+  await requireParkedAtLimit(session, pane, 'aws1', deps((id) => ({ id, kind: 'claude', rateLimit: { at: LIMIT }, mtime: 5 })));
+  assert.deepEqual(nodes, ['aws1', 'aws1']);
+  await assert.rejects(requireParkedAtLimit(session, pane, 'aws1', deps(() => { throw new Error('host request timed out'); })),
+    (error) => error.status === 409 && /^Session activity on aws1 could not be verified/.test(error.message)
+      && require('./account-handoff').classifyRefusal(error.message) === 'transient');
+  await assert.rejects(requireParkedAtLimit({ ...session, kind: 'codex' }, pane, 'aws1', deps(() => assert.fail())),
+    (error) => /^Only a Claude session/.test(error.message));
 });
 
 test('a survivor of an earlier forced stop is the same pid and start time, never a reused pid', () => {

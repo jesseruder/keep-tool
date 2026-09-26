@@ -12,7 +12,10 @@
 // console button calls, with the same arguments. Every preflight in that path
 // still runs on every attempt; a refusal classified 'transient' only earns the
 // entry another try later, and a 'blocked' one parks it for a person. `force` is
-// carried from the request that asked for it and is never invented here.
+// carried from the request that asked for it and is never invented here. The one
+// stop the queue asks for by itself is `parkedForce`, for a session on another node
+// parked on its limit (see policyEnqueue), and only ever with the source account and
+// the limit event named, so the transfer can prove it is still that session.
 //
 // The queue launches nothing, types nothing, and closes nothing. Its only side
 // effect is the handoffSession call.
@@ -42,6 +45,8 @@ const PARKED_KEEP_MS = 7 * 24 * 60 * 60e3;
 const MOVE_COOLDOWN_MS = 30 * 60e3;
 
 const SESSION_RE = /^[A-Za-z0-9_-]+$/;
+// A host's pane id, bare or qualified by the node it is on (account-handoff PANE_REF_RE).
+const PANE_RE = /^[A-Za-z0-9_-]+(?:@[a-z0-9]+)?$/;
 // The session-id shape bin/portable-handoff.js and serve.js already validate. A
 // filter that arrives in a request body is not a place to accept anything else:
 // a string, a null or an object used to mean "no filter" would quietly enqueue
@@ -100,7 +105,7 @@ function normalize(input) {
   const pane = String(input?.pane || '');
   const targetAccountId = String(input?.targetAccountId || '');
   const sourceAccountId = input?.sourceAccountId == null ? '' : String(input.sourceAccountId);
-  if (!SESSION_RE.test(sessionId) || !SESSION_RE.test(pane)) throw badRequest('Expected exact session and pane');
+  if (!SESSION_RE.test(sessionId) || !PANE_RE.test(pane)) throw badRequest('Expected exact session and pane');
   if (!accounts.ID_RE.test(targetAccountId)) throw badRequest('Expected an exact target account');
   if (sourceAccountId && !accounts.ID_RE.test(sourceAccountId)) throw badRequest('Expected an exact source account');
   if (sourceAccountId && sourceAccountId === targetAccountId) throw badRequest('source and target account are the same', 409);
@@ -119,7 +124,17 @@ function normalize(input) {
   if (activityBoundary !== null && !Number.isFinite(activityBoundary)) {
     throw badRequest('Queued transfer activityBoundary must be a finite number');
   }
-  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true, rateLimitAt, activityBoundary };
+  if (input?.parkedForce !== undefined && typeof input.parkedForce !== 'boolean') {
+    throw badRequest('Queued transfer parkedForce must be a boolean');
+  }
+  const parkedForce = input?.parkedForce === true;
+  // The parked stop exists only for a limit event the transfer can check is still
+  // current, on an account it can check the session is still on.
+  if (parkedForce && (rateLimitAt === null || !sourceAccountId)) {
+    throw badRequest('A parked-session transfer must name its source account and rate limit');
+  }
+  return { sessionId, pane, sourceAccountId, targetAccountId, force: input?.force === true, rateLimitAt, activityBoundary,
+    ...(parkedForce ? { parkedForce: true } : {}) };
 }
 
 // The moment after which work by the person retires this entry rather than being
@@ -153,7 +168,7 @@ function enqueue(root, input, options = {}) {
     status: 'queued',
     updatedAt: now,
   });
-  log(`queued ${entry.sessionId} ${entry.sourceAccountId || '?'} → ${entry.targetAccountId}${entry.force ? ' (force)' : ''}`);
+  log(`queued ${entry.sessionId} ${entry.sourceAccountId || '?'} → ${entry.targetAccountId}${entry.force ? ' (force)' : ''}${entry.parkedForce ? ' (parked stop)' : ''}`);
   return { entry, created: true };
 }
 
@@ -257,11 +272,14 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
     // sessions Keep started by itself): the owner's own sessions move automatically only
     // off a source they opted in with a rateLimitHandoff key.
     if (!map[sourceAccountId] && (!poolIds.length || session.unattended !== true)) continue;
-    // A queued transfer is never Owner-forced, and an unforced transfer of a session
-    // on another machine is refused (its graceful stop's background-work proof reads
-    // the transcript here), so the retry this entry promises could only ever be
-    // refused. Never enqueued at all.
-    if (nodes.isRemotePane(session)) continue;
+    // A session on another machine cannot be stopped gracefully from here (the graceful
+    // stop's background-work proof reads the transcript on this machine), and a queued
+    // transfer is never Owner-forced. It is queued for the parked stop instead: a forced
+    // stop the transfer takes only after fresh reads from the node show the session
+    // still sitting on this same limit, idle at an empty prompt (serve.js
+    // requireParkedAtLimit). Without a limit event to name there is nothing to prove.
+    const remote = nodes.isRemotePane(session);
+    if (remote && session.rateLimit?.at == null) continue;
     // A parked or cancelled entry is waiting on a person; the policy never
     // overrules that, so only the console's Retry starts one of those again.
     const current = readOne(root, session.id);
@@ -290,7 +308,7 @@ async function policyEnqueue(root, loadSessions, now, deps, log) {
       continue;
     }
     enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId,
-      rateLimitAt: session.rateLimit?.at ?? null }, { now, log });
+      rateLimitAt: session.rateLimit?.at ?? null, ...(remote ? { parkedForce: true } : {}) }, { now, log });
     summary.enqueued += 1;
   }
   if (summary.exhausted) log(`policy held ${summary.exhausted} session(s): the target's weekly window is spent, and no pool account has room`);
@@ -401,6 +419,11 @@ async function attemptOne(root, entry, sessions, now, deps, log) {
       accountId: entry.targetAccountId,
       intent: 'continue',
       ...(entry.force === true ? { force: true } : {}),
+      // The parked stop is only ever sent with the source account named (below), and,
+      // unless the transaction is past its stop and has nothing left to stop, with the
+      // limit too (normalize requires both of the entry); account-handoff refuses it
+      // otherwise.
+      ...(entry.parkedForce === true && entry.sourceAccountId && entry.rateLimitAt != null ? { parkedForce: true } : {}),
       // Belt and braces for the checks above: the transfer re-resolves both
       // itself, before it writes a record or stops anything, so a snapshot this
       // queue read a moment too early cannot move a session that has moved on.
@@ -532,18 +555,21 @@ function batch(deps = {}) {
     if (on !== sourceAccountId) { if (named) skipped.push({ sessionId: session.id, reason: 'not on the source account' }); continue; }
     if (!session.rateLimit) { if (named) skipped.push({ sessionId: session.id, reason: 'not rate limited' }); continue; }
     if (!session.pane) { skipped.push({ sessionId: session.id, reason: 'no live pane' }); continue; }
+    const current = readOne(root, session.id);
+    // Asked first, so a node session the policy already queued for its parked stop is
+    // not also handed back to the console for a forced transfer of its own.
+    if (current && current.status === 'queued') { skipped.push({ sessionId: session.id, reason: 'already queued' }); continue; }
     // Said out loud rather than passed over, so a person who asked for every
     // rate-limited session on an account is told which ones the queue cannot move.
     // The pane and node let the console move them itself with an Owner-forced
-    // transfer, the only kind a session on another node accepts; the limit it saw
-    // lets that transfer refuse a session that has since resumed.
+    // transfer: Owner asked, so the move is his, now, rather than a queue entry that
+    // waits for the parked stop's proofs. The limit it saw lets that transfer refuse
+    // a session that has since resumed.
     if (nodes.isRemotePane(session)) {
       skipped.push({ sessionId: session.id, pane: session.pane, node: session.node,
         rateLimitAt: session.rateLimit?.at ?? null, reason: `session runs on ${session.node}` });
       continue;
     }
-    const current = readOne(root, session.id);
-    if (current && current.status === 'queued') { skipped.push({ sessionId: session.id, reason: 'already queued' }); continue; }
     enqueue(root, { sessionId: session.id, pane: session.pane, sourceAccountId, targetAccountId, force,
       rateLimitAt: session.rateLimit?.at ?? null }, { now, log });
     queued.push({ sessionId: session.id, pane: session.pane, title: session.title || '' });

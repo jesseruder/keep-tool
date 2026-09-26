@@ -1705,7 +1705,7 @@ function nodeDeps(f, overrides = {}) {
     // The node's host answers the relaunch, and the transfer copies inside its hook.
     restartSession: async (body, options) => {
       assert.equal(body.pane, 'pane-1@aws1');
-      assert.equal(options.ownerForce, true, 'a node transfer is Owner-forced');
+      assert.equal(options.ownerForce || options.parkedForce, true, 'a node transfer is Owner-forced or the queue\'s parked stop');
       assert.equal(Object.prototype.hasOwnProperty.call(options, 'host'), false,
         'no host override is handed to a restart whose pane is on another node');
       events.push('stop'); pane.alive = false;
@@ -1775,6 +1775,84 @@ test('a transfer of a node session that is not Owner-forced is refused before an
     assert.equal(fs.readFileSync(journal, 'utf8'), recorded);
     assert.deepEqual(d.asked, []);
     assert.equal(accounts.authority(f.root)[f.sid].accountId, 'one');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+// The rate-limit queue's stop of a node session parked on its limit: forced, because the
+// graceful stop's ledger proof cannot be taken off the node, but nothing else of Owner's.
+const LIMIT_AT = '2026-09-25T10:00:00.000Z';
+function parkedInspect(f, d, session = {}) {
+  const inspect = d.inspect;
+  return async (body) => {
+    const answer = await inspect(body);
+    return { ...answer, session: { ...answer.session, rateLimit: { at: LIMIT_AT, type: 'seven_day' }, ...session } };
+  };
+}
+
+test('the queue\'s parked stop moves a node session only with its source and limit named, and is not Owner\'s force', async () => {
+  const f = fixture();
+  try {
+    let restart;
+    const d = nodeDeps(f);
+    const stop = d.restartSession;
+    d.restartSession = async (body, options) => { restart = { body, options }; return stop(body, options); };
+    d.inspect = parkedInspect(f, d);
+    const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', intent: 'continue',
+      parkedForce: true, expectedSourceAccountId: 'one', expectedRateLimitAt: LIMIT_AT }, d);
+    assert.equal(result.status, 'done');
+    assert.deepEqual(d.events, ['preflight', 'trust', 'stop', 'copy', 'launch', 'continue']);
+    // The restart is told to take the parked stop, with the limit it must prove again
+    // from the node, and is never told it is Owner's.
+    assert.equal(restart.options.parkedForce, true);
+    assert.equal(restart.options.ownerForce, false);
+    assert.equal(restart.options.expectedRateLimitAt, LIMIT_AT);
+    assert.equal('force' in restart.body, false);
+    const journal = handoff.readOne(f.root, f.sid);
+    assert.equal(journal.parkedForce, true);
+    assert.equal(journal.ownerForce, undefined);
+    assert.equal(journal.force, undefined);
+    assert.equal(accounts.authority(f.root)[f.sid].accountId, 'two');
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a parked stop that names too little, or is for this machine, is refused before anything is asked or written', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f, { restartSession: async () => assert.fail('the source must not be stopped') });
+    d.inspect = parkedInspect(f, d);
+    const names = /^A parked-session transfer on aws1 must name the source account and the limit it is for$/;
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', parkedForce: true,
+      expectedSourceAccountId: 'one' }, d), (error) => error.status === 409 && names.test(error.message));
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', parkedForce: true,
+      expectedRateLimitAt: LIMIT_AT }, d), (error) => error.status === 409 && names.test(error.message));
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', parkedForce: 'yes',
+      expectedSourceAccountId: 'one', expectedRateLimitAt: LIMIT_AT }, d), (error) => error.status === 400);
+    assert.deepEqual(d.asked, [], 'the node was asked nothing');
+    assert.equal(handoff.readOne(f.root, f.sid), null);
+    // This machine's own sessions keep the graceful stop.
+    const local = deps(f, { restartSession: async () => assert.fail('the source must not be stopped') });
+    await assert.rejects(handoff.run({ sessionId: f.sid, pane: 'pane-1', accountId: 'two', parkedForce: true,
+      expectedSourceAccountId: 'one', expectedRateLimitAt: LIMIT_AT }, local),
+    (error) => error.status === 409 && /only for a session on another node/.test(error.message));
+    assert.equal(handoff.readOne(f.root, f.sid), null);
+  } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+});
+
+test('a parked stop of a node session whose limit cleared, or that left its source account, stops nothing', async () => {
+  const f = fixture();
+  try {
+    const d = nodeDeps(f, { restartSession: async () => assert.fail('the source must not be stopped') });
+    const body = { sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', parkedForce: true,
+      expectedSourceAccountId: 'one', expectedRateLimitAt: LIMIT_AT };
+    d.inspect = parkedInspect(f, nodeDeps(f), { rateLimit: null });
+    await assert.rejects(handoff.run(body, d), (error) => error.status === 409
+      && error.message === 'Session no longer carries the account limit this transfer was requested for');
+    // Queued from an account it is no longer on: refused by the source account named.
+    d.inspect = parkedInspect(f, nodeDeps(f));
+    await assert.rejects(handoff.run({ ...body, expectedSourceAccountId: 'three' }, d),
+      (error) => error.status === 409 && /^Session is on one, not the three/.test(error.message));
+    assert.equal(d.pane.alive, true);
+    assert.equal(d.events.includes('stop'), false);
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 

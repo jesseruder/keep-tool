@@ -838,16 +838,29 @@ test('restart: an in-place restart of a node session is refused by name before a
   assert.deepEqual(hosts.typedOn('aws1'), []);
 });
 
-test('rate-limit handoff: the policy never offers a pane on the node', async (t) => {
+test('rate-limit handoff: the policy reads a pane on the node from its mirror, never the copy a move left here', async (t) => {
   const fleet = createRemoteNodeFleet(t);
   const { handoffPolicySessions } = require('./serve.js');
   const asked = [];
-  const sessions = await handoffPolicySessions({
+  const limited = (id) => ({ id, rateLimit: { at: new Date().toISOString(), type: 'five_hour' } });
+  // The mirror holds an ended turn and no limit: nothing on the node is offered, and
+  // the stale local copy of the mirrored session is never looked up.
+  let sessions = await handoffPolicySessions({
     listHostPanes: async () => fleet.panes(),
-    claudeSessionFor: (id) => { asked.push(id); return { id, rateLimit: { at: new Date().toISOString(), type: 'five_hour' } }; },
+    claudeSessionFor: (id) => { asked.push(id); return limited(id); },
   });
   assert.deepEqual(sessions.map((session) => session.id), [fleet.local.id]);
   assert.deepEqual(asked, [fleet.local.id]);
+  // A mirror that shows the limit offers the session, with its qualified pane and node,
+  // for the queue's parked stop.
+  sessions = await handoffPolicySessions({
+    listHostPanes: async () => fleet.panes(),
+    claudeSessionFor: (id) => limited(id),
+    mirroredCompactRow: (id, pane) => (id === fleet.mirrored.id ? { ...limited(id), pane: pane.id, node: pane.node } : null),
+  });
+  const far = sessions.find((session) => session.id === fleet.mirrored.id);
+  assert.deepEqual([far.pane, far.node, far.kind], [fleet.mirrored.pane, 'aws1', 'claude']);
+  assert.equal(sessions.some((session) => session.id === fleet.unmirrored.id), false, 'nothing mirrored, nothing offered');
 });
 
 test('limit resume and auto-close: the node\'s sessions and panes are filtered out by the shared predicates', async (t) => {

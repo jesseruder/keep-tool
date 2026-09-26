@@ -6803,6 +6803,7 @@
     "bin/serve.js::handoffNode|bin/serve.js::sessionNodeOf|1",
     "bin/serve.js::handoffPolicySessions|bin/serve.js::handoffPolicySessions>right callback|2",
     "bin/serve.js::handoffPolicySessions|bin/serve.js::listHostPanes|1",
+    "bin/serve.js::handoffPolicySessions|bin/serve.js::mirroredCompactRow|1",
     "bin/serve.js::handoffPolicySessions>right callback|bin/serve.js::claudeSessionFor|1",
     "bin/serve.js::handoffQueueSessions|bin/serve.js::handoffQueueState|1",
     "bin/serve.js::handoffQueueState|bin/serve.js::isolatedHostStateBuild|1",
