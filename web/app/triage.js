@@ -240,8 +240,6 @@ export function agentForStage(ctx, item, session) {
   if (live) return live;
   return (pane && agents.find((agent) => agent.session?.pane === pane))
     || (sessionId && agents.find((agent) => agent.session?.id === sessionId))
-    // An idle agent's last run, opened from its row: still that agent's stage.
-    || (sessionId && agents.find((agent) => !agent.session?.id && agent.lastSession?.id === sessionId))
     || null;
 }
 
