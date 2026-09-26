@@ -192,6 +192,21 @@ Sessions already running on the node keep the MCP servers, skills and settings t
 started with. Restart them (or open fresh ones) to pick up what changed. Run
 `keep node audit <name>` again; what remains should be only what is meant to differ.
 
+## The CLI on a node
+
+A node with the daemon's address (`KEEP_DAEMON_URL`) forwards the registry commands
+to the daemon, which runs them with its own CLI under the calling session's identity:
+the card commands, `tell`, `open`, `move`, `handoff`, the reads (`usage`, `alerts`,
+`brief`, `accounts list`, …) and the rest listed in `docs/reference.md` beside
+`keep review-queue handoff`. `keep nodes ls` there prints the daemon's fleet table;
+the bare `keep nodes` answers for the node's own host, names its row after the node
+and says where the daemon is. What a node runs itself is its own machine's: `host`,
+`pane`, `attach`, `doctor`, `setup`, `secret`, `browser`, `codex`, `node init` and the
+hooks. A command that runs only on the daemon node (`serve`, `restart-daemon`, `sync`,
+`archive`, `transfer`, `node audit`, `nodes add|rm`, the account writes, …) says so,
+with a reason; nothing a node types is ever answered as though the node were the
+daemon.
+
 ## Schedulers and sessions on another node
 
 A machine at parity is not enough on its own: the daemon's own periodic work has to

@@ -84,6 +84,10 @@ Load the situational skill when its moment comes, not before:
   cite the path it prints. `keep show` or `keep artifact <card>` lists them, and
   `keep artifact <card> --get <name> [--out <path>]` copies one back out as a file,
   from a node too.
+- **On a node**, Keep commands are answered by the daemon: `keep nodes ls` shows the
+  fleet as the daemon sees it (the bare `keep nodes` is only this machine), and a
+  command that runs only on the daemon node says so and why. That refusal is not a
+  sign the daemon or another machine is missing; ask the daemon with `keep nodes ls`.
 
 ## Waiting on another card
 

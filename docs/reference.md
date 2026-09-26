@@ -1875,6 +1875,49 @@ forwarded, and only in that form: `<name>` must be the 24 hex digits the message
 it needs no session, and the queue itself (`keep review-queue` with or without flags)
 stays on the daemon node.
 
+The rest of the CLI a session reaches for is forwarded the same way, under the same
+rules (`bin/registry-commands.js` holds them):
+
+- **Reads, no session needed:** `keep usage` (the fleet's model usage is collected on the
+  daemon), `lint`, `alerts`, `brief` (`--send` sends it as the daemon's alert),
+  `accounts` / `accounts list` (never `add`, `default` or `setup`, which write the
+  daemon's account configuration and credentials), `incidents` (the open list),
+  `discord status`, `slack status`, `ideas --dry`, `codex-jobs` and `leftovers`. The last
+  two list the daemon node's own processes, and say so first to a node; their `--reap`
+  is refused, as are `discord poll`, `slack poll|mode`, a real `keep ideas` (each asks
+  a model on the daemon for longer than a forwarded command may take, or changes
+  Owner's setting) and `incidents parse|session`. `keep nodes ls` prints the daemon's
+  fleet table; the bare `keep nodes` still answers for the node itself, and names its
+  one row after the node and says where the daemon is.
+- **Writes under the caller's identity:** `keep quiet <duration>|off`, `incidents close`,
+  and `probe <card>`, which runs the card's own probe on the daemon node, where the
+  scheduler runs it, under the probe's two-minute timeout and on a queue of its own.
+  `keep wait` polls the daemon's registry for its `--for` (nine minutes by default, at
+  most a day); like a waiting tell it runs beside the node's other commands and holds no
+  restart.
+- **Session-scoped:** `mark`, `rename` and `keep-running` act on the caller's session in
+  their bare form, which from a node shell with no session is refused, and on any named
+  session otherwise. `delegate` needs a session in every form. Its `-- <command>` form
+  is refused: the command would run on the daemon node. From a node, prepare the
+  delegation (`keep delegate <card> --step <n> --prepare`) and have the worker run
+  `keep delegate --accept <id>`, or register it with `--session <sid> --agent <agent>`,
+  which names the worker and may be any session.
+- **Long-running:** `move`, `handoff`, `force-restart` and `restore` run under an open's
+  bound on a queue of their own and hold a restart; `move` has its own bound, a minute
+  past the thirty minutes its CLI gives the daemon, and its `--node` names where the
+  session goes. A `--pane` a node names for `handoff` or `force-restart` goes up as
+  `<pane-id>@<node>`, and the daemon refuses a bare one, which on the daemon would name
+  one of its own panes. A move, handoff or force-restart of the caller's own session
+  ends the caller's pane partway, so the node never prints the answer, as for a
+  forwarded open that replaces it; the daemon carries on and the console shows the
+  outcome.
+
+What stays on the daemon node says so, with a reason, rather than the generic "the
+registry lives on node …": `serve`, `service`, `restart-daemon`, `sync`, `init`,
+`self-repair`, `archive`, `transfer` (it reads the transcript, the working tree and the
+`--context` file from its own disk), `node` other than `node init`, `nodes add|rm` and
+the account writes. A command in neither list keeps the generic line.
+
 `keep artifact` from a node sends the files themselves, since the paths name files the
 daemon does not have. The node's CLI reads each one and posts it to the daemon's
 `POST /api/artifact` with its basename, size, sha256 and bytes, under the same node
