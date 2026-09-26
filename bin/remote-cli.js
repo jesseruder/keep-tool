@@ -274,8 +274,13 @@ function requestTimeoutMs(command, args) {
 async function runRemote(command, args, deps = {}) {
   const env = deps.env || process.env;
   const where = deps.where || remoteMode(env);
+  const commandRules = require('./registry-commands.js');
+  // A bare pane id names a pane on this node; on the daemon it would name one of the
+  // daemon's own, so it goes up qualified (`<id>@<this node>`), and the daemon
+  // refuses one that is not.
+  args = commandRules.qualifyPaneArgs(command, args, where && where.local);
   // Said here rather than after a round trip: the daemon would refuse it the same way.
-  const refusal = require('./registry-commands.js').nodeSideRefusal(command, args);
+  const refusal = commandRules.nodeSideRefusal(command, args);
   if (refusal) return { code: 2, stdout: '', stderr: `keep ${command}: ${refusal}\n` };
   let response;
   try {

@@ -83,12 +83,92 @@ const REGISTRY_COMMANDS = Object.freeze([
   // was woken for and records its verdict, reply or merge. Every write is to the
   // daemon's report store; nothing in a request is run or read from the node.
   'reports',
+  // Reads over the daemon's registry and its own state, which is the fleet's: model
+  // usage (the fleet's attribution is collected on the daemon), the lint findings, the
+  // alert log, the morning brief (`--send` sends it as the daemon's alert, as a local
+  // run does), and the account list without its credentials (ACCOUNTS_ALLOWED).
+  'usage', 'lint', 'alerts', 'brief', 'accounts',
+  // Owner's quiet hours are the daemon's: a node's `keep quiet 2h` silences the same
+  // alerts a local one does, and `off` ends them.
+  'quiet',
+  // The daemon's incident, Discord and Slack state, in their reading forms, and an
+  // incident closed by hand (INCIDENTS_ALLOWED and formRefusal below): a responder on
+  // a node records the close its recipe recommends.
+  'incidents', 'discord', 'slack',
+  // `keep ideas --dry` prints the evidence and prompt; a real run is refused
+  // (IDEAS_REFUSAL). The Codex job and leftover-process lists describe the daemon
+  // node's own machine, and the daemon's CLI says so to a node; `--reap` is refused.
+  'ideas', 'codex-jobs', 'leftovers',
+  // `keep probe <card>` runs the card's own probe, the one the daemon's scheduler
+  // runs, on the daemon node, which is where its answer means anything. The command is
+  // the card's, never the request's: a node cannot set one (COMMAND_FLAGS). It runs
+  // under the probe's own timeout (probeExtraMs).
+  'probe',
+  // `keep wait` polls the daemon's registry for a hold, a card, a lane or a check to
+  // come due. It writes nothing, so like a waiting tell it has a queue of its own and
+  // does not hold a restart, and it runs for its --for (nine minutes by default, at
+  // most a day).
+  'wait',
+  // Session decoration and lifecycle preferences the daemon owns (its
+  // /api/mark-session, /api/rename-session and /api/session-keep-running, which the
+  // daemon's CLI posts to over loopback). A bare form acts on the caller's own session
+  // (BARE_SESSION_FORMS); one naming a session acts on that one, as it would on the
+  // daemon node.
+  'mark', 'rename', 'keep-running',
+  // A delegation is a registry record naming the parent session, which the daemon's
+  // CLI takes from the caller's verified identity, so a node's delegate needs one. The
+  // `-- <command>` form runs the command on the machine the CLI runs on, which for a
+  // forwarded one is the daemon's: it is refused (DELEGATE_COMMAND_REFUSAL), and a node
+  // prepares the delegation and has the worker accept it instead.
+  'delegate',
+  // The ones that stop, move or restart sessions, and may take minutes: they run
+  // under a long bound on a queue of their own (runsLikeOpen). A move, handoff or
+  // force-restart of the caller's own session ends the caller's pane partway, so the
+  // node never prints the answer, exactly as for a forwarded open that replaces it;
+  // the daemon carries on and the console shows the outcome. A pane a node names is
+  // qualified with that node before it is sent (qualifyPaneArgs), since on the daemon
+  // a bare pane id is one of the daemon's own.
+  'move', 'handoff', 'force-restart', 'restore',
 ]);
+
+// Why each command that is deliberately not forwarded runs only on the daemon node,
+// which a node's CLI says in place of the generic "the registry lives elsewhere": for
+// these that line would read as a missing registry, when the command is one that
+// belongs to the daemon's machine. The last three name only some forms of their
+// command (daemonOnlyReason): `keep node init` runs on a node, `keep nodes` lists and
+// updates there, and the account list is forwarded (ACCOUNTS_ALLOWED), so the reason
+// is for `node audit`, `nodes add|rm` and the account writes, which a node without
+// the daemon's address also reaches.
+const DAEMON_ONLY = Object.freeze({
+  serve: 'it is the daemon itself',
+  service: "it installs and runs the daemon's service on the machine it is typed on",
+  'restart-daemon': 'it restarts the daemon process on its own machine',
+  sync: 'it pulls and pushes the registry checkout the daemon owns',
+  init: 'it creates a registry, and the registry lives with the daemon',
+  'self-repair': "it reads and resets the daemon's own repair records and panes",
+  archive: "it moves finished cards within the daemon's registry in bulk",
+  transfer: "it reads the source session's transcript, the working tree and the --context file from its own disk",
+  node: 'only keep node init runs on a node; the audit compares the daemon node with the node it names',
+  nodes: 'the node list and the tokens that reach each node live on the daemon',
+  accounts: "it writes the daemon's account configuration and credentials",
+});
+function daemonOnlyReason(command, args = []) {
+  if (!Object.prototype.hasOwnProperty.call(DAEMON_ONLY, command)) return null;
+  const argv = Array.isArray(args) ? args : [];
+  if (command === 'node' && argv[0] === 'init') return null;
+  if (command === 'nodes' && !['add', 'rm'].includes(argv[0])) return null;
+  if (command === 'accounts' && (subcommandOf(argv) === null || ACCOUNTS_ALLOWED.includes(subcommandOf(argv)))) return null;
+  return DAEMON_ONLY[command];
+}
 // A forwarded `review-land -` document: one reviewer tick's batch.
 const REVIEW_LAND_STDIN_MAX = 1024 * 1024;
 
-const NODES_ALLOWED = Object.freeze(['update']);
-const NODES_REFUSAL = 'a node runs only keep nodes update; the rest runs on the daemon node';
+// `nodes ls` too: the fleet table is the daemon's, which holds the node list and dials
+// each host. A node that answered for itself printed one row named after the daemon,
+// with its own socket and status under that name, and a session read the Linux box as
+// the daemon. The bare `keep nodes` and `keep nodes usage` stay local (keep.js).
+const NODES_ALLOWED = Object.freeze(['update', 'ls']);
+const NODES_REFUSAL = 'a node forwards only keep nodes update|ls; the rest runs on the daemon node';
 
 const AGENTS_ALLOWED = Object.freeze(['emit', 'events', 'place']);
 const AGENTS_REFUSAL = `a node runs only keep agents ${AGENTS_ALLOWED.join('|')} (or the bare list); the rest runs on the daemon node`;
@@ -107,6 +187,44 @@ const REVIEW_QUEUE_REFUSAL = 'a node runs only keep review-queue handoff <name>;
 function reviewQueueRefusal(args) {
   if (args.length === 2 && args[0] === 'handoff' && REVIEW_QUEUE_HANDOFF_NAME_RE.test(args[1])) return null;
   return REVIEW_QUEUE_REFUSAL;
+}
+
+// The subcommand a forwarded command's argv names: its first argument, unless that is
+// a flag (the bare form).
+function subcommandOf(args) {
+  const first = args[0];
+  return first === undefined || String(first).startsWith('-') ? null : String(first);
+}
+
+// Accounts: the list only (the bare form is the list). Every other verb writes the
+// daemon's account configuration or the credentials behind it.
+const ACCOUNTS_ALLOWED = Object.freeze(['list']);
+const ACCOUNTS_REFUSAL = "a node runs only keep accounts list; add, default and setup write the daemon's account configuration and credentials, and run only on the daemon node";
+// Incidents: the open list and a close by hand. `parse` reads a file or stdin on the
+// node, and `session` runs an area tick with the daemon's own seams (opening,
+// typing, closing sessions) in the CLI's process, past a forwarded command's bound.
+const INCIDENTS_ALLOWED = Object.freeze(['close']);
+const INCIDENTS_REFUSAL = 'a node runs only keep incidents (the open list) and keep incidents close; parse and session run on the daemon node';
+// Discord and Slack: their status. A poll classifies messages with a model on the
+// daemon, past a forwarded command's bound, and `slack mode` is Owner's setting for
+// what the daemon's own poll does.
+const FEED_STATUS_REFUSAL = (command) => `a node runs only keep ${command} status; the rest runs on the daemon node`;
+const IDEAS_REFUSAL = 'a node runs only keep ideas --dry: a real run asks a model on the daemon node for longer than a forwarded command may take';
+const REAP_REFUSAL = (command) => `a node's keep ${command} lists the daemon node's own processes; --reap stops them, so run it on the daemon node`;
+const DELEGATE_COMMAND_REFUSAL = 'keep delegate -- <command> would run the command on the daemon node; from a node, run keep delegate <card> --step <n> --prepare and have the worker run keep delegate --accept <id>, or register it with --session <sid> --agent <agent>';
+
+// The refusals a command's arguments alone decide, the same on both sides.
+function formRefusal(command, args) {
+  const sub = subcommandOf(args);
+  const flagged = (name) => args.some((arg, i) => arg === name && !args.slice(0, i).includes('--'));
+  if (command === 'accounts' && sub !== null && !ACCOUNTS_ALLOWED.includes(sub)) return ACCOUNTS_REFUSAL;
+  if (command === 'incidents' && sub !== null && !INCIDENTS_ALLOWED.includes(sub)) return INCIDENTS_REFUSAL;
+  if ((command === 'discord' || command === 'slack') && sub !== 'status') return FEED_STATUS_REFUSAL(command);
+  if (command === 'ideas' && !flagged('--dry')) return IDEAS_REFUSAL;
+  if ((command === 'codex-jobs' || command === 'leftovers') && flagged('--reap')) return REAP_REFUSAL(command);
+  // commands.delegate splits its argv at the first `--` wherever it stands.
+  if (command === 'delegate' && args.includes('--')) return DELEGATE_COMMAND_REFUSAL;
+  return null;
 }
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
@@ -173,7 +291,42 @@ const PLACEMENT_FLAGS = Object.freeze({
   // Not where or who but which: the session whose transcript a bundle reads.
   'review-bundle': ['--session'],
   'review-replay': ['--session'],
+  // Where the session moves to.
+  move: ['--node'],
+  // The worker session a parent registers the delegation to, never the parent.
+  delegate: ['--session'],
 });
+
+// The flags whose value is a pane, in the commands that take one. A bare pane id on
+// the daemon is one of the daemon's own panes, so a node's CLI qualifies a bare one
+// with its own name (qualifyPaneArgs) and the daemon refuses one that is not
+// qualified: the pane a node means is never read as a daemon pane of the same id.
+const PANE_FLAGS = Object.freeze({
+  handoff: ['--pane'],
+  'force-restart': ['--pane'],
+});
+const PANE_UNQUALIFIED_REFUSAL = (flag) => `${flag} from a node must name its node: <pane-id>@<node>`;
+
+// `args` with each bare pane value qualified with `local`, the node the CLI runs on:
+// walked the way parseArgs reads it (a `--` ends the flags, -m's value is not one).
+function qualifyPaneArgs(command, args, local) {
+  const flags = Object.prototype.hasOwnProperty.call(PANE_FLAGS, command) ? PANE_FLAGS[command] : [];
+  if (!flags.length || !Array.isArray(args) || !local) return args;
+  const out = [...args];
+  const qualify = (value) => (typeof value === 'string' && value && !value.includes('@') ? `${value}@${local}` : value);
+  for (let i = 0; i < out.length; i += 1) {
+    const arg = out[i];
+    if (arg === '--') break;
+    if (arg === '-m') { i += 1; continue; }
+    if (typeof arg !== 'string' || !arg.startsWith('--')) continue;
+    const eq = arg.indexOf('=');
+    const flag = eq < 0 ? arg : arg.slice(0, eq);
+    if (!flags.includes(flag)) continue;
+    if (eq >= 0) out[i] = `${flag}=${qualify(arg.slice(eq + 1))}`;
+    else if (i + 1 < out.length) { out[i + 1] = qualify(out[i + 1]); i += 1; }
+  }
+  return out;
+}
 
 // The commands the daemon runs on behalf of a session and so frames as that session's
 // act; without one the daemon's CLI would attribute a node's request to Owner's own
@@ -193,7 +346,51 @@ const SESSION_REFUSALS = Object.freeze({
   // A bare compact names no session but the caller's, and from a node shell with none
   // the daemon's CLI would take its own environment's instead.
   compact: "a node's compact names the session it is from; run it inside an agent session",
+  // A delegation names its parent (or, for --accept and --end, its worker) as the
+  // session the daemon verified, in every form.
+  delegate: "a node's delegate names the session it is from; run it inside an agent session",
 });
+
+// The commands whose bare form means "my session": from a node shell with none they
+// are refused, since the daemon's CLI would find no session to act on and the node
+// would be told something about the daemon's environment. A form naming a session
+// needs none. Each reads the positionals the CLI will see (isBareSessionForm).
+const BARE_SESSION_FORMS = Object.freeze(['mark', 'rename', 'keep-running']);
+function isBareSessionForm(command, args) {
+  const positionals = positionalsOf(command, args);
+  const flags = args.slice(0, args.includes('--') ? args.indexOf('--') : args.length);
+  // keep mark [<#n|id>] --emoji …; --colors lists the palette and names no session.
+  if (command === 'mark') return positionals.length === 0 && !flags.includes('--colors');
+  // keep rename [<#n|id>] "title" | keep rename [<#n|id>] --clear
+  if (command === 'rename') return positionals.length === (flags.includes('--clear') ? 0 : 1);
+  // keep keep-running [<#n|id>] on|off
+  if (command === 'keep-running') return positionals.length === 1;
+  return false;
+}
+const BARE_SESSION_REFUSAL = (command) => `a node's ${command} with no session named acts on the session it is from; run it inside an agent session, or name the session`;
+
+// The positional arguments parseArgs would read for `command`: -m and its value, a
+// flag and (unless the command reads it as boolean, or it carries =) its value are
+// not; after `--` everything is.
+function positionalsOf(command, args) {
+  const out = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const arg = args[i];
+    if (arg === '--') { out.push(...args.slice(i + 1)); break; }
+    if (arg === '-m') { i += 1; continue; }
+    if (typeof arg === 'string' && arg.startsWith('--')) {
+      if (!arg.includes('=') && !isBooleanFlag(command, arg.slice(2))) i += 1;
+      continue;
+    }
+    out.push(arg);
+  }
+  return out;
+}
+
+function bareSessionRefusal(command, args, identity) {
+  if (identity.session || !BARE_SESSION_FORMS.includes(command)) return null;
+  return isBareSessionForm(command, args) ? BARE_SESSION_REFUSAL(command) : null;
+}
 
 // `keep compact <id>` without --when-idle compacts now, and the daemon's CLI waits for
 // it: up to KEEP_COMPACT_TIMEOUT_MS (four minutes by default), past the minute a
@@ -266,6 +463,26 @@ const BOOLEAN_FLAGS = Object.freeze({
   alert: ['dry', 'force'],
   compact: ['when-idle'],
   'review-queue': ['json'],
+  usage: ['json'],
+  lint: ['json', 'fix-hints'],
+  alerts: ['all'],
+  brief: ['send'],
+  accounts: ['json'],
+  incidents: ['dry', 'json'],
+  discord: ['dry'],
+  slack: ['dry'],
+  ideas: ['dry'],
+  'codex-jobs': ['json', 'reap', 'dry'],
+  leftovers: ['json', 'reap', 'dry'],
+  mark: ['no-emoji', 'no-color', 'clear', 'colors'],
+  rename: ['clear'],
+  delegate: ['prepare', 'end'],
+  move: ['force', 'dry', 'json'],
+  handoff: ['force'],
+  'force-restart': ['recover'],
+  restore: ['dry'],
+  // `keep wait` reads its own argv (bin/wait.js parseWaitArgs), where every flag takes
+  // a value (`--lane` two), and `quiet`, `probe` and `keep-running` take no flags.
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -279,6 +496,9 @@ const PROJECT_FLAGS = Object.freeze({
   turns: ['--project'],
   search: ['--project'],
   'review-idea': ['--project'],
+  // `keep wait --no-hold <project>` and `--lane <project> <step>`.
+  wait: ['--no-hold', '--lane'],
+  restore: ['--project'],
 });
 const PROJECT_POSITIONS = Object.freeze({
   project: [1],
@@ -325,8 +545,10 @@ function argumentRefusal(command, args, identity = {}) {
   if (command === 'agents' && agentsRefusal(args, identity)) return agentsRefusal(args, identity);
   if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
   if (command === 'review-queue' && reviewQueueRefusal(args)) return reviewQueueRefusal(args);
+  if (formRefusal(command, args)) return formRefusal(command, args);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
-  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
+  if (bareSessionRefusal(command, args, identity)) return bareSessionRefusal(command, args, identity);
+  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return waitCapRefusal(command);
   const newline = (arg) => /[\r\n]/.test(arg);
   const NEWLINE = 'only the -m message may contain a newline';
   let positional = false;
@@ -338,6 +560,7 @@ function argumentRefusal(command, args, identity = {}) {
   const projectPositions = Object.prototype.hasOwnProperty.call(PROJECT_POSITIONS, command) ? PROJECT_POSITIONS[command] : [];
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   const placementFlags = Object.prototype.hasOwnProperty.call(PLACEMENT_FLAGS, command) ? PLACEMENT_FLAGS[command] : [];
+  const paneFlags = Object.prototype.hasOwnProperty.call(PANE_FLAGS, command) ? PANE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
     if (i === message) continue;
@@ -352,6 +575,10 @@ function argumentRefusal(command, args, identity = {}) {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
       const own = flag === '--session' ? identity.session : identity.node;
       if (!own || named !== own) return `${flag} must name the caller's own ${flag.slice(2)}`;
+    }
+    if (flag && paneFlags.includes(flag)) {
+      const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
+      if (typeof named !== 'string' || !named.includes('@')) return PANE_UNQUALIFIED_REFUSAL(flag);
     }
     if (flag && eq >= 0 && projectFlags.includes(flag)) {
       const refusal = projectRefusal(arg.slice(eq + 1));
@@ -391,9 +618,9 @@ function argumentRefusal(command, args, identity = {}) {
 }
 
 // How long a forwarded command may wait on the daemon beyond an ordinary run: a
-// `tell --wait <duration>` re-asks a busy session until that duration runs out, and
-// an `open` waits for the session it starts (OPEN_EXTRA_MS). Both the daemon's
-// subprocess and the node's request must outlast it.
+// `tell --wait <duration>` re-asks a busy session until that duration runs out, a
+// `keep wait` polls for its --for, and an `open` waits for the session it starts
+// (OPEN_EXTRA_MS). Both the daemon's subprocess and the node's request must outlast it.
 //
 // At most a day. A waiting tell does not hold a daemon restart, so its started
 // journal entry is all that stops a resend running it twice, and entries are pruned
@@ -401,6 +628,11 @@ function argumentRefusal(command, args, identity = {}) {
 // also fires at once.
 const MAX_FORWARDED_WAIT_MS = 24 * 3600e3;
 const WAIT_CAP_REFUSAL = '--wait on a forwarded tell is at most 24h';
+function waitCapRefusal(command) {
+  return command === 'wait' ? '--for on a forwarded wait is at most 24h' : WAIT_CAP_REFUSAL;
+}
+// What `keep wait` waits with no --for (bin/wait.js parseWaitArgs).
+const WAIT_DEFAULT_MS = 9 * 60e3;
 
 // What an `open` may spend past the ordinary bound. Its /api/open call has no client
 // timeout, and killing the CLI at this bound only drops that loopback request: the
@@ -461,16 +693,46 @@ function openRequiredMs(env = {}) {
 // a fresh session and waits for its prompt and its id. Its /api/run call has no client
 // timeout either, so the ordinary minute would tell the node of a timeout while the
 // daemon carried on, and a rerun would deliver the check twice.
+//
+// The commands that stop, move or restart sessions are bounded like an open too, and
+// for the same reason: each posts to a daemon route that carries on when the CLI is
+// killed. `handoff` waits up to three minutes for its transfer (/api/handoff-session),
+// `restore` opens every session its plan restores one after another (at most three
+// minutes each, so the open bound covers about four; past that the node is told of a
+// timeout and a rerun restores the rest, since a restored session is alive and its
+// plan skips it), and `force-restart` asks the daemon to restart a pane, which it
+// then owns. A `move` has its own, longer bound (MOVE_EXTRA_MS).
+const LONG_RUNNING = Object.freeze(['open', 'verify', 'move', 'handoff', 'force-restart', 'restore']);
 function runsLikeOpen(command) {
-  return command === 'open' || command === 'verify';
+  return LONG_RUNNING.includes(command);
 }
+// The long-running commands whose bound is an open's, and so grows with the daemon's
+// compaction timeout: a move's is fixed.
+function boundedLikeOpen(command) {
+  return runsLikeOpen(command) && command !== 'move';
+}
+// A move carries a session's whole transcript between machines, and the CLI gives
+// /api/move-session thirty minutes (commands.move); the forwarded run outlasts that by
+// a minute, so the node prints the CLI's own answer, a timeout included, which names
+// the journal a move that stopped part way continues from.
+const MOVE_EXTRA_MS = 31 * 60e3;
+// `keep probe` runs the card's probe under keep-core runProbe's timeout, which the
+// daemon's child reads from KEEP_PROBE_TIMEOUT_MS; the route's child environment does
+// not carry it, so the two-minute default applies, and fifteen seconds cover the rest.
+const PROBE_EXTRA_MS = 120e3 + 15e3;
 const OPEN_UNBOUNDED_REFUSAL = "this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
+function unboundedRefusal(command) {
+  if (command === 'open') return OPEN_UNBOUNDED_REFUSAL;
+  return OPEN_UNBOUNDED_REFUSAL.replace('a forwarded open', `a forwarded ${command}`).replace('run keep open', `run keep ${command}`);
+}
 
 // `env` is the daemon's own environment, passed only by the daemon's route: a node's
 // environment says nothing about the daemon's compaction timeout, so a node leaves
 // it out and gets the floor.
 function forwardedWaitMs(command, args, env) {
+  if (command === 'move') return MOVE_EXTRA_MS;
   if (runsLikeOpen(command)) return env ? openExtraMs(env) : OPEN_EXTRA_MS;
+  if (command === 'probe') return PROBE_EXTRA_MS;
   return Math.min(requestedWaitMs(command, args), MAX_FORWARDED_WAIT_MS);
 }
 
@@ -481,9 +743,17 @@ function isWaitingTell(command, args) {
   return command === 'tell' && requestedWaitMs(command, args) > 0;
 }
 
-// What a node can refuse before it posts, from the arguments alone: a file named on
-// the node, and a wait past the cap. The identity rules need the daemon's location
-// record and are left to the route, which applies these two as well.
+// A run that only waits: a waiting tell, or a `keep wait`, which reads the registry
+// until its condition holds and writes nothing. Neither holds a restart.
+function isWaiting(command, args) {
+  return command === 'wait' || isWaitingTell(command, args);
+}
+
+// What a node can refuse before it posts, from the arguments alone: a form it does not
+// forward (formRefusal and the per-command tables), a file named on the node, and a
+// wait past the cap. The identity rules need the daemon's location record and are
+// left to the route, which applies these as well. A bare --pane is qualified before
+// this (qualifyPaneArgs), so the route's refusal of one is for other callers.
 function nodeSideRefusal(command, args) {
   if (!Array.isArray(args)) return null;
   if ((command === 'turns' || command === 'search') && turnsRefusal(args, command)) return turnsRefusal(args, command);
@@ -491,6 +761,7 @@ function nodeSideRefusal(command, args) {
   if (command === 'agents' && agentsRefusal(args)) return agentsRefusal(args);
   if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
   if (command === 'review-queue' && reviewQueueRefusal(args)) return reviewQueueRefusal(args);
+  if (formRefusal(command, args)) return formRefusal(command, args);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -500,16 +771,18 @@ function nodeSideRefusal(command, args) {
     const flag = arg.startsWith('--') ? arg.split('=')[0] : null;
     if (flag && fileFlags.includes(flag)) return `${flag} names a file on this node; use -m, or run it from the daemon node`;
   }
-  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
+  if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return waitCapRefusal(command);
   return null;
 }
 
-// The --wait a forwarded command asks for, read the way parseArgs reads it (the
-// last --wait wins, a value-taking flag takes the next argument, -m's value and
-// everything after `--` are not flags). A value that does not parse is 0: the
-// daemon's CLI answers it with its usage error well inside the ordinary bound.
+// The --wait a forwarded tell asks for, or the --for of a `keep wait` (nine minutes
+// when it names none), read the way the CLI reads it (the last one wins, a
+// value-taking flag takes the next argument, -m's value and everything after `--`
+// are not flags). A value that does not parse is 0: the daemon's CLI answers it with
+// its usage error well inside the ordinary bound.
 function requestedWaitMs(command, args) {
-  if (command !== 'tell' || !Array.isArray(args)) return 0;
+  if ((command !== 'tell' && command !== 'wait') || !Array.isArray(args)) return 0;
+  const flagName = command === 'wait' ? 'for' : 'wait';
   let wait = null;
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -519,9 +792,9 @@ function requestedWaitMs(command, args) {
     const name = arg.slice(2);
     if (isBooleanFlag(command, name)) continue;
     i += 1;
-    if (name === 'wait') wait = args[i];
+    if (name === flagName) wait = args[i];
   }
-  if (wait == null) return 0;
+  if (wait == null) return command === 'wait' ? WAIT_DEFAULT_MS : 0;
   try { return require('./wait.js').parseDuration(wait); } catch { return 0; }
 }
 
@@ -569,4 +842,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { REVIEW_QUEUE_HANDOFF_NAME_RE, REVIEW_QUEUE_REFUSAL, REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { DAEMON_ONLY, daemonOnlyReason, qualifyPaneArgs, PANE_FLAGS, BARE_SESSION_FORMS, MOVE_EXTRA_MS, PROBE_EXTRA_MS, WAIT_DEFAULT_MS, boundedLikeOpen, unboundedRefusal, isWaiting, REVIEW_QUEUE_HANDOFF_NAME_RE, REVIEW_QUEUE_REFUSAL, REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

@@ -105,7 +105,7 @@ test('the registry route exists only where the daemon listens for nodes', async 
 
 test('only the listed registry commands run, and never a command-bearing flag', async (t) => {
   const { svc, root, calls } = service(t);
-  for (const command of ['handoff', 'land', 'artifact', 'serve', 'restart-daemon', 'probe', 'sync', '', null, 'show; rm -rf /']) {
+  for (const command of ['transfer', 'land', 'artifact', 'serve', 'restart-daemon', 'self-repair', 'archive', 'sync', 'init', 'service', '', null, 'show; rm -rf /']) {
     const answer = await svc.handle(AWS1, body(root, { command }));
     assert.equal(answer.status, 400, String(command));
   }
@@ -314,12 +314,15 @@ test('a flag is read as taking no value exactly where that command\'s parseArgs 
     for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) searchBools.add(flag[1]);
   }
   assert.deepEqual([...BOOLEAN_FLAGS.search].sort(), [...searchBools].sort(), 'search');
-  // `nodes` forwards only `update`, whose spec is updateNodes' in bin/commands/nodes.js.
+  // `nodes` forwards only `update` and `ls`, whose specs are updateNodes' and
+  // listNodes' in bin/commands/nodes.js.
   const nodesSource = fs.readFileSync(path.join(__dirname, 'commands', 'nodes.js'), 'utf8');
-  const updateBody = nodesSource.slice(nodesSource.indexOf('async function updateNodes(')).split(/\n(?=function |async function |const |commands\.)/)[0];
   const nodesBools = new Set();
-  for (const spec of updateBody.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
-    for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) nodesBools.add(flag[1]);
+  for (const name of ['updateNodes', 'listNodes']) {
+    const nodesBody = nodesSource.slice(nodesSource.indexOf(`async function ${name}(`)).split(/\n(?=function |async function |const |commands\.)/)[0];
+    for (const spec of nodesBody.matchAll(/parseArgs\([^,]+,\s*(\{[^}]*\})/g)) {
+      for (const flag of spec[1].matchAll(/'?([a-z-]+)'?\s*:\s*'bool'/g)) nodesBools.add(flag[1]);
+    }
   }
   assert.deepEqual([...BOOLEAN_FLAGS.nodes].sort(), [...nodesBools].sort(), 'nodes');
   // `reports` lives in bin/commands/reports.js; every subcommand there is forwarded.
@@ -368,9 +371,11 @@ test('a node runs only the reading turns subcommands', () => {
   assert.match(nodeSideRefusal('search', ['secret', '--all']), /without --all/);
   assert.match(argumentRefusal('search', ['x', '--project', '../elsewhere']), /relative to a directory/);
   assert.equal(argumentRefusal('nodes', ['update', '--json']), null);
-  for (const args of [['add', 'x', '--address', '1.2.3.4:1'], ['rm', 'aws1'], ['ls'], []]) {
-    assert.match(argumentRefusal('nodes', args), /only keep nodes update/, args.join(' '));
-    assert.match(nodeSideRefusal('nodes', args), /only keep nodes update/, args.join(' '));
+  assert.equal(argumentRefusal('nodes', ['ls']), null);
+  assert.equal(argumentRefusal('nodes', ['ls', '--json']), null);
+  for (const args of [['add', 'x', '--address', '1.2.3.4:1'], ['rm', 'aws1'], ['usage', 'aws1', 'acct'], []]) {
+    assert.match(argumentRefusal('nodes', args), /only keep nodes update\|ls/, args.join(' '));
+    assert.match(nodeSideRefusal('nodes', args), /only keep nodes update\|ls/, args.join(' '));
   }
   for (const args of [['search', 'x', '--all'], ['search', '--all=1', 'x'], ['show', 'c', '--all']]) {
     assert.match(argumentRefusal('turns', args), /without --all/, args.join(' '));
@@ -1797,4 +1802,230 @@ test('a request the route would refuse on its own adopts nothing', async (t) => 
     assert.equal(fs.existsSync(path.join(root, '.keep', 'session-accounts')), false, `${name}: nothing pinned`);
     assert.equal(fs.existsSync(path.join(root, '.keep', 'panes')), false, `${name}: no pane record`);
   }
+});
+
+// ---------- the rest of the node CLI ----------
+
+// The reads a node forwards need no session: they answer from the daemon's registry
+// and state, and the daemon's CLI runs them as they were typed.
+test('a node forwards the daemon\'s reads with or without a session, and refuses their writing forms', async (t) => {
+  const reads = [
+    ['usage', []], ['usage', ['some-card', '--json']], ['lint', ['--json', '--rule', 'stale']], ['alerts', ['--all']],
+    ['brief', []], ['brief', ['--send']], ['accounts', []], ['accounts', ['list', '--json']], ['accounts', ['--json']],
+    ['incidents', []], ['incidents', ['--json']], ['incidents', ['close', 'inc-card', '-m', 'noise, diagnosed']],
+    ['discord', ['status']], ['slack', ['status']], ['ideas', ['--dry']], ['codex-jobs', []], ['codex-jobs', ['--json']],
+    ['leftovers', []], ['quiet', ['2h']], ['quiet', ['off']], ['probe', ['some-card']],
+  ];
+  for (const [command, args] of reads) {
+    assert.ok(REGISTRY_COMMANDS.includes(command), command);
+    assert.equal(argumentRefusal(command, args, { node: 'aws1' }), null, `${command} ${args.join(' ')}`);
+    assert.equal(nodeSideRefusal(command, args), null, `${command} ${args.join(' ')}`);
+  }
+  const refused = [
+    ['accounts', ['add', 'extra', '--agent', 'claude', '--label', 'x', '--config-dir', '~/.x'], /only keep accounts list/],
+    ['accounts', ['default', 'claude', 'extra'], /only keep accounts list/],
+    ['accounts', ['setup', 'extra', '--share-from', 'primary'], /only keep accounts list/],
+    ['incidents', ['parse', '-'], /parse and session run on the daemon node/],
+    ['incidents', ['session', 'area', '--dry'], /parse and session run on the daemon node/],
+    ['discord', ['poll', '--dry'], /only keep discord status/], ['discord', [], /only keep discord status/],
+    ['slack', ['poll'], /only keep slack status/], ['slack', ['mode', 'cards'], /only keep slack status/],
+    ['ideas', [], /only keep ideas --dry/], ['ideas', ['--model', 'x'], /only keep ideas --dry/],
+    ['ideas', ['--', '--dry'], /only keep ideas --dry/],
+    ['codex-jobs', ['--reap'], /--reap stops them/], ['leftovers', ['--reap', '--dry'], /--reap stops them/],
+  ];
+  for (const [command, args, pattern] of refused) {
+    assert.match(argumentRefusal(command, args, ME), pattern, `${command} ${args.join(' ')}`);
+    assert.match(nodeSideRefusal(command, args), pattern, `${command} ${args.join(' ')}`);
+  }
+  const { svc, root, calls } = service(t);
+  let n = 0;
+  for (const [command, args] of [['usage', []], ['accounts', ['list']], ['incidents', ['close', 'inc-card', '-m', 'why']], ['probe', ['some-card']]]) {
+    const answer = await svc.handle(AWS1, body(root, { command, args, session: null, agent: null, idempotencyKey: `${KEY}-read-${n += 1}` }));
+    assert.equal(answer.status, 200, `${command}: ${JSON.stringify(answer.body)}`);
+    assert.deepEqual(calls.at(-1).args.slice(1), [command, ...args]);
+    assert.equal(calls.at(-1).options.env.CLAUDE_CODE_SESSION_ID, undefined);
+    assert.equal(calls.at(-1).options.env.KEEP_REMOTE_CALLER, 'aws1');
+  }
+  const write = await svc.handle(AWS1, body(root, { command: 'accounts', args: ['add', 'x'], idempotencyKey: `${KEY}-acct-add` }));
+  assert.equal(write.status, 400);
+  assert.match(write.body.error, /only keep accounts list/);
+  assert.equal(calls.length, 4);
+});
+
+test('a node\'s mark, rename and keep-running act on its own session bare, and on a named one from anywhere', async (t) => {
+  for (const [command, bare, named] of [
+    ['mark', [['--emoji', '🔥'], ['--no-color'], ['--clear']], [['#3', '--emoji', '🔥'], ['sess-other', '--clear'], ['--colors']]],
+    ['rename', [['a new title'], ['--clear']], [['#3', 'a new title'], ['sess-other', '--clear']]],
+    ['keep-running', [['on'], ['off']], [['#3', 'on'], ['sess-other', 'off']]],
+  ]) {
+    const refusal = `a node's ${command} with no session named acts on the session it is from; run it inside an agent session, or name the session`;
+    for (const args of bare) {
+      assert.equal(argumentRefusal(command, args, { node: 'aws1' }), refusal, `${command} ${args.join(' ')}`);
+      assert.equal(argumentRefusal(command, args, ME), null, `${command} ${args.join(' ')} from a session`);
+      assert.equal(nodeSideRefusal(command, args), null, 'the node leaves identity to the daemon');
+    }
+    for (const args of named) assert.equal(argumentRefusal(command, args, { node: 'aws1' }), null, `${command} ${args.join(' ')}`);
+  }
+  const { svc, root, calls } = service(t);
+  const own = await svc.handle(AWS1, body(root, { command: 'mark', args: ['--emoji', '🔥'], idempotencyKey: `${KEY}-mark` }));
+  assert.equal(own.status, 200, JSON.stringify(own.body));
+  assert.deepEqual(calls[0].args.slice(1), ['mark', '--emoji', '🔥']);
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the bare mark is the node session\'s own');
+  const shell = await svc.handle(AWS1, body(root, { command: 'rename', args: ['title'], session: null, agent: null, idempotencyKey: `${KEY}-rename` }));
+  assert.equal(shell.status, 400);
+  assert.match(shell.body.error, /rename with no session named/);
+  assert.equal(calls.length, 1);
+});
+
+test('a node\'s delegate names its own session, never runs a command on the daemon, and may register another session as the worker', async (t) => {
+  const anonymous = "a node's delegate names the session it is from; run it inside an agent session";
+  for (const args of [['card', '--step', '2', '--prepare'], ['--accept', 'del-1'], ['--end']]) {
+    assert.equal(argumentRefusal('delegate', args, ME), null, args.join(' '));
+    assert.equal(argumentRefusal('delegate', args, { node: 'aws1' }), anonymous, args.join(' '));
+  }
+  // --session names the worker, a session other than the caller, on any node.
+  assert.equal(argumentRefusal('delegate', ['card', '--step', '2', '--session', 'sess-worker', '--agent', 'codex'], ME), null);
+  for (const args of [['card', '--step', '2', '--', 'codex', 'exec', 'x'], ['card', '--step', '--', 'x'], ['--', 'card']]) {
+    assert.match(argumentRefusal('delegate', args, ME), /would run the command on the daemon node/, args.join(' '));
+    assert.match(nodeSideRefusal('delegate', args), /would run the command on the daemon node/, args.join(' '));
+  }
+  const { svc, root, calls } = service(t);
+  const run = await svc.handle(AWS1, body(root, { command: 'delegate', args: ['card', '--step', '1', '--', 'sh', '-c', 'id'], idempotencyKey: `${KEY}-dg` }));
+  assert.equal(run.status, 400);
+  const prepared = await svc.handle(AWS1, body(root, { command: 'delegate', args: ['card', '--step', '1', '--prepare'], idempotencyKey: `${KEY}-dp` }));
+  assert.equal(prepared.status, 200, JSON.stringify(prepared.body));
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the parent is the verified caller');
+});
+
+test('move, handoff, force-restart and restore run under a long bound on their own queue and hold a restart', async (t) => {
+  const { MOVE_EXTRA_MS, runsLikeOpen, boundedLikeOpen } = require('./registry-commands.js');
+  for (const command of ['move', 'handoff', 'force-restart', 'restore']) {
+    assert.equal(runsLikeOpen(command), true, command);
+    assert.equal(boundedLikeOpen(command), command !== 'move', command);
+  }
+  assert.equal(forwardedWaitMs('handoff', ['s', '--pane', 'p1@aws1', '--account', 'a']), OPEN_EXTRA_MS);
+  assert.equal(forwardedWaitMs('restore', [], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '360000' }));
+  assert.ok(MOVE_EXTRA_MS > 30 * 60e3, 'a move outlasts the thirty minutes its CLI gives the daemon');
+  assert.equal(forwardedWaitMs('move', ['#3', '--node', 'main']), MOVE_EXTRA_MS);
+  assert.equal(forwardedWaitMs('move', ['#3', '--node', 'main'], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), MOVE_EXTRA_MS);
+  // --node is where the session goes, not who is asking.
+  assert.equal(argumentRefusal('move', ['#3', '--node', 'main'], ME), null);
+  assert.equal(argumentRefusal('move', ['--recover', 'tx-1'], { node: 'aws1' }), null);
+  assert.equal(argumentRefusal('restore', ['--dry', '--project', 'keep-tool'], { node: 'aws1' }), null);
+
+  const fake = fakeSpawn((call) => (call.args[1] === 'move' ? 'hang' : { code: 0, stdout: 'ok\n' }));
+  const original = fake.spawn;
+  const moves = [];
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    if (args[1][1] === 'move') moves.push(child);
+    return child;
+  };
+  const { svc, root } = service(t, { fake, timeoutMs: 20 });
+  const move = svc.handle(AWS1, body(root, { command: 'move', args: ['#3', '--node', 'main'], idempotencyKey: `${KEY}-move` }));
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(moves.length, 1);
+  assert.equal(svc.busy(), true, 'a restart waits for a move');
+  const show = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(show.body.stdout, 'ok\n', 'the node\'s next command is not held behind the move');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(svc.busy(), true, 'the move is still running past the ordinary bound');
+  moves[0].emit('close', 0, null);
+  assert.equal((await move).status, 200);
+
+  // Bounded like an open, a handoff is refused on a daemon whose compaction timeout
+  // no bound can cover; a move, whose bound is its own, is not.
+  const high = { KEEP_COMPACT_TIMEOUT_MS: String(2 * 24 * 3600e3) };
+  const unbounded = service(t, { fake: fakeSpawn(), env: high });
+  const handoff = await unbounded.svc.handle(AWS1, body(unbounded.root, {
+    command: 'handoff', args: ['sess-aws1', '--pane', 'p1@aws1', '--account', 'other'], idempotencyKey: `${KEY}-h`,
+  }));
+  assert.equal(handoff.status, 409);
+  assert.match(handoff.body.error, /a forwarded handoff cannot be bounded; run keep handoff on the daemon node/);
+  const moved = await unbounded.svc.handle(AWS1, body(unbounded.root, { command: 'move', args: ['#3', '--node', 'main'], idempotencyKey: `${KEY}-m` }));
+  assert.equal(moved.status, 200, JSON.stringify(moved.body));
+  assert.equal(unbounded.calls.length, 1);
+});
+
+test('a pane a node names for handoff or force-restart goes up qualified, and the daemon refuses a bare one', async (t) => {
+  const { qualifyPaneArgs } = require('./registry-commands.js');
+  assert.deepEqual(qualifyPaneArgs('handoff', ['sess-a', '--pane', 'p1', '--account', 'x'], 'aws1'), ['sess-a', '--pane', 'p1@aws1', '--account', 'x']);
+  assert.deepEqual(qualifyPaneArgs('force-restart', ['sess-a', '--pane=p1', '--recover'], 'aws1'), ['sess-a', '--pane=p1@aws1', '--recover']);
+  assert.deepEqual(qualifyPaneArgs('force-restart', ['sess-a', '--pane', 'p1@main'], 'aws1'), ['sess-a', '--pane', 'p1@main'], 'one already qualified is left alone');
+  assert.deepEqual(qualifyPaneArgs('handoff', ['s', '-m', '--pane', '--', '--pane', 'p1'], 'aws1'), ['s', '-m', '--pane', '--', '--pane', 'p1'], '-m\'s value and what follows -- are not flags');
+  assert.deepEqual(qualifyPaneArgs('checkin', ['card', '--pane', 'p1'], 'aws1'), ['card', '--pane', 'p1'], 'only the commands whose --pane is a pane');
+  for (const [command, args] of [['handoff', ['sess-a', '--pane', 'p1', '--account', 'x']], ['force-restart', ['sess-a', '--pane=p1']]]) {
+    assert.equal(argumentRefusal(command, args, ME), '--pane from a node must name its node: <pane-id>@<node>', command);
+    assert.equal(argumentRefusal(command, qualifyPaneArgs(command, args, 'aws1'), ME), null, command);
+  }
+  const { svc, root, calls } = service(t);
+  const bare = await svc.handle(AWS1, body(root, { command: 'force-restart', args: ['sess-aws1', '--pane', 'p1'], idempotencyKey: `${KEY}-fr1` }));
+  assert.equal(bare.status, 400);
+  const qualified = await svc.handle(AWS1, body(root, { command: 'force-restart', args: ['sess-aws1', '--pane', 'p1@aws1'], idempotencyKey: `${KEY}-fr2` }));
+  assert.equal(qualified.status, 200, JSON.stringify(qualified.body));
+  assert.deepEqual(calls.map((call) => call.args.slice(1)), [['force-restart', 'sess-aws1', '--pane', 'p1@aws1']]);
+});
+
+test('a node\'s keep wait runs for its --for beside the node\'s other commands, holds no restart, and waits at most a day', async (t) => {
+  const { WAIT_DEFAULT_MS, PROBE_EXTRA_MS } = require('./registry-commands.js');
+  assert.equal(forwardedWaitMs('wait', ['--card', 'x']), WAIT_DEFAULT_MS, 'nine minutes when it names none');
+  assert.equal(WAIT_DEFAULT_MS, 9 * 60e3);
+  assert.equal(forwardedWaitMs('wait', ['--card', 'x', '--for', '1h']), 3600e3);
+  assert.equal(forwardedWaitMs('wait', ['--for', '2m', '--lane', 'proj', '3', '--for', '+5m']), 5 * 60e3, 'the last --for wins');
+  assert.equal(forwardedWaitMs('probe', ['card']), PROBE_EXTRA_MS);
+  assert.ok(PROBE_EXTRA_MS > 120e3, 'a probe outlasts its own two-minute timeout');
+  const capped = '--for on a forwarded wait is at most 24h';
+  assert.equal(argumentRefusal('wait', ['--card', 'x', '--for', '2d']), capped);
+  assert.equal(nodeSideRefusal('wait', ['--card', 'x', '--for', '25h']), capped);
+  assert.equal(argumentRefusal('wait', ['--card', 'x', '--for', '24h']), null);
+  assert.match(argumentRefusal('wait', ['--no-hold', '../elsewhere']), /relative to a directory/);
+  assert.match(argumentRefusal('wait', ['--lane', 'sub/dir', '2']), /relative to a directory/);
+  assert.equal(argumentRefusal('wait', ['--no-hold', 'keep-tool', '--scope', 'device:phone']), null);
+
+  const fake = fakeSpawn((call) => (call.args[1] === 'wait' ? 'hang' : { code: 0, stdout: 'ok\n' }));
+  const original = fake.spawn;
+  const waits = [];
+  fake.spawn = (...args) => {
+    const child = original(...args);
+    if (args[1][1] === 'wait') waits.push(child);
+    return child;
+  };
+  const { svc, root } = service(t, { fake, timeoutMs: 20 });
+  const wait = svc.handle(AWS1, body(root, { command: 'wait', args: ['--card', 'x', '--for', '1s'], session: null, agent: null, idempotencyKey: `${KEY}-wait` }));
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(waits.length, 1);
+  assert.equal(svc.busy(), false, 'a restart does not wait on a wait');
+  const show = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(show.body.stdout, 'ok\n', 'the node\'s next command is not held behind the wait');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  waits[0].emit('close', 0, null);
+  assert.equal((await wait).status, 200, 'the wait outlived the ordinary bound');
+});
+
+test('a node\'s keep nodes ls runs the daemon\'s own fleet table', async (t) => {
+  assert.equal(nodeSideRefusal('nodes', ['ls', '--json']), null);
+  const { svc, root, calls } = service(t);
+  const answer = await svc.handle(AWS1, body(root, { command: 'nodes', args: ['ls'], session: null, agent: null, idempotencyKey: `${KEY}-nodes` }));
+  assert.equal(answer.status, 200, JSON.stringify(answer.body));
+  assert.deepEqual(calls[0].args.slice(1), ['nodes', 'ls']);
+  assert.equal(calls[0].options.env.KEEP_NODE_NAME, 'main', 'the daemon\'s CLI answers as the daemon');
+});
+
+test('each command a node deliberately does not forward has a reason, and none of them is forwarded', () => {
+  const { DAEMON_ONLY, daemonOnlyReason } = require('./registry-commands.js');
+  for (const command of ['serve', 'service', 'restart-daemon', 'sync', 'init', 'self-repair', 'archive', 'transfer']) {
+    assert.equal(REGISTRY_COMMANDS.includes(command), false, command);
+    assert.ok(daemonOnlyReason(command, []), command);
+  }
+  assert.equal(daemonOnlyReason('node', ['init', 'aws1']), null, 'keep node init runs on the node');
+  assert.match(daemonOnlyReason('node', ['audit', 'aws1']), /only keep node init runs on a node/);
+  assert.match(daemonOnlyReason('nodes', ['add', 'aws2']), /node list/);
+  assert.equal(daemonOnlyReason('nodes', ['ls']), null);
+  assert.match(daemonOnlyReason('accounts', ['add', 'x']), /account configuration and credentials/);
+  assert.equal(daemonOnlyReason('accounts', ['list']), null);
+  assert.equal(daemonOnlyReason('accounts', []), null);
+  assert.equal(daemonOnlyReason('show', []), null);
+  assert.equal(daemonOnlyReason('constructor', []), null, 'a name inherited from Object.prototype is not an entry');
+  assert.ok(Object.isFrozen(DAEMON_ONLY));
 });

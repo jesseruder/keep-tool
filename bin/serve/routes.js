@@ -1003,7 +1003,9 @@ function routes(ctx) {
       // keep move: a Claude session from one node to another (bin/session-move.js).
       // The daemon node's own callers only: the CLI arrives through the UI worker as
       // the proxy class, the console as proxy too (no button yet), and no node may
-      // ask for one, so this is the default allow list with node left out.
+      // post one here, so this is the default allow list with node left out. A node's
+      // `keep move` is forwarded through /api/registry instead, where the daemon's
+      // own CLI makes this call under the node session's verified identity.
       method: 'POST',
       path: '/api/move-session',
       allow: ['proxy', 'local', 'admin'],

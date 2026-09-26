@@ -358,7 +358,8 @@ test('a command that is not registry-class still refuses, and without a daemon U
   const { root, env } = nodeEnv(t);
   // keep artifact is not registry-class either, but a node with a URL posts its files
   // to /api/artifact (see the tests at the end); without a URL it refuses as these do.
-  for (const argv of [['handoff', 'card'], ['sync'], ['serve']]) {
+  // handoff is forwarded now (with its --pane qualified); these are not.
+  for (const argv of [['transfer', 'sess-a'], ['sync'], ['serve']]) {
     const result = await run(argv, { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
     assert.equal(result.status, 2, argv.join(' '));
     assert.equal(result.stderr, `keep ${argv[0]}: the registry lives on node main; this is node aws1\n`);
@@ -564,6 +565,41 @@ test('a tell naming a file on the node, or waiting past a day, is refused on the
     code: 2, stdout: '', stderr: 'keep tell: --wait on a forwarded tell is at most 24h\n',
   });
   assert.equal(sent.length, 0);
+});
+
+// The rest of the node CLI: what a node sends for the newly forwarded commands, and
+// what it refuses before sending.
+test('a node qualifies a bare pane it names for handoff and force-restart, and its request outlasts a move', async (t) => {
+  const { runRemote, requestTimeoutMs, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+  const { MOVE_EXTRA_MS, OPEN_EXTRA_MS, PROBE_EXTRA_MS, WAIT_DEFAULT_MS } = require('./registry-commands.js');
+  const root = tempDir(t);
+  const sent = [];
+  const request = async (url, pathname, options) => {
+    sent.push(options);
+    return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: 'ok\n', stderr: '' }) };
+  };
+  const deps = { where: { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' }, request, token: 't', env: { CLAUDE_CODE_SESSION_ID: 'sess-aws1' }, cwd: root };
+  assert.equal((await runRemote('handoff', ['sess-aws1', '--pane', 'p4', '--account', 'other'], deps)).code, 0);
+  assert.deepEqual(sent[0].payload.args, ['sess-aws1', '--pane', 'p4@aws1', '--account', 'other']);
+  assert.equal(sent[0].timeoutMs, REQUEST_TIMEOUT_MS + OPEN_EXTRA_MS);
+  assert.equal((await runRemote('force-restart', ['sess-aws1', '--pane=p4@main'], deps)).code, 0);
+  assert.deepEqual(sent[1].payload.args, ['sess-aws1', '--pane=p4@main']);
+  assert.equal(requestTimeoutMs('move', ['#3', '--node', 'main']), REQUEST_TIMEOUT_MS + MOVE_EXTRA_MS);
+  assert.equal(requestTimeoutMs('probe', ['card']), REQUEST_TIMEOUT_MS + PROBE_EXTRA_MS);
+  assert.equal(requestTimeoutMs('wait', ['--card', 'x']), REQUEST_TIMEOUT_MS + WAIT_DEFAULT_MS);
+  // Refused here, before a post: a delegate that would run its command on the daemon,
+  // a Slack poll, an account write and a reap of the daemon's processes.
+  for (const [command, args, pattern] of [
+    ['delegate', ['card', '--step', '1', '--', 'codex', 'exec', 'x'], /would run the command on the daemon node/],
+    ['slack', ['poll'], /only keep slack status/],
+    ['accounts', ['add', 'x'], /only keep accounts list/],
+    ['codex-jobs', ['--reap'], /--reap stops them/],
+  ]) {
+    const refused = await runRemote(command, args, deps);
+    assert.equal(refused.code, 2, command);
+    assert.match(refused.stderr, pattern, command);
+  }
+  assert.equal(sent.length, 2);
 });
 
 // ---- keep artifact from a node (bin/artifact-route.js is the daemon's side) ----

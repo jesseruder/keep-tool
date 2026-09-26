@@ -2818,6 +2818,17 @@ function renderCodexJobs(result) {
   return lines.join('\n');
 }
 
+// A list of this machine's processes, asked for by another node (KEEP_REMOTE_CALLER,
+// set only by the daemon's /api/registry): said first, so the node does not read the
+// daemon's processes as its own.
+function remoteMachineNote(what) {
+  const caller = process.env.KEEP_REMOTE_CALLER;
+  if (!caller) return;
+  let daemon = 'the daemon node';
+  try { daemon = `node ${require('./nodes.js').daemonNode()}`; } catch {}
+  console.log(`${what} on ${daemon}, where the daemon runs; ${caller}'s own are not listed here`);
+}
+
 commands['codex-jobs'] = async (argv) => {
   const o = parseArgs(argv, { json: 'bool', reap: 'bool', dry: 'bool' });
   if (o._.length || (o.dry && !o.reap)) die('usage: keep codex-jobs [--json] [--reap] [--dry]');
@@ -2841,6 +2852,7 @@ commands['codex-jobs'] = async (argv) => {
   const result = await codexJobs.list({ includeAgents: true });
   result.brokers = await codexBrokers.list();
   if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
+  remoteMachineNote('Codex jobs');
   console.log(renderCodexJobs(result));
 };
 
@@ -2865,6 +2877,7 @@ commands.leftovers = async (argv) => {
   const result = await leftovers.list(deps);
   if (o.json) return process.stdout.write(JSON.stringify(result, null, 2) + '\n');
   if (!result.known) die(`leftover discovery unavailable: ${result.reason}`);
+  remoteMachineNote('leftover processes');
   for (const item of result.leftovers) console.log(`${item.due ? 'due' : 'in grace'} ${leftovers.describe(item)}`);
   if (!result.leftovers.length) console.log('no leftover processes');
 };

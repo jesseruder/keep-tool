@@ -31,8 +31,8 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  isRegistryCommand, argumentRefusal, forwardedWaitMs, runsLikeOpen, isWaitingTell, openExtraMs, openRequiredMs,
-  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, stdinRefusal,
+  isRegistryCommand, argumentRefusal, forwardedWaitMs, runsLikeOpen, boundedLikeOpen, isWaiting, openExtraMs, openRequiredMs,
+  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, unboundedRefusal, stdinRefusal,
 } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -358,9 +358,10 @@ function createRegistryService(options = {}) {
       // An open this daemon's compaction timeout would let run past the capped bound
       // is refused before anything is adopted, journaled or spawned: killing its CLI
       // at the cap would leave the in-process open running with nothing recording it.
-      if (body && runsLikeOpen(body.command) && openRequiredMs(baseEnv) > MAX_OPEN_EXTRA_MS) {
-        refuse(409, body.command === 'open' ? OPEN_UNBOUNDED_REFUSAL
-          : OPEN_UNBOUNDED_REFUSAL.replace('a forwarded open', 'a forwarded verify').replace('run keep open', 'run keep verify'));
+      // The same holds for every command bounded like an open (registry-commands
+      // boundedLikeOpen): verify, handoff, restore and force-restart.
+      if (body && boundedLikeOpen(body.command) && openRequiredMs(baseEnv) > MAX_OPEN_EXTRA_MS) {
+        refuse(409, unboundedRefusal(body.command));
       }
       const deps = {
         io, location,
@@ -399,10 +400,18 @@ function createRegistryService(options = {}) {
       // account pin, and a restart in the middle would leave that half done.
       // An open's bound is read from this daemon's own compaction timeout (baseEnv).
       // A `verify` is treated as an open (registry-commands runsLikeOpen): it may open
-      // a fresh session for the check, or compact a cold one before delivering it.
+      // a fresh session for the check, or compact a cold one before delivering it. So
+      // are the commands that stop, move or restart sessions (move, handoff,
+      // force-restart, restore), a move under its own longer bound.
+      //
+      // A `keep wait` is a waiting tell's kind: it only reads the registry until its
+      // condition holds, so it has a queue of its own and holds no restart. A `probe`
+      // runs past the ordinary bound under the probe's own timeout, on a queue of its
+      // own so the node's other commands do not wait out its command; it holds a
+      // restart like any ordinary run.
       const waitMs = forwardedWaitMs(request.command, request.args, baseEnv);
-      const waitingTell = isWaitingTell(request.command, request.args);
-      const ownQueue = waitingTell || runsLikeOpen(request.command);
+      const waitingTell = isWaiting(request.command, request.args);
+      const ownQueue = waitingTell || runsLikeOpen(request.command) || waitMs > 0;
       return await journaled({
         caller, key: request.idempotencyKey, digest: digestOf(request),
         queue: ownQueue ? `${request.command}\0${caller}\0${request.idempotencyKey}` : caller,
