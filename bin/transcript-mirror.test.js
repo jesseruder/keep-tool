@@ -414,6 +414,71 @@ test('a seed whose sidecar cannot be written leaves the old mirror and sidecar a
   assert.equal((await seedOf()).ok, true);
 });
 
+test('a post for another session is not held behind a seed in flight', async (t) => {
+  const { root, held, seedOf } = seedFixture(t);
+  const fromFile = path.join(root, 'held.jsonl');
+  // The seed's read of its source is held until the other session's post has answered.
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const open = fs.promises.open;
+  fs.promises.open = async (target, ...rest) => {
+    if (String(target) === fromFile) await gate;
+    return open(target, ...rest);
+  };
+  t.after(() => { fs.promises.open = open; release(); });
+  const seeding = seedOf();
+  const other = postAsync(root, { sessionId: 'sess-2' });
+  const first = await Promise.race([
+    other.then(() => 'other'), seeding.then(() => 'seed'),
+    new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000)),
+  ]);
+  assert.equal(first, 'other');
+  assert.deepEqual(await other, { ok: true, size: 8, reset: true });
+  release();
+  assert.deepEqual(await seeding, { ok: true, size: held.length });
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), held.toString());
+});
+
+test('a seed whose sidecar rename fails writes the sidecar again, or answers why without throwing', async (t) => {
+  const { root, held, seedOf, dir } = seedFixture(t);
+  await postAsync(root, { bytes: Buffer.from('old\n') });
+  const sidecar = path.join(dir, 'sess-1.json');
+  const rename = fs.promises.rename;
+  t.after(() => { fs.promises.rename = rename; });
+  const simulated = () => Object.assign(new Error('simulated rename failure'), { code: 'EIO' });
+
+  // Only the temporary sidecar's rename fails: the fallback write lands the seeded sidecar.
+  fs.promises.rename = async (from, to) => {
+    if (/\.seedside\./.test(String(from))) throw simulated();
+    return rename(from, to);
+  };
+  assert.deepEqual(await seedOf(), { ok: true, size: held.length });
+  const side = JSON.parse(fs.readFileSync(sidecar, 'utf8'));
+  assert.deepEqual([side.generation, side.size, side.seededAt], ['7:8:9', held.length, 1_750_000_000_000]);
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), held.toString());
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl']);
+
+  // Every rename onto the sidecar fails, the fallback's too: an answer, not a throw, and
+  // no temporary file left; the mirror is the seeded one under the sidecar it had.
+  await postAsync(root, { bytes: Buffer.from('old\n') });
+  const before = fs.readFileSync(sidecar, 'utf8');
+  fs.promises.rename = async (from, to) => {
+    if (String(to) === sidecar) throw simulated();
+    return rename(from, to);
+  };
+  const result = await seedOf();
+  assert.deepEqual(result, { ok: false,
+    reason: 'the mirror was replaced but its sidecar could not be written (EIO); the next post starts the mirror again' });
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), held.toString());
+  assert.equal(fs.readFileSync(sidecar, 'utf8'), before);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl'], 'no temporary file is left');
+  fs.promises.rename = rename;
+  // The node's next post of the seeded generation finds the old sidecar and starts again from 0.
+  const next = Buffer.from('{"n":3}\n');
+  assert.deepEqual(await postAsync(root, { generation: '7:8:9', bytes: next, fromOffset: held.length, size: held.length + next.length }),
+    { ok: false, needFrom: 0 });
+});
+
 test('prune takes a seed\'s temporary sidecar after the hour and never as a session', async (t) => {
   const root = tempRoot(t);
   await postAsync(root);

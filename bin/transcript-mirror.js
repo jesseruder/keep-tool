@@ -55,20 +55,24 @@ class MirrorError extends Error {
 
 function refuse(status, message) { throw new MirrorError(status, message); }
 
-// Every asynchronous write to a mirror (appendAsync, seed, pruneAsync) runs its body on
-// this one chain. They are called from different places (the hook route's posts, a
-// move's or an account handoff's seed in serve.js, the prune sweep), and two of them on
-// one session would otherwise interleave: an append that had read the old sidecar and
-// size could land its bytes on the inode a seed just renamed away, then write its old
-// generation's sidecar over the seed's, leaving the file and the sidecar disagreeing.
-// Here rather than in each caller, so no caller can forget it. One chain for every node
-// and session, as the hook route already had: a large seed holds posts back while it
-// hashes, and they then see the seeded mirror. The synchronous append and prune do not
-// take it; they are for the CLI and tests, never the daemon's path.
-let writeTail = Promise.resolve();
-function serialized(fn) {
-  const run = writeTail.then(() => fn());
-  writeTail = run.then(() => {}, () => {});
+// appendAsync and seed run their body on a chain per mirror (node and session). They
+// are called from different places (the hook route's posts, a move's or an account
+// handoff's seed in serve.js), and two of them on one session would otherwise
+// interleave: an append that had read the old sidecar and size could land its bytes on
+// the inode a seed just renamed away, then write its old generation's sidecar over the
+// seed's, leaving the file and the sidecar disagreeing. Here rather than in each caller,
+// so no caller can forget it. Per mirror, so a large seed holds back only that
+// session's posts while it hashes (they then see the seeded mirror), never another
+// session's. A chain's entry is dropped once its tail settles with nothing queued
+// behind it. pruneAsync is not on it (see there). The synchronous append and prune do
+// not take it either; they are for the CLI and tests, never the daemon's path.
+const writeTails = new Map();
+function serialized(node, sessionId, fn) {
+  const key = `${node}/${sessionId}`;
+  const run = (writeTails.get(key) || Promise.resolve()).then(() => fn());
+  const tail = run.then(() => {}, () => {});
+  writeTails.set(key, tail);
+  tail.then(() => { if (writeTails.get(key) === tail) writeTails.delete(key); });
   return run;
 }
 
@@ -167,7 +171,8 @@ async function readSidecarAsync(file) {
 async function writeSidecarAsync(file, value) {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
   await fs.promises.writeFile(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-  await fs.promises.rename(temp, file);
+  try { await fs.promises.rename(temp, file); }
+  catch (error) { await fs.promises.unlink(temp).catch(() => {}); throw error; }
 }
 
 function checkedSourcePath(sourcePath) {
@@ -273,8 +278,8 @@ function append(options = {}) {
 // The hook route uses this equivalent implementation so directory metadata and a
 // multi-megabyte append yield the daemon event loop. The synchronous API remains
 // for CLI/library callers; both keep the same no-follow and atomic-reset rules.
-// Serialized with seed and pruneAsync (see `serialized`).
-function appendAsync(options = {}) { return serialized(() => appendAsyncNow(options)); }
+// Serialized with a seed of the same mirror (see `serialized`).
+function appendAsync(options = {}) { return serialized(options.node, options.sessionId, () => appendAsyncNow(options)); }
 
 async function appendAsyncNow(options = {}) {
   const { root, node, sessionId, generation, fromOffset, size, mtimeMs, sourcePath } = options;
@@ -344,9 +349,19 @@ async function appendAsyncNow(options = {}) {
 // it was; then the mirror is renamed into place, then the sidecar. The mirror carries
 // the source's mtime as an append does. Answers { ok: true, size } after a seed;
 // throws MirrorError for a request that does not make sense, as append does.
+//
+// Once the request is validated, an I/O failure answers { ok: false, reason } and never
+// throws, and no temporary file is left behind. What it leaves: a failure before the
+// mirror's rename (reading the source, writing the temporary mirror or sidecar, the
+// rename itself) changes nothing, the old mirror and sidecar stand. A failure renaming
+// the sidecar after that leaves the new mirror under the old sidecar, so the seed
+// writes the sidecar again directly; if that fails too it answers ok:false, and the
+// node's next post finds a generation or size that disagrees and starts the mirror
+// again from 0, as before seeding existed.
+//
 // Asynchronous: a transcript can be hundreds of megabytes, and the daemon's loop is
-// not held while it is hashed. Serialized with appendAsync and pruneAsync.
-function seed(options = {}) { return serialized(() => seedNow(options)); }
+// not held while it is hashed. Serialized with appendAsync on the same mirror.
+function seed(options = {}) { return serialized(options.node, options.sessionId, () => seedNow(options)); }
 
 async function seedNow(options = {}) {
   const { root, node, sessionId, fromFile, size, sha256, generation, mtimeMs, sourcePath } = options;
@@ -370,6 +385,7 @@ async function seedNow(options = {}) {
   let target = null;
   let placed = false;
   let sidePlaced = false;
+  const failed = (error) => error.code || error.message;
   try {
     source = await fs.promises.open(fromFile, fs.constants.O_RDONLY);
     target = await fs.promises.open(temp,
@@ -393,20 +409,30 @@ async function seedNow(options = {}) {
     await target.close();
     target = null;
     const at = now();
+    const side = { generation, size, mtimeMs, sourcePath, updatedAt: at, seededAt: at };
     try {
-      await fs.promises.writeFile(sideTemp, `${JSON.stringify({ generation, size, mtimeMs, sourcePath, updatedAt: at, seededAt: at })}\n`,
-        { mode: 0o600, flag: 'wx' });
+      await fs.promises.writeFile(sideTemp, `${JSON.stringify(side)}\n`, { mode: 0o600, flag: 'wx' });
     } catch (error) {
-      return { ok: false, reason: `the seeded mirror's sidecar could not be written (${error.code || error.message})` };
+      return { ok: false, reason: `the seeded mirror's sidecar could not be written (${failed(error)})` };
     }
-    // The only window left is a crash between these two renames: the new mirror under
-    // the old sidecar. The next append then finds a generation other than its own (or
-    // a size that disagrees) and starts the mirror again from 0, which is what it did
-    // before seeding existed.
+    // Past this rename the new mirror is in place under the old sidecar until the
+    // sidecar's rename (or its fallback) lands; a crash in between is met by the next
+    // append, which finds a generation other than its own (or a size that disagrees)
+    // and starts the mirror again from 0, which is what it did before seeding existed.
     await fs.promises.rename(temp, where.file);
     placed = true;
-    await fs.promises.rename(sideTemp, where.sidecar);
-    sidePlaced = true;
+    try {
+      await fs.promises.rename(sideTemp, where.sidecar);
+      sidePlaced = true;
+    } catch {
+      try { await writeSidecarAsync(where.sidecar, side); }
+      catch (error) {
+        return { ok: false, reason: `the mirror was replaced but its sidecar could not be written (${failed(error)}); the next post starts the mirror again` };
+      }
+    }
+  } catch (error) {
+    if (error instanceof MirrorError) throw error;
+    return { ok: false, reason: `the seed could not be written (${failed(error)})` };
   } finally {
     if (source) await source.close().catch(() => {});
     if (target) await target.close().catch(() => {});
@@ -480,7 +506,7 @@ function usage(root) {
 // a seed stamps the source's mtime on the file just before renaming it, which moves
 // the ctime to now, so a seed still running is never taken for a dead one. Those
 // files are not sessions and are not in the answer. Like append, the synchronous
-// prune does not take the async writers' chain.
+// prune takes no write chain.
 function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   const removed = [];
   const cutoff = now() - olderThanMs;
@@ -516,10 +542,13 @@ function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   return removed;
 }
 
-// Serialized with appendAsync and seed, so it never unlinks a mirror one of them is writing.
-function pruneAsync(root, options) { return serialized(() => pruneAsyncNow(root, options)); }
-
-async function pruneAsyncNow(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
+// Not on the per-mirror chain. The hook route runs it on its own chain with its posts,
+// which orders it against every append. A seed from serve.js cannot collide with it:
+// prune unlinks a session's mirror only once nothing has written it for PRUNE_AFTER_MS
+// (30 days), and a temporary file only once it is an hour old, while a seed reads its
+// source through a handle it already holds open and its own temporary files are seconds
+// old, and its rename then writes a fresh sidecar.
+async function pruneAsync(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   const removed = [];
   const cutoff = now() - olderThanMs;
   const seedCutoff = now() - SEED_TEMP_MAX_AGE_MS;
