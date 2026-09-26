@@ -24,6 +24,7 @@ import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { nodeStripHTML, nodeStatsHealthRowsHTML } from './node-stats.js';
 import { numLabel } from './session-number.js';
+import { describeSession } from './session-links.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser, defaultModels } from './session-launcher.js';
 import { providerIconHTML } from './provider-icon.js';
@@ -781,6 +782,26 @@ async function removePane(pane) {
   await api.removePane(pane);
   await dropPane(pane);
 }
+// `#n` in any terminal names a session: the hover card and ⌘-click read the
+// console's current rows, so they follow the session as it moves on.
+function sessionByNum(num) {
+  return (data.sessions || []).find((session) => session.num === num && !isClosingSession(session.id, session.pane)) || null;
+}
+const sessionLinks = {
+  esc,
+  lookup: (num) => describeSession(sessionByNum(num), {
+    tasks: data.tasks, rel, statusOf: sessionLabel,
+    projectName: (path) => projectOf(path).name,
+    nodeOf: (session) => sessionNode(ctx, session),
+  }),
+  open(num) {
+    const session = sessionByNum(num);
+    if (!session) return;
+    rememberSession(session.id, 'triage');
+    navigateHistory({ sessionId: session.id, view: 'triage' });
+    refresh();
+  },
+};
 function mount(container, pane, options = {}) {
   // Triage and Watch are mutually exclusive views of the same local terminal.
   // Reuse its viewer/control ownership when moving it between pages; a second
@@ -811,6 +832,7 @@ function mount(container, pane, options = {}) {
       // mounting xterm, so it needs the names this pane is known by.
       session: entity.session?.id || currentPane?.meta?.sessionId || '',
       title: entity.title,
+      sessionLinks,
       onFocus(terminal, element) {
         state.focused = true;
         document.querySelectorAll('.term.focused').forEach((term) => term.classList.remove('focused'));

@@ -19,7 +19,7 @@ test('Triage and Watch move one terminal viewer instead of retaining a hidden pr
   let count = 0;
   const shown = [];
   const context = vm.createContext({
-    terminals: new Map(), terminalRender: 1, visibleTerminals: [],
+    terminals: new Map(), terminalRender: 1, visibleTerminals: [], sessionLinks: {},
     data: { sessions: [] },
     document: { activeElement: null },
     paneMap: () => new Map(),

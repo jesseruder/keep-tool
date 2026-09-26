@@ -5,6 +5,7 @@ import { createTrackedPixelWheelHandler } from './terminal-scroll.js';
 import { createTerminalProfiler } from './terminal-profile.js';
 import { getTerminalRendererPreference, rendererTrialExpiry, terminalRendererKey } from './terminal-renderer.js';
 import { createTypingPredictor } from './predict-typing.js';
+import { installSessionLinks } from './session-links.js';
 
 const encoder = new TextEncoder();
 
@@ -101,6 +102,7 @@ export function mountTerminal(container, pane, options = {}) {
   terminal.loadAddon(fit);
   terminal.loadAddon(search);
   terminal.open(host);
+  const sessionLinks = options.sessionLinks ? installSessionLinks(terminal, options.sessionLinks) : null;
 
   const viewer = mountViewerId(pane, options.slot);
   let socket;
@@ -755,6 +757,7 @@ export function mountTerminal(container, pane, options = {}) {
       cancelAnimationFrame(showFrame);
       stopObserving();
       disposeWebgl();
+      sessionLinks?.dispose();
       if (socket && socket.readyState < WebSocket.CLOSING) socket.close();
       terminal.dispose();
     },

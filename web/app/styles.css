@@ -304,6 +304,12 @@ html.mobile .artifact-save { padding: 4px 0; }
 .session-actions[open] > summary { color: var(--text); background: var(--sel); }
 .session-actions-pop { position: absolute; top: calc(100% + 5px); right: 0; z-index: 30; width: 230px; padding: 6px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); box-shadow: var(--shadow); }
 .session-actions-content { display: flex; flex-direction: column; gap: 4px; }
+.session-link-pop { position: fixed; z-index: 40; max-width: min(380px, calc(100vw - 16px)); padding: 8px 10px; border: 1px solid var(--line-2); border-radius: 6px; background: var(--panel-2); color: var(--text); box-shadow: var(--shadow); font: 12px/1.45 var(--sans); pointer-events: none; }
+.session-link-pop .sl-head { overflow-wrap: anywhere; }
+.session-link-pop .sl-meta { color: var(--muted); margin-bottom: 4px; }
+.session-link-pop .sl-row { display: flex; gap: 8px; }
+.session-link-pop .sl-key { color: var(--faint); min-width: 44px; flex: none; }
+.session-link-pop .sl-hint { color: var(--faint); margin-top: 4px; font-size: 11px; }
 .session-actions-content > .btn, .session-actions-content > div > .btn,
 .session-actions-content .account-handoff > summary, .session-actions-content .session-move > summary { width: 100%; justify-content: space-between; padding: 6px 8px; text-align: left; }
 .session-actions-content .portable-transfer-controls, .session-actions-content .account-controls, .session-actions-content .move-controls,
