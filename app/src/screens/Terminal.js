@@ -12,7 +12,7 @@ import Screen from './Screen';
 // failing them and asking again on every open would be the wrong response.
 const VIEW_KEY = '@keep/terminalView';
 
-export default function Terminal({ colors, config, onBack, target }) {
+export default function Terminal({ colors, config, onBack, onOpenSession, target }) {
   const [view, setView] = useState(null);
 
   useEffect(() => {
@@ -60,6 +60,7 @@ export default function Terminal({ colors, config, onBack, target }) {
       config={config}
       key={target?.session || target?.pane}
       onBack={onBack}
+      onOpenSession={onOpenSession}
       onUseTextView={() => choose('text')}
       storage={AsyncStorage}
       target={target}

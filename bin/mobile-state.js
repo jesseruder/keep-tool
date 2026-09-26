@@ -1,9 +1,10 @@
 'use strict';
 
-// The phone app reads two projections: `notifications` (its connection check and
-// the notification fallback) and `terminal` (resolving a session to its pane). The
-// console itself runs in a WebView and reads the console projection.
-const MOBILE_VIEWS = new Set(['notifications', 'terminal']);
+// The phone app reads three projections: `notifications` (its connection check and
+// the notification fallback), `terminal` (resolving a session to its pane) and
+// `refs` (what the native terminal's `#n` and card-id links can name). The console
+// itself runs in a WebView and reads the console projection.
+const MOBILE_VIEWS = new Set(['notifications', 'terminal', 'refs']);
 const HUMAN_ATTENTION_KINDS = new Set(['question', 'permission', 'plan', 'input']);
 
 function pick(source, fields) {
@@ -96,6 +97,23 @@ function projectMobileState(state, view, id) {
 
   if (view === 'notifications') {
     return { view, attention: (state.attention || []).map(attentionSummary) };
+  }
+
+  // Every numbered session and every card in the console's list, a line each: the
+  // phone decides from this which `#n` and card ids are links, and the tapped card
+  // shows these fields at once while the rest (a card's log, who mentions a
+  // session) loads from the same endpoints the console's hover cards use.
+  if (view === 'refs') {
+    return {
+      view,
+      sessions: (state.sessions || []).filter((session) => Number.isInteger(session?.num)).map((session) => ({
+        ...pick(session, ['id', 'num', 'kind', 'title', 'project', 'taskId', 'pane', 'mtime', 'reviewer', 'accountLabel']),
+        state: session.stateLabel || session.activity?.label || session.state || '',
+      })),
+      tasks: (state.tasks || []).filter((task) => task?.id).map((task) => ({
+        id: task.id, title: task.fm?.title || task.id, status: task.fm?.status || '', project: task.fm?.project || '',
+      })),
+    };
   }
 
   requireId(view, id);

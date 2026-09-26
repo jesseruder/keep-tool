@@ -107,6 +107,19 @@ export const terminalView = (config, id, signal) => request(
   { signal, timeoutMs: 8000 },
 );
 
+// What the native terminal's tappable references can name (src/terminal/refs.js),
+// and what a tapped one's sheet loads: the same lookups as the console's hover cards.
+export const refsView = (config, signal) => request(config, '/api/state?view=refs', { signal, timeoutMs: 10000 });
+export const holds = (config, signal) => request(config, '/api/holds', { signal, timeoutMs: 8000 })
+  .then((body) => body?.holds || []);
+export const sessionMentions = (config, num) => request(config, `/api/session-mentions?num=${encodeURIComponent(num)}`, { timeoutMs: 8000 })
+  .then((body) => (body?.superseded ? undefined : { sessions: body?.sessions || [], cards: body?.cards || [] }));
+export const commitInfo = (config, sha, project) => request(config,
+  `/api/commit-info?sha=${encodeURIComponent(sha)}${project ? `&project=${encodeURIComponent(project)}` : ''}`, { timeoutMs: 8000 })
+  .then((body) => body?.info || null);
+export const cardDetail = (config, id) => request(config, `/api/dashboard-detail?kind=task&id=${encodeURIComponent(id)}`, { timeoutMs: 8000 })
+  .then((body) => body?.value || null);
+
 // "Open on Mac": the console on the desktop brings this session's terminal forward.
 export const focus = (config, sessionId) => request(config, '/api/focus', {
   method: 'POST', body: { sessionId },

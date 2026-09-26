@@ -13,10 +13,12 @@ import {
 
 import * as api from '../api';
 import { mono } from '../ui';
+import RefSheet from './RefSheet';
 
 const { createEmulator } = require('../terminal/emulator');
 const { createFieldTracker, encodeKey, encodePaste, encodeText } = require('../terminal/keys');
 const { createRenderQueue } = require('../terminal/render-queue');
+const { findRefs, splitSegments } = require('../terminal/refs');
 const { rowSegments } = require('../terminal/row');
 const { createScrollbackMirror } = require('../terminal/scrollback');
 const { openPaneSocket } = require('../terminal/socket');
@@ -154,6 +156,7 @@ function makeStyles(colors) {
     body: { backgroundColor: colors.termBg, flex: 1 },
     content: { paddingHorizontal: BODY_PADDING, paddingVertical: BODY_PADDING },
     row: { color: colors.termFg, fontFamily: mono, includeFontPadding: false },
+    ref: { textDecorationLine: 'underline', textDecorationStyle: 'dotted' },
     historyBar: { alignItems: 'center', flexDirection: 'row', gap: 8, paddingBottom: 6 },
     historyButton: { backgroundColor: colors.barSel, borderColor: colors.termLine, borderRadius: 5, borderWidth: 1, justifyContent: 'center', minHeight: 28, paddingHorizontal: 10 },
     historyButtonText: { color: colors.info, fontFamily: mono, fontSize: 10, fontWeight: '700' },
@@ -175,10 +178,17 @@ function makeStyles(colors) {
   });
 }
 
+// How often the list of sessions, cards and holds a reference can name is re-read.
+const REFS_MS = 30e3;
+
 // One parsed row. Memoized on the row object, which the paint step only replaces for
 // rows the parser actually touched, so a spinner repaints one line and not the screen.
-const Row = React.memo(function Row({ cursor, cursorUnderline, fontSize, lineHeight, onCopy, onPress, row, styles, theme }) {
-  const segments = rowSegments(row, cursor);
+// A reference to other Keep work (`#453`, a card id, a hold, a SHA) is its own nested
+// Text: a tap there opens its sheet, and anywhere else on the row still focuses the
+// input, and a long press still copies the row.
+const Row = React.memo(function Row({ cursor, cursorUnderline, fontSize, known, lineHeight, onCopy, onPress, onRef, row, styles, theme }) {
+  const plain = rowSegments(row, cursor);
+  const segments = known && onRef && plain.length ? splitSegments(plain, findRefs(row.text.slice(0, row.trimmed), known)) : plain;
   const text = { fontSize, lineHeight };
   const body = segments.length === 0
     ? ' '
@@ -191,6 +201,12 @@ const Row = React.memo(function Row({ cursor, cursorUnderline, fontSize, lineHei
           ? { ...base, textDecorationLine: 'underline' }
           : runStyle({ ...segment.run, inverse: !segment.run.inverse }, theme))
         : base;
+      if (segment.ref) {
+        const ref = { ...segment.ref, text: row.text.slice(segment.ref.start, segment.ref.end) };
+        return (
+          <Text allowFontScaling={false} key={index} onPress={() => onRef(ref)} style={[style, styles.ref]}>{segment.text}</Text>
+        );
+      }
       return <Text allowFontScaling={false} key={index} style={style}>{segment.text}</Text>;
     });
   return (
@@ -239,7 +255,7 @@ function KeyButton({ entry, on, onPress, styles }) {
   );
 }
 
-export default function NativeTerminal({ colors, config, onBack, onUseTextView, storage, target }) {
+export default function NativeTerminal({ colors, config, onBack, onOpenSession, onUseTextView, storage, target }) {
   const styles = useMemo(() => makeStyles(colors), [colors]);
   const theme = useMemo(() => ({ fg: colors.termFg, bg: colors.termBg }), [colors]);
 
@@ -258,6 +274,9 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
   const [modifiers, setModifiers] = useState({ ctrl: false, alt: false });
   const [following, setFollowing] = useState(true);
   const [toast, setToast] = useState('');
+  // What a reference in a row can name, and the one whose sheet is open.
+  const [known, setKnown] = useState(null);
+  const [refTarget, setRefTarget] = useState(null);
 
   const emulatorRef = useRef(null);
   const queueRef = useRef(null);
@@ -305,6 +324,27 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
     }).catch(() => {});
     return () => { cancelled = true; };
   }, [storage]);
+
+  // The sessions, cards and holds a row's references are checked against, re-read
+  // while the screen is open. A failed read keeps what the last one had.
+  useEffect(() => {
+    let live = true;
+    let timer = null;
+    const read = async () => {
+      try {
+        const [view, holds] = await Promise.all([api.refsView(config), api.holds(config).catch(() => [])]);
+        if (!live) return;
+        setKnown({
+          sessions: new Map((view?.sessions || []).map((session) => [session.num, session])),
+          cards: new Map((view?.tasks || []).map((task) => [task.id, task])),
+          holds,
+        });
+      } catch {}
+      if (live) timer = setTimeout(read, REFS_MS);
+    };
+    read();
+    return () => { live = false; if (timer) clearTimeout(timer); };
+  }, [config]);
 
   // A target that names only a session has no pane to attach to yet.
   useEffect(() => {
@@ -677,8 +717,10 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
                   fontSize={fontSize}
                   key={entry.key}
                   lineHeight={lineHeight}
+                  known={known}
                   onCopy={copyRow}
                   onPress={focusInput}
+                  onRef={setRefTarget}
                   row={entry.row}
                   styles={styles}
                   theme={theme}
@@ -691,8 +733,10 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
                   fontSize={fontSize}
                   key={index}
                   lineHeight={lineHeight}
+                  known={known}
                   onCopy={copyRow}
                   onPress={focusInput}
+                  onRef={setRefTarget}
                   row={row}
                   styles={styles}
                   theme={theme}
@@ -708,6 +752,20 @@ export default function NativeTerminal({ colors, config, onBack, onUseTextView, 
         ) : null}
         {toast ? <View pointerEvents="none" style={styles.toast}><Text style={styles.toastText}>{toast}</Text></View> : null}
       </View>
+
+      <RefSheet
+        colors={colors}
+        config={config}
+        known={known || {}}
+        onClose={() => setRefTarget(null)}
+        onCopy={(text) => { setRefTarget(null); copyRow(text); }}
+        onOpenSession={(sessionId) => {
+          setRefTarget(null);
+          if (onOpenSession) onOpenSession({ session: sessionId });
+        }}
+        project={[...(known?.sessions?.values() || [])].find((session) => session.id === target?.session || (pane && session.pane === pane))?.project || ''}
+        target={refTarget}
+      />
 
       <TerminalField
         autoCapitalize="none"

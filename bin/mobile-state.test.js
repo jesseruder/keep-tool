@@ -79,6 +79,18 @@ test('non-rendered timestamps and verbose internals do not churn the terminal vi
   assert.deepEqual(projectMobileState(later, 'terminal', 's'), projectMobileState(first, 'terminal', 's'));
 });
 
+test('refs lists numbered sessions and every card, a line each, with no card body', () => {
+  const source = fixture();
+  source.sessions.push({ id: 'n7', num: 7, title: 'Seven', stateLabel: 'Working', taskId: 'open', project: '~/keep', observation: { big: true } },
+    { id: 'unnumbered', title: 'No number' });
+  const refs = projectMobileState(source, 'refs');
+  assert.deepEqual(refs.sessions.find((session) => session.num === 7),
+    { id: 'n7', num: 7, title: 'Seven', project: '~/keep', taskId: 'open', state: 'Working' });
+  assert.equal(refs.sessions.some((session) => session.id === 'unnumbered'), false);
+  assert.deepEqual(refs.tasks.find((task) => task.id === 'open'), { id: 'open', title: 'Open', status: 'active', project: '~/keep' });
+  assert.equal(JSON.stringify(refs).includes('latest'), false, 'no log text');
+});
+
 test('terminal requires an id, and removed or unknown views are rejected', () => {
   const source = fixture();
   assert.throws(() => projectMobileState(source, 'terminal'), (error) => error.status === 400);
