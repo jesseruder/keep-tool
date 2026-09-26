@@ -46,6 +46,7 @@ const FORWARDABLE = new Set(TOOL_NAMES);
  * session never gets these.
  */
 const VIEWER_METHODS = new Set([
+  "viewer_tab_owner",
   "viewer_tabs",
   "viewer_start",
   "viewer_ack",

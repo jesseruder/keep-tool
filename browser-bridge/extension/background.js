@@ -131,6 +131,7 @@ async function handleViewerRequest(message, generation) {
 }
 
 const VIEWER_METHODS = new Set([
+  "viewer_tab_owner",
   "viewer_tabs",
   "viewer_start",
   "viewer_ack",

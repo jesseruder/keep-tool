@@ -222,7 +222,7 @@ Worth knowing:
 
 | Variable | Effect |
 | --- | --- |
-| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Read in the **session's** environment — by `bin/headers.js` for Claude Code, and by Codex itself through `env_http_headers` (Codex does not give the helper an environment). Either way it arrives as `X-Browser-Bridge-Session`. Without it, the helper sends the name `keep browser show` left for the session's `KEEP_PANE` (in `pane-names/`), and otherwise the daemon names the session after the client that connected (`claude-code #3`). A session whose name changes is renamed, tab group and all. |
+| `BROWSER_BRIDGE_SESSION_NAME` | Names the session and its tab group. Read in the **session's** environment — by `bin/headers.js` for Claude Code, and by Codex itself through `env_http_headers` (Codex does not give the helper an environment). Either way it arrives as `X-Browser-Bridge-Session`. Without it, the daemon names the session after the client that connected (`claude-code #3`); `keep browser show --tab` renames such a session to its Keep number later, through the daemon's `POST /rename`. |
 | `KEEP_AGENT_ACCOUNT_ID` | The account label the popup and `browser_status` show, on both clients. For Codex it is the *only* source: `env_http_headers` names one variable per header, so there is no fallback there. |
 | `CLAUDE_CONFIG_DIR`, `CODEX_HOME` | Read by `bin/headers.js` to guess the agent, and the account when `KEEP_AGENT_ACCOUNT_ID` is unset. |
 | `BROWSER_BRIDGE_NEW_WINDOW` | Overrides `newWindow` in `config.json` (`1` on, `0` off). Read by the **daemon**, so it applies to every session — which is why the setting itself belongs in `config.json` and not here. |

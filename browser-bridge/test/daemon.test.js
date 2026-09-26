@@ -25,7 +25,7 @@ import {
   createDaemon,
   sanitizeHeaderValue,
 } from "../mcp/daemon.js";
-import { deriveRegistryKey, deriveSessionKey } from "../mcp/identity.js";
+import { deriveRegistryKey, deriveSessionKey, ownerTag } from "../mcp/identity.js";
 import { TOOL_NAMES } from "../mcp/tools.js";
 
 const DAEMON = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "mcp", "daemon.js");
@@ -148,29 +148,38 @@ test("a header names the session, and the host's hello carries that name", async
   );
 });
 
-test("a session that starts unnamed takes the name its header carries later, and the host hears it", async (t) => {
+/** POST /rename, the way keep browser show sends it. */
+function rename(port, body, auth = `Bearer ${TOKEN}`) {
+  return fetch(`http://127.0.0.1:${port}/rename`, {
+    method: "POST",
+    headers: { Authorization: auth, "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+}
+
+test("a session Keep could not name at launch is renamed by its owner tag, and the host hears it", async (t) => {
   const dir = tempDir(t);
   const host = await fakeHost(t, dir);
   const { port, logs } = await startDaemon(t, dir);
-
-  // Read on every request, as the helper is run on every request.
-  const headers = { Authorization: `Bearer ${TOKEN}` };
-  const client = new Client({ name: "daemon-test", version: "0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
-  t.after(() => client.close().catch(() => {}));
+  const { client, transport } = await connectClient(t, port);
   await client.callTool({ name: "browser_status", arguments: {} });
   assert.match(host.hellos().at(-1).params.name, /^daemon-test #\d+$/);
+  const owner = ownerTag(deriveSessionKey(SECRET, transport.sessionId));
 
-  // keep browser show left a name for the pane; the helper sends it from now on.
-  headers["X-Browser-Bridge-Session"] = "#405";
+  assert.equal((await rename(port, { owner, name: "#405" }, "Bearer nope")).status, 401);
+  assert.equal((await rename(port, { owner: "0".repeat(32), name: "#405" })).status, 404);
+  assert.equal((await rename(port, { owner, name: "" })).status, 400);
+
+  const renamed = await rename(port, { owner, name: "#405" });
+  assert.equal(renamed.status, 200);
+  assert.deepEqual(await renamed.json(), { renamed: "#405" });
+  assert.deepEqual(host.received.filter((m) => m.method === "rename").map((m) => m.params.name), ["#405"]);
   const status = await client.callTool({ name: "browser_status", arguments: {} });
   assert.match(status.content[0].text, /Session: #405/);
-  const renames = host.received.filter((m) => m.method === "rename");
-  assert.deepEqual(renames.map((m) => m.params.name), ["#405"]);
   assert.ok(logs.some((line) => line.includes("session renamed") && line.includes("#405")), logs.join("\n"));
 
   // The same name again is not another rename.
-  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.equal((await rename(port, { owner, name: "#405" })).status, 200);
   assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
 });
 
@@ -181,46 +190,29 @@ test("a host from before rename is reconnected, and its new hello carries the na
     return defaultHandler(message);
   });
   const { port } = await startDaemon(t, dir);
-  const headers = { Authorization: `Bearer ${TOKEN}` };
-  const client = new Client({ name: "daemon-test", version: "0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
-  t.after(() => client.close().catch(() => {}));
+  const { client, transport } = await connectClient(t, port);
   await client.callTool({ name: "browser_status", arguments: {} });
   assert.equal(host.hellos().length, 1);
 
-  headers["X-Browser-Bridge-Session"] = "#405";
+  const owner = ownerTag(deriveSessionKey(SECRET, transport.sessionId));
+  assert.equal((await rename(port, { owner, name: "#405" })).status, 200);
   await client.callTool({ name: "browser_status", arguments: {} });
   assert.equal(host.hellos().at(-1).params.name, "#405");
-  // Settled: the same name is not sent again.
-  await client.callTool({ name: "browser_status", arguments: {} });
-  assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
 });
 
-test("a rename the host refuses is tried again on the next request", async (t) => {
+test("a rename the host fails is reported, and the session keeps its name", async (t) => {
   const dir = tempDir(t);
-  let refuse = true;
-  const host = await fakeHost(t, dir, (message) => {
-    if (message.method === "rename" && refuse) return { ok: false, error: { message: "the host is busy" } };
+  await fakeHost(t, dir, (message) => {
+    if (message.method === "rename") return { ok: false, error: { message: "the host is busy" } };
     return defaultHandler(message);
   });
-  const { port, logs } = await startDaemon(t, dir);
-  const headers = { Authorization: `Bearer ${TOKEN}` };
-  const client = new Client({ name: "daemon-test", version: "0" });
-  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
-  t.after(() => client.close().catch(() => {}));
+  const { port } = await startDaemon(t, dir);
+  const { client, transport } = await connectClient(t, port, { "X-Browser-Bridge-Session": "old" });
   await client.callTool({ name: "browser_status", arguments: {} });
-
-  headers["X-Browser-Bridge-Session"] = "#405";
-  // The tool call still runs, and the client carries the name into its next hello.
-  const refused = await client.callTool({ name: "browser_status", arguments: {} });
-  assert.match(refused.content[0].text, /Session: #405/);
-  assert.ok(logs.some((line) => line.includes("could not be renamed")), logs.join("\n"));
-
-  refuse = false;
-  await client.callTool({ name: "browser_status", arguments: {} });
-  const renames = host.received.filter((m) => m.method === "rename");
-  assert.equal(renames.length, 2);
-  assert.ok(logs.some((line) => line.includes("session renamed")), logs.join("\n"));
+  const owner = ownerTag(deriveSessionKey(SECRET, transport.sessionId));
+  const refused = await rename(port, { owner, name: "#405" });
+  assert.equal(refused.status, 502);
+  assert.match((await refused.json()).error, /the host is busy/);
 });
 
 test("without the header the session is named after the client, numbered", async (t) => {

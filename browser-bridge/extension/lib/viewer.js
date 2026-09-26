@@ -25,6 +25,12 @@ const MAX_SIDE = 4096;
 
 const viewers = new Map(); // viewerId -> viewer
 
+/** sha256 of a session key, hex, first 32: what mcp/daemon.js compares with its own. */
+export async function ownerTag(sessionKey) {
+  const digest = await crypto.subtle.digest("SHA-256", new TextEncoder().encode(sessionKey));
+  return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, "0")).join("").slice(0, 32);
+}
+
 /** "#12" matches the groups titled "#12" and "#12 some-card", never "#123". */
 export function nameMatches(name, session) {
   if (typeof name !== "string" || typeof session !== "string" || !session) return false;
@@ -238,6 +244,20 @@ export function createViewerHandlers() {
   });
 
   return {
+    /**
+     * Which session's group a tab is in, as ownerTag() of its session key: the daemon
+     * can match that against its own sessions, and the key itself never leaves here.
+     */
+    async viewer_tab_owner(params) {
+      const tabId = Number(params.tabId);
+      if (!Number.isInteger(tabId)) throw new Error("tabId is required");
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.groupId == null || tab.groupId < 0) return { owner: null };
+      const store = await allSessions();
+      const key = Object.keys(store).find((k) => store[k]?.groupId === tab.groupId && !store[k].ended);
+      return { owner: key ? await ownerTag(key) : null };
+    },
+
     async viewer_tabs(params) {
       const session = String(params.session ?? "");
       if (!/^#\d+$/.test(session)) throw new Error("session must look like #12");

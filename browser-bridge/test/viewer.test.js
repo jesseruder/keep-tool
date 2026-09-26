@@ -2,7 +2,14 @@ import assert from "node:assert/strict";
 import test from "node:test";
 
 import { CTRL, META, SHIFT } from "../extension/lib/keys.js";
-import { cdpInput, nameMatches, tabsForSession } from "../extension/lib/viewer.js";
+import { cdpInput, nameMatches, ownerTag, tabsForSession } from "../extension/lib/viewer.js";
+import { ownerTag as daemonOwnerTag } from "../mcp/identity.js";
+
+test("the extension tags a tab's owner exactly as the daemon tags its sessions", async () => {
+  const key = "a1b2c3d4e5f60718293a4b5c6d7e8f90";
+  assert.equal(await ownerTag(key), daemonOwnerTag(key));
+  assert.match(await ownerTag(key), /^[0-9a-f]{32}$/);
+});
 
 test("a session number matches its own groups and no longer number", () => {
   assert.equal(nameMatches("#12", "#12"), true);

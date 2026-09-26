@@ -23,6 +23,7 @@ import {
   MAX_HEADER_VALUE_LENGTH,
   deriveRegistryKey,
   deriveSessionKey,
+  ownerTag,
   readHeaderValue,
   sanitizeHeaderValue,
 } from "./identity.js";
@@ -222,13 +223,18 @@ export function createDaemon({
       return;
     }
 
-    if (target.pathname !== "/mcp") {
+    if (target.pathname !== "/mcp" && target.pathname !== "/rename") {
       jsonError(res, 404, -32601, "Not found");
       return;
     }
 
     if (!tokensMatch(bearerToken(req.headers.authorization), token)) {
       jsonError(res, 401, -32000, "Unauthorized: a Bearer token from daemon.json is required");
+      return;
+    }
+
+    if (target.pathname === "/rename") {
+      await handleRename(req, res);
       return;
     }
 
@@ -324,9 +330,6 @@ export function createDaemon({
       if (req.method === "GET") trackStream(entry, res);
       else entry.inFlight += 1;
       try {
-        // Only once the request counts as live: the rename waits on the host, and the
-        // sweep must not end the session under it.
-        if (req.method !== "GET") await renameFromRequest(sessionId, entry, req);
         await entry.transport.handleRequest(req, res, body);
       } finally {
         // A session is never ended out from under a tool call, so the count has to come back
@@ -391,34 +394,53 @@ export function createDaemon({
   }
 
   /**
-   * A session is named when it starts, but a session Keep could not name at launch (its
-   * number was not ready) is named later: \`keep browser show\` leaves a name for its pane
-   * that bin/headers.js sends from then on. The new name reaches the host, and the
-   * extension retitles the group on the next call, so the tab group reads \`#405\` and the
-   * console's browser view can find it.
+   * POST /rename {owner, name}: a session is named when it starts, but one Keep could not
+   * name at launch (its number was not ready) is named later by \`keep browser show\`,
+   * which asks the extension who owns one of the session's tabs (\`viewer_tab_owner\`,
+   * a one-way tag of the session key) and then asks here. A running client never sends
+   * new headers - Claude Code runs the headers helper when it connects - so the name
+   * cannot arrive with the session's own requests. The host and the extension take the
+   * new name at once, so the tab group reads \`#405\` and the console's view finds it; the
+   * registry keeps it for an adoption after a restart.
    */
-  async function renameFromRequest(id, entry, req) {
-    const name = readHeaderValue(req.headers["x-browser-bridge-session"]);
-    if (!name || name === entry.name || !entry.client.rename) return;
-    // Recorded only once the host has it, so a refusal (a host from before rename, or one
-    // that is restarting) is tried again on the next request instead of being forgotten.
+  async function handleRename(req, res) {
+    const reply = (status, body) => {
+      const text = JSON.stringify(body);
+      res.writeHead(status, { "Content-Type": "application/json", "Content-Length": Buffer.byteLength(text) });
+      res.end(text);
+    };
+    if (req.method !== "POST") return reply(405, { error: "POST only" });
+    let body;
     try {
-      await entry.client.rename(name);
-    } catch (error) {
-      if (entry.renameFailed !== name) log(`session ${tag(id)} could not be renamed ${JSON.stringify(name)}: ${error?.message ?? error}`);
-      entry.renameFailed = name;
-      return;
+      body = JSON.parse((await readBody(req)).toString("utf8"));
+    } catch {
+      return reply(400, { error: "the body must be JSON" });
     }
-    log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
-    entry.name = name;
-    entry.renameFailed = null;
-    known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
+    const owner = typeof body?.owner === "string" && /^[0-9a-f]{32}$/.test(body.owner) ? body.owner : null;
+    const name = sanitizeHeaderValue(body?.name, 200);
+    if (!owner || !name) return reply(400, { error: "rename needs an owner tag and a name" });
+    const found = [...sessions.entries()].find(([, entry]) => entry.sessionKey && ownerTag(entry.sessionKey) === owner);
+    if (!found) return reply(404, { error: "no live session owns that tab" });
+    const [id, entry] = found;
+    if (name !== entry.name) {
+      try {
+        await entry.client.rename?.(name);
+      } catch (error) {
+        return reply(502, { error: `the browser did not take the name: ${error?.message ?? error}` });
+      }
+      log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
+      entry.name = name;
+      known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
+    }
+    return reply(200, { renamed: name });
   }
 
-  function newEntry(identity, client) {
+  function newEntry(identity, client, sessionKey) {
     return {
       ...identity,
       client,
+      // Kept only to answer POST /rename, which names a session by ownerTag() of it.
+      sessionKey,
       transport: null,
       id: null,
       lastSeenAt: now(),
@@ -476,8 +498,9 @@ export function createDaemon({
     const identity = identityFor(req, { remembered });
     // Derived from the id, so there is nothing to look up and nothing that could be handed to
     // the wrong caller: whoever holds the id gets the key for that id, and only that one.
-    const client = newClient({ ...identity, sessionKey: deriveSessionKey(secret, id) });
-    const entry = newEntry(identity, client);
+    const sessionKey = deriveSessionKey(secret, id);
+    const client = newClient({ ...identity, sessionKey });
+    const entry = newEntry(identity, client, sessionKey);
     entry.id = id;
     entry.transport = adoptTransport(id);
     entry.transport.onerror = (error) => log(`transport error: ${error?.message ?? error}`);
@@ -515,8 +538,9 @@ export function createDaemon({
     // The id is minted here rather than inside the transport, because the session key is
     // derived from it and the client needs the key before the transport answers.
     const id = randomUUID();
-    const client = newClient({ ...identity, sessionKey: deriveSessionKey(secret, id) });
-    const entry = newEntry(identity, client);
+    const sessionKey = deriveSessionKey(secret, id);
+    const client = newClient({ ...identity, sessionKey });
+    const entry = newEntry(identity, client, sessionKey);
 
     const transport = new StreamableHTTPServerTransport({
       sessionIdGenerator: () => id,

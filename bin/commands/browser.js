@@ -60,10 +60,9 @@ async function show(argv) {
   const api = transport();
   const pane = paneRef(api);
   if (!pane) die('keep browser show: this session is not running in a Keep pane (no KEEP_PANE)');
-  // A session Keep could not name at launch is named through its pane, which only a
-  // Claude session's headers helper can see: Codex runs it without the session's env.
-  if (!process.env.BROWSER_BRIDGE_SESSION_NAME && (session.agent !== 'claude' || !claudePid())) {
-    die('keep browser show: this session\'s browser has no Keep name (BROWSER_BRIDGE_SESSION_NAME), and only a Claude session can be named after launch; restart it from Keep');
+  // A session Keep could not name at launch is named now, through one of its tabs.
+  if (!/^#\d+/.test(process.env.BROWSER_BRIDGE_SESSION_NAME || '') && o.tab == null) {
+    die('keep browser show: this session\'s browser has no Keep name yet; pass --tab <id> (from tabs_context_mcp) so Keep can name it');
   }
   const body = await call(() => api.post('/api/browser-view/open', {
     sessionId: session.id,
@@ -73,31 +72,52 @@ async function show(argv) {
     note: o.m || null,
   }), 'open the view');
   const record = body.request;
-  // Keep could not name this session's browser at launch: leave the name for the Browser
-  // Bridge, which renames the session's tab group on its next call.
-  if (body.browserName) await leavePaneName(process.env.KEEP_PANE, body.browserName);
+  // Keep could not name this session's browser at launch: name it now, or the view
+  // cannot find its tabs.
+  if (body.browserName) {
+    try {
+      await renameBrowser(Number(o.tab), body.browserName);
+    } catch (error) {
+      await api.post('/api/browser-view/close', { id: record.id, sessionId: session.id, pane }).catch(() => {});
+      die(`keep browser show: could not name this session's browser ${body.browserName}: ${error.message}`);
+    }
+  }
   console.log(`browser view opened for #${record.num} on ${record.node}${record.tabId != null ? `, starting on tab ${record.tabId}` : ''}`);
   console.log('Owner sees it over this session\'s terminal in the Keep console. Nothing arrives here when they close it:');
   console.log('read the page (screenshot, read_page) to see whether they are done, or run keep browser status.');
-  if (body.browserName) {
-    console.log(`This session's tab group is named ${body.browserName} on its next browser call: make one now (tabs_context_mcp) so the view finds your tabs.`);
-  }
+  if (body.browserName) console.log(`This session's tab group is now named ${body.browserName}.`);
 }
 
-async function leavePaneName(pane, name) {
+/**
+ * Rename the Browser Bridge session that owns `tabId`: the extension says which session
+ * that is (as a one-way tag of its key), and the bridge's daemon renames it and its group.
+ */
+async function renameBrowser(tabId, name) {
   const path = require('node:path');
-  const fs = require('node:fs');
-  const { paneNamePath, processStarted } = await import(path.join(__dirname, '..', '..', 'browser-bridge', 'host', 'protocol.js'));
-  const file = paneNamePath(pane, process.env);
-  const started = processStarted(claudePid());
-  if (!file || !started) die(`keep browser show: cannot name the browser of pane ${pane}`);
-  await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  await fs.promises.writeFile(file, `${JSON.stringify({ name, pid: claudePid(), started })}\n`, { mode: 0o600 });
-}
-
-function claudePid() {
-  const pid = Number(process.env.CLAUDE_PID);
-  return Number.isInteger(pid) && pid > 1 ? pid : null;
+  const bridge = path.join(__dirname, '..', '..', 'browser-bridge');
+  const { readDaemonConfig } = await import(path.join(bridge, 'host', 'protocol.js'));
+  const { connectViewer } = await import(path.join(bridge, 'host', 'viewer-client.js'));
+  const config = readDaemonConfig(process.env);
+  if (!config) throw new Error('Browser Bridge is not installed on this machine');
+  const viewer = await connectViewer({ name: 'keep browser show' });
+  let owner;
+  try {
+    ({ owner } = await viewer.request('viewer_tab_owner', { tabId }));
+  } finally {
+    viewer.close();
+  }
+  if (!owner) throw new Error(`tab ${tabId} is not in a session's tab group`);
+  const response = await fetch(`http://127.0.0.1:${config.port}/rename`, {
+    method: 'POST',
+    headers: { authorization: `Bearer ${config.token}`, 'content-type': 'application/json' },
+    body: JSON.stringify({ owner, name }),
+    signal: AbortSignal.timeout(30e3),
+  });
+  if (!response.ok) {
+    let reason = `HTTP ${response.status}`;
+    try { reason = (await response.json()).error || reason; } catch {}
+    throw new Error(reason);
+  }
 }
 
 async function hide(argv) {
