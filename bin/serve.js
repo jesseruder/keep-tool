@@ -601,14 +601,21 @@ async function companionSnapshot(deps = {}) {
       jobs: snapshots.flatMap((snapshot) => snapshot.jobs || []),
     };
   };
+  // The fleet-wide fields stay this machine's own discovery, so nothing that reads
+  // them changes; every node's answer, this one's included, rides beside them in
+  // `byNode`, for the rules that ask about a session where it runs.
+  const discoverFleet = async (options) => {
+    const local = await discover(options);
+    return { ...local, byNode: await companionByNode(local, deps) };
+  };
   const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
   // Injected discovery is request scoped and must not share production cache state.
   if (injected) {
-    return discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS });
+    return discoverFleet({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS });
   }
   if (companionSnapshotCache.value && now - companionSnapshotCache.at < COMPANION_SNAPSHOT_MS) return companionSnapshotCache.value;
   if (companionSnapshotCache.pending) return companionSnapshotCache.pending;
-  companionSnapshotCache.pending = discover({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS })
+  companionSnapshotCache.pending = discoverFleet({ root: deps.root || keep.ROOT, fallbackCacheMs: COMPANION_SNAPSHOT_MS })
     .then((value) => {
       companionSnapshotCache = { at: Date.now(), value, pending: null };
       return value;
@@ -619,22 +626,81 @@ async function companionSnapshot(deps = {}) {
   return companionSnapshotCache.pending;
 }
 
-function applyCompanionJobs(sessions, companion) {
-  const known = companion?.known ?? (companion?.discovery && companion.discovery !== 'unknown');
-  if (!known) return sessions;
-  const byOwner = new Map();
-  for (const job of companion.jobs || []) {
-    if (!job) continue;
+function companionKnown(entry) {
+  return Boolean(entry?.known ?? (entry?.discovery && entry.discovery !== 'unknown'));
+}
+
+// A known, not partial list: the same rule for this machine's own discovery and for
+// each node's entry in `byNode`.
+function companionListComplete(entry) {
+  return companionKnown(entry) && entry?.partial !== true && entry?.discovery !== 'partial';
+}
+
+// A node's entry in the snapshot's `byNode`, or null.
+function nodeCompanionEntry(companion, node) {
+  const byNode = companion?.byNode;
+  return node && byNode && typeof byNode === 'object' && Object.hasOwn(byNode, node) ? byNode[node] : null;
+}
+
+// Whether the companion job list a session's pane is judged against is complete. A
+// pane on this machine carries no `hostPaneId` (qualifyNodePanes) and is judged by this
+// machine's own discovery, exactly as before nodes answered for theirs. A pane on
+// another node is judged by that node's own answer, and by nothing when the node gave
+// none: a job this daemon cannot see may be what the session is waiting on.
+function paneCompanionComplete(pane, companion) {
+  if (!pane?.hostPaneId) return companionListComplete(companion);
+  const entry = nodeCompanionEntry(companion, pane.node);
+  return entry ? companionListComplete(entry) : false;
+}
+
+// `options.nodeOf` names the node a session's pane is on (null for this machine);
+// buildState passes the same pane reading paneCompanionComplete uses, so a session is
+// given the jobs of exactly the node whose list it is judged complete by.
+function applyCompanionJobs(sessions, companion, options = {}) {
+  const daemonNode = options.daemonNode || daemonNodeName();
+  const nodeOf = typeof options.nodeOf === 'function' ? options.nodeOf : (session) => session?.node;
+  const known = companionKnown(companion);
+  // Each node's jobs, attached only to a session on that same node: a node's job
+  // list names that node's sessions, and nothing here reads its pids or paths.
+  const nodeOwners = new Map();
+  const knownNodes = new Set();
+  for (const [node, entry] of Object.entries(companion?.byNode || {})) {
+    if (!node || node === daemonNode || !companionKnown(entry)) continue;
+    knownNodes.add(node);
+    for (const job of entry.jobs || []) {
+      if (!job || typeof job.sessionId !== 'string' || !job.sessionId) continue;
+      const key = `${node}\0${job.sessionId}`;
+      if (!nodeOwners.has(key)) nodeOwners.set(key, []);
+      nodeOwners.get(key).push(job);
+    }
+  }
+  if (!known && !knownNodes.size) return sessions;
+  const companionEntry = (job, node = null) => {
+    if (!job) return null;
     const state = job.state || job.status;
-    if (!job.id || !['running', 'queued', 'cancelling', 'stalled'].includes(state) || typeof job.sessionId !== 'string' || !job.sessionId) continue;
-    if (!byOwner.has(job.sessionId)) byOwner.set(job.sessionId, []);
-    byOwner.get(job.sessionId).push({
+    if (!job.id || !['running', 'queued', 'cancelling', 'stalled'].includes(state) || typeof job.sessionId !== 'string' || !job.sessionId) return null;
+    return {
       id: String(job.id), kind: 'companion', status: 'pending', recurring: false,
       startedAt: stalled.timeMs(job.startedAt || job.createdAt), expiresAt: null, current: true,
-    });
+      ...(node ? { node } : {}),
+    };
+  };
+  const byOwner = new Map();
+  for (const job of known ? companion.jobs || [] : []) {
+    const entry = companionEntry(job);
+    if (!entry) continue;
+    if (!byOwner.has(job.sessionId)) byOwner.set(job.sessionId, []);
+    byOwner.get(job.sessionId).push(entry);
   }
   for (const session of sessions || []) {
-    const owned = byOwner.get(session.id) || [];
+    const sessionNode = nodeOf(session);
+    const node = typeof sessionNode === 'string' && sessionNode !== daemonNode && knownNodes.has(sessionNode)
+      ? sessionNode : null;
+    if (!known && !node) continue;
+    const owned = [
+      ...(byOwner.get(session.id) || []),
+      ...(node ? (nodeOwners.get(`${node}\0${session.id}`) || []).map((job) => companionEntry(job, node)).filter(Boolean) : []),
+    ];
     const existing = session.backgroundJobs;
     const priorJobs = existing?.jobs || [];
     const hadCompanion = priorJobs.some((job) => job.kind === 'companion');
@@ -1858,7 +1924,8 @@ function isHostTarget(target) {
 // further and has a connection of its own (HOST_CHANNEL_BY_TYPE): a receipt's long
 // poll waits up to nine seconds, and a launch's prepare must not queue behind it.
 // `secret-write` joins them: it checks the destination against the node's repos first.
-const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'secret-write', 'ensure-worktree']);
+// `companion-jobs` reads a node's job state in a child process for up to six seconds.
+const HOST_OPS_TYPES = new Set(['run', 'transcript', 'prepare-launch', 'usage', 'git-state', 'artifacts', 'stats', 'secret-write', 'ensure-worktree', 'companion-jobs']);
 // `artifacts` carries a moving session's files in 4 MiB frames: a connection of its
 // own, so a move never sits in front of a receipt, a launch or a keystroke.
 const HOST_CHANNEL_BY_TYPE = new Map([['transcript', 'transcript'], ['artifacts', 'artifacts']]);
@@ -2129,7 +2196,7 @@ async function hostRequest(type, params, deps = {}) {
   // agent pane — a `process` call every 2.5s — clear the memo that outage listing is
   // built from, so a slow node holding an agent pane dropped off the list entirely
   // instead of staying on it marked stale.
-  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript', 'stats'].includes(type)
+  const idempotent = ['hello', 'list', 'get', 'screen', 'meta', 'process', 'usage', 'transcript', 'stats', 'companion-jobs'].includes(type)
     // An artifacts read or list changes nothing, a stage is continuity-checked on the
     // node (the same piece again is a no-op), and an abort only removes a stage. A
     // publish, a release and a queue drop are asked once: their caller looks before
@@ -6558,6 +6625,125 @@ async function remoteProcessRows(node, deps = {}) {
     throw error;
   });
   return cache.pending;
+}
+
+// Each node's own Codex companion and Pi jobs (the host's `companion-jobs` verb), kept
+// apart per node like its process rows: the pids and paths in them are that machine's.
+const nodeCompanionJobsCaches = new Map();
+// Whether a node's host answers the verb, from its hello, rechecked once a minute.
+const nodeCompanionJobsCapability = new Map();
+const NODE_COMPANION_CAPABILITY_MS = 60e3;
+// The node reads its lists in a child it kills at six seconds.
+const NODE_COMPANION_REQUEST_TIMEOUT_MS = 10e3;
+// How long a snapshot waits on a node before it counts that node as unknown for this
+// round. The read goes on and fills the cache for the next one: one slow node must not
+// hold up a publication that every other session's status waits on.
+const NODE_COMPANION_WAIT_MS = 3000;
+
+function unknownNodeCompanion(node, reason) {
+  return { node, known: false, complete: false, discovery: 'unknown', jobs: [], parts: null, reason };
+}
+
+// One node's answer, in the shape of the daemon's own snapshot. Every job carries the
+// node it runs on, so nothing downstream can mistake its pid or state path for one here.
+function summarizeNodeCompanion(node, answer) {
+  const snapshots = [answer.codexJobs, answer.piJobs].filter((part) => part && typeof part === 'object');
+  const known = snapshots.some((snapshot) => snapshot.known ?? (snapshot.discovery && snapshot.discovery !== 'unknown'));
+  const complete = snapshots.length === 2
+    && snapshots.every((snapshot) => snapshot.complete === true || snapshot.discovery === 'ok');
+  return {
+    node,
+    known,
+    complete,
+    discovery: !known ? 'unknown' : complete ? 'ok' : 'partial',
+    jobs: snapshots.flatMap((snapshot) => (Array.isArray(snapshot.jobs) ? snapshot.jobs : []))
+      .filter((job) => job && typeof job === 'object').map((job) => ({ ...job, node })),
+    parts: {
+      codex: answer.codexJobs ? { discovery: answer.codexJobs.discovery ?? null, unreadable: answer.codexJobs.unreadable || [] } : null,
+      pi: answer.piJobs ? { discovery: answer.piJobs.discovery ?? null } : null,
+    },
+    ...(typeof answer.bootId === 'string' ? { bootId: answer.bootId } : {}),
+  };
+}
+
+async function fetchNodeCompanionJobs(node, deps = {}) {
+  const request = deps.hostRequest || hostRequest;
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  try {
+    let capability = nodeCompanionJobsCapability.get(node);
+    if (!capability || !(now - capability.at < NODE_COMPANION_CAPABILITY_MS)) {
+      const hello = await request('hello', {}, { ...deps, node });
+      capability = { at: now, version: Number(hello && hello.companionJobs) || 0 };
+      nodeCompanionJobsCapability.set(node, capability);
+    }
+    // An older host is never asked: it would answer "unknown request" at best.
+    if (!(capability.version >= 1)) return unknownNodeCompanion(node, 'host-predates-verb');
+    const answer = await request('companion-jobs', {}, {
+      ...deps, node, hostRequestTimeoutMs: NODE_COMPANION_REQUEST_TIMEOUT_MS,
+    });
+    if (!answer || typeof answer !== 'object') return unknownNodeCompanion(node, 'no-answer');
+    // An answer from some other machine says nothing about this one's sessions.
+    if (typeof answer.node === 'string' && answer.node && answer.node !== node) {
+      return unknownNodeCompanion(node, 'wrong-node');
+    }
+    return summarizeNodeCompanion(node, answer);
+  } catch (error) {
+    if (/unknown request/i.test(String(error && error.message || ''))) {
+      nodeCompanionJobsCapability.delete(node);
+      return unknownNodeCompanion(node, 'host-predates-verb');
+    }
+    return unknownNodeCompanion(node, 'unreachable');
+  }
+}
+
+// Never rejects: a node that does not answer is `discovery: 'unknown'`.
+function remoteCompanionJobs(node, deps = {}) {
+  let cache = nodeCompanionJobsCaches.get(node);
+  if (!cache) {
+    cache = { value: null, at: 0, pending: null };
+    nodeCompanionJobsCaches.set(node, cache);
+  }
+  const now = typeof deps.now === 'function' ? Number(deps.now()) : Number(deps.now ?? Date.now());
+  if (cache.value && now - cache.at < PROCESS_ROWS_CACHE_MS) return Promise.resolve(cache.value);
+  if (cache.pending) return cache.pending;
+  cache.pending = fetchNodeCompanionJobs(node, deps).then((value) => {
+    cache.value = value;
+    cache.at = typeof deps.now === 'function' ? Number(deps.now()) : Date.now();
+    cache.pending = null;
+    return value;
+  }, () => {
+    cache.pending = null;
+    return unknownNodeCompanion(node, 'failed');
+  });
+  return cache.pending;
+}
+
+// Every node's companion list, the daemon's own (already read) under its own name.
+async function companionByNode(local, deps = {}) {
+  const daemon = daemonNodeName(deps);
+  const byNode = {
+    [daemon]: { node: daemon, known: local.known, complete: local.complete, discovery: local.discovery,
+      jobs: local.jobs || [], parts: local.parts || null },
+  };
+  let others = [];
+  try { others = hostNodeNames(deps).filter((node) => node && node !== daemon); } catch {}
+  if (!others.length) return byNode;
+  const fetch = deps.remoteCompanionJobs || remoteCompanionJobs;
+  const waitMs = deps.nodeCompanionWaitMs == null ? NODE_COMPANION_WAIT_MS : Number(deps.nodeCompanionWaitMs);
+  const answers = await Promise.all(others.map((node) => new Promise((resolve) => {
+    let timer = null;
+    const settle = (value) => {
+      if (timer) { clearTimeout(timer); timer = null; }
+      resolve(value);
+    };
+    timer = setTimeout(() => settle(unknownNodeCompanion(node, 'slow')), waitMs);
+    Promise.resolve()
+      .then(() => fetch(node, deps))
+      .then((value) => settle(value && typeof value === 'object' ? value : unknownNodeCompanion(node, 'no-answer')),
+        () => settle(unknownNodeCompanion(node, 'failed')));
+  })));
+  others.forEach((node, index) => { byNode[node] = answers[index]; });
+  return byNode;
 }
 
 async function agentProcessRows(deps = {}, options = {}) {
@@ -13722,7 +13908,12 @@ function buildState(options = {}) {
       }
     }
   }
-  applyCompanionJobs(sessions, options.companion);
+  applyCompanionJobs(sessions, options.companion, {
+    nodeOf: (session) => {
+      const pane = panesBySession.get(session.id);
+      return pane?.hostPaneId ? pane.node || null : null;
+    },
+  });
   // What Claude Code's footer says is running in each live Claude pane, and whether
   // that reading still agrees with the process table and the ledger (footer-health).
   // Only a full dashboard build over the whole pane list advances the check: an
@@ -13735,22 +13926,18 @@ function buildState(options = {}) {
   });
   const footerStatus = options.fresh !== true && Array.isArray(options.hostPanes)
     ? footerHealth.observe(footerTracker, footerObservations, now) : footerHealth.peek(footerTracker, now);
-  // Whether this machine's companion job list is complete: a session here whose
-  // discovery is unknown or partial may be waiting on a job status cannot see.
-  const companionComplete = Boolean(options.companion?.known ?? (options.companion?.discovery && options.companion.discovery !== 'unknown'))
-    && options.companion?.partial !== true && options.companion?.discovery !== 'partial';
   for (const session of sessions) {
     const pane = panesBySession.get(session.id);
     if (pane?.footer && session.kind === 'claude') {
       session.footer = pane.footer;
       session.footerTrusted = footerStatus.trusted && !footerStatus.untrustedPanes.includes(pane.id);
       if (Number.isInteger(pane.agentShells)) session.agentShells = pane.agentShells;
-      // Companion jobs are discovered on this machine only: a session on another
-      // node may be waiting on one nothing here can see, so it keeps its RUNNING.
-      // A pane on another node carries its host's own id beside the qualified one
-      // (qualifyNodePanes); the daemon's own panes have none (absent or null),
-      // whatever their node tag.
-      session.companionComplete = !pane.hostPaneId ? companionComplete : false;
+      // Whether the companion job list this session is judged against is complete:
+      // one whose discovery is unknown or partial may be waiting on a job status
+      // cannot see. Jobs are discovered where they run, so a session on another node
+      // is judged by that node's own answer (the `companion-jobs` host verb) and
+      // keeps its RUNNING when that node gave none (paneCompanionComplete).
+      session.companionComplete = paneCompanionComplete(pane, options.companion);
     }
   }
   // What the classifier reads off the card: whether this session is its latest linked
@@ -18018,6 +18205,8 @@ module.exports = {
   stallAliveIds,
   companionSnapshot,
   applyCompanionJobs,
+  paneCompanionComplete,
+  remoteCompanionJobs,
   claudeSessionFor,
   forgetClaudeSessionMisses,
   noteHostPaneSessions,

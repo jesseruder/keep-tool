@@ -122,6 +122,7 @@ const {
   createDashboardClaudeSessionResolver,
   companionSnapshot,
   applyCompanionJobs,
+  paneCompanionComplete,
   applySessionLiveness,
   resumeAfterLimit,
   agentPromptVisible,
@@ -11691,6 +11692,162 @@ test('companion snapshot merges Codex and Pi jobs', async () => {
   });
   assert.equal(snapshot.known, true);
   assert.deepEqual(snapshot.jobs.map((job) => job.id), ['codex-job', 'pi-job']);
+});
+
+// A node's host answering the companion-jobs verb (bin/node-companion-jobs.js), as
+// the daemon's hostRequest sees it. Names are per test: the node caches are per node.
+function companionNodeHost(answers) {
+  const asked = [];
+  const hostRequest = async (type, params, deps) => {
+    asked.push([type, deps.node]);
+    const answer = answers[deps.node];
+    if (typeof answer === 'function') return answer(type);
+    if (type === 'hello') return { node: deps.node, companionJobs: 1 };
+    if (type === 'companion-jobs') return answer;
+    throw new Error(`unexpected ${type}`);
+  };
+  return { hostRequest, asked };
+}
+
+const localCompanion = {
+  root: '/unused',
+  daemonNode: 'main',
+  discoverCodexJobs: async () => ({ known: true, complete: true, jobs: [{ id: 'local-job', sessionId: 'local-owner', state: 'running', pid: 7 }] }),
+  discoverPiJobs: () => ({ known: true, discovery: 'ok', jobs: [] }),
+};
+
+test('companion snapshot keeps its own fields local and adds each node\'s own answer by node', async () => {
+  const { hostRequest, asked } = companionNodeHost({
+    'cj-merge': {
+      node: 'cj-merge', bootId: 'boot-1',
+      codexJobs: { discovery: 'ok', jobs: [{ id: 'node-job', sessionId: 'node-owner', state: 'running', pid: 7 }] },
+      piJobs: { known: true, discovery: 'ok', jobs: [] },
+    },
+  });
+  const snapshot = await companionSnapshot({ ...localCompanion, hostNodes: ['main', 'cj-merge'], hostRequest });
+  assert.deepEqual(snapshot.jobs.map((job) => job.id), ['local-job'], 'the fleet-wide fields are this machine\'s own');
+  assert.equal(snapshot.jobs[0].node, undefined, 'a local job is as it was');
+  assert.equal(snapshot.discovery, 'ok');
+  assert.deepEqual(Object.keys(snapshot.byNode).sort(), ['cj-merge', 'main']);
+  assert.equal(snapshot.byNode.main.discovery, 'ok');
+  assert.deepEqual(snapshot.byNode.main.jobs.map((job) => job.id), ['local-job']);
+  const node = snapshot.byNode['cj-merge'];
+  assert.equal(node.known, true);
+  assert.equal(node.complete, true);
+  assert.equal(node.discovery, 'ok');
+  assert.equal(node.bootId, 'boot-1');
+  assert.deepEqual(node.jobs.map((job) => [job.id, job.node, job.pid]), [['node-job', 'cj-merge', 7]],
+    'a node\'s job carries its node, so its pid is never read as one here');
+  assert.deepEqual(asked, [['hello', 'cj-merge'], ['companion-jobs', 'cj-merge']]);
+  // Within the short cache the node is not asked again.
+  await companionSnapshot({ ...localCompanion, hostNodes: ['main', 'cj-merge'], hostRequest });
+  assert.equal(asked.length, 2);
+  // A single-node install asks nobody.
+  const single = companionNodeHost({});
+  const alone = await companionSnapshot({ ...localCompanion, hostNodes: ['main'], hostRequest: single.hostRequest });
+  assert.deepEqual(Object.keys(alone.byNode), ['main']);
+  assert.deepEqual(single.asked, []);
+});
+
+test('companion snapshot reads a node that fails, predates the verb, is slow or is partial as not known there', async () => {
+  const { hostRequest, asked } = companionNodeHost({
+    'cj-down': () => { throw new Error('terminal host is unavailable'); },
+    'cj-old': (type) => {
+      if (type === 'hello') return { node: 'cj-old', transcript: 5 };
+      throw new Error('an older host is never asked the verb');
+    },
+    'cj-older': (type) => {
+      if (type === 'hello') return { node: 'cj-older', companionJobs: 1 };
+      throw new Error('unknown request');
+    },
+    'cj-slow': () => new Promise(() => {}),
+    'cj-partial': (type) => (type === 'hello' ? { companionJobs: 1 } : {
+      node: 'cj-partial', codexJobs: { discovery: 'partial', jobs: [], unreadable: ['account inventory'] },
+      piJobs: { known: true, discovery: 'ok', jobs: [] },
+    }),
+    'cj-elsewhere': (type) => (type === 'hello' ? { companionJobs: 1 } : {
+      node: 'some-other-node', codexJobs: { discovery: 'ok', jobs: [] }, piJobs: { known: true, discovery: 'ok', jobs: [] },
+    }),
+  });
+  const nodes = ['cj-down', 'cj-old', 'cj-older', 'cj-slow', 'cj-partial', 'cj-elsewhere'];
+  const snapshot = await companionSnapshot({ ...localCompanion, hostNodes: ['main', ...nodes], hostRequest, nodeCompanionWaitMs: 50 });
+  assert.equal(snapshot.discovery, 'ok', 'no node\'s trouble reaches this machine\'s own answer');
+  const reasons = Object.fromEntries(nodes.map((node) => [node, [snapshot.byNode[node].discovery, snapshot.byNode[node].reason || null]]));
+  assert.deepEqual(reasons, {
+    'cj-down': ['unknown', 'unreachable'],
+    'cj-old': ['unknown', 'host-predates-verb'],
+    'cj-older': ['unknown', 'host-predates-verb'],
+    'cj-slow': ['unknown', 'slow'],
+    'cj-partial': ['partial', null],
+    'cj-elsewhere': ['unknown', 'wrong-node'],
+  });
+  assert.equal(snapshot.byNode['cj-partial'].known, true);
+  assert.equal(snapshot.byNode['cj-partial'].complete, false);
+  assert.deepEqual(snapshot.byNode['cj-partial'].parts.codex, { discovery: 'partial', unreadable: ['account inventory'] });
+  assert.ok(!asked.some(([type, node]) => node === 'cj-old' && type === 'companion-jobs'),
+    'a host whose hello does not name the verb is never asked it');
+});
+
+test('a session is judged by the companion list of the node its pane is on', () => {
+  const byNode = {
+    main: { known: true, complete: true, discovery: 'ok', jobs: [] },
+    'cj-ok': { known: true, complete: true, discovery: 'ok', jobs: [] },
+    'cj-unknown': { known: false, complete: false, discovery: 'unknown', jobs: [] },
+    'cj-partial': { known: true, complete: false, discovery: 'partial', jobs: [] },
+  };
+  const complete = { known: true, complete: true, discovery: 'ok', jobs: [], byNode };
+  const local = { id: 'p1' };
+  const onNode = (node) => ({ id: `p1@${node}`, node, hostPaneId: 'p1' });
+  assert.equal(paneCompanionComplete(local, complete), true);
+  assert.equal(paneCompanionComplete({ ...local, hostPaneId: null, node: 'main' }, complete), true);
+  assert.equal(paneCompanionComplete(local, { ...complete, known: false, discovery: 'unknown' }), false,
+    'this machine\'s own panes keep exactly the answer they had');
+  assert.equal(paneCompanionComplete(local, { ...complete, discovery: 'partial' }), false);
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete), true);
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, known: false, discovery: 'unknown' }), true,
+    'a node session is judged by its own node, not by this machine');
+  assert.equal(paneCompanionComplete(onNode('cj-unknown'), complete), false);
+  assert.equal(paneCompanionComplete(onNode('cj-partial'), complete), false);
+  assert.equal(paneCompanionComplete(onNode('cj-missing'), complete), false, 'a node that gave no answer');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { known: true, discovery: 'ok', jobs: [] }), false,
+    'a snapshot with no node answers at all');
+  assert.equal(paneCompanionComplete(onNode('__proto__'), complete), false);
+});
+
+test('a node session drops RUNNING when its own node lists no job for it, and keeps it otherwise', () => {
+  const { activity } = require('./session-status');
+  const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
+  const idle = (id) => ({ id, kind: 'claude', pane: `p-${id}@cj-status`, node: 'cj-status', endedTurn: true, attentionAt: 1000,
+    lastAssistantFull: 'The Codex review is running; I will land once it comes back.',
+    stopVerdict: { verdict: 'running', reason: 'waiting on the review' },
+    footer, footerTrusted: true, agentShells: 0, backgroundJobs: { caughtUp: true, pending: false, jobs: [] } });
+  const nodeAnswer = (discovery, jobs = []) => ({ known: true, complete: true, discovery: 'ok', jobs: [], byNode: {
+    main: { known: true, complete: true, discovery: 'ok', jobs: [] },
+    'cj-status': { known: discovery !== 'unknown', complete: discovery === 'ok', discovery, jobs },
+  } });
+  // What buildState does for each session: the node's jobs for a session on that
+  // node, then whether that node's list is complete.
+  const judge = (session, companion) => {
+    const pane = { id: session.pane, node: 'cj-status', hostPaneId: `p-${session.id}` };
+    applyCompanionJobs([session], companion, { daemonNode: 'main', nodeOf: () => pane.node });
+    session.companionComplete = paneCompanionComplete(pane, companion);
+    return activity(session);
+  };
+  const empty = judge(idle('cj-empty'), nodeAnswer('ok'));
+  assert.equal(empty.decision.rule, 'conversation-ready', 'nothing on its node will wake it: the verdict falls to the rules');
+  const unknown = idle('cj-unknown');
+  assert.equal(judge(unknown, nodeAnswer('unknown')).decision.rule, 'model-running', 'an unknown node keeps it RUNNING');
+  assert.equal(unknown.companionComplete, false);
+  const owned = idle('cj-owned');
+  const running = judge(owned, nodeAnswer('ok', [{ id: 'task-node', sessionId: 'cj-owned', state: 'running', node: 'cj-status' }]));
+  assert.equal(running.state, 'waiting', 'its own node\'s running job keeps it waiting');
+  assert.deepEqual(owned.backgroundJobs.jobs.map((job) => [job.id, job.kind, job.node]), [['task-node', 'companion', 'cj-status']]);
+  // A job another node lists for a session with the same id is not this session's.
+  const stranger = idle('cj-stranger');
+  const companion = nodeAnswer('ok');
+  companion.byNode['cj-other'] = { known: true, complete: true, discovery: 'ok', jobs: [{ id: 'task-other', sessionId: 'cj-stranger', state: 'running' }] };
+  assert.equal(judge(stranger, companion).decision.rule, 'conversation-ready');
+  assert.deepEqual(stranger.backgroundJobs.jobs, []);
 });
 
 test('buildState includes companion ownership in normal session classification', () => {

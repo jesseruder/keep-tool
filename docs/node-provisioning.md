@@ -221,6 +221,15 @@ a node.** Run against a fleet where some sessions live on another node, a tick m
 deliver, move or verify against the file, and a mirror trails the node by a hook post, so
 "use the mirror" is never the fix there; handle the refusal per session instead.
 
+Codex companion and Pi jobs are discovered on the machine they run on. A session on a
+node that starts `keep codex task --background` creates the job in that node's own
+companion state, so the daemon asks each node's host for its own list (the read-only
+`companion-jobs` verb, `bin/node-companion-jobs.js`) beside its own, and judges whether
+anything will wake a node session by that node's answer alone. A node that does not
+answer, or whose host predates the verb (its hello has no `companionJobs`), counts as
+unknown, and its sessions keep their RUNNING. To give such a node the verb, run
+`keep nodes update` and then `keep host reload` on that node.
+
 ### Adding a scheduler to the suite
 
 The fixture is `bin/fixtures/remote-node-fleet.js`. `createRemoteNodeFleet(t)` writes, into

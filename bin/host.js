@@ -75,6 +75,7 @@ const ARTIFACTS_VERSION = 3;
 const STATS_VERSION = 1;
 const WORKTREE_VERSION = 1;
 const INVENTORY_VERSION = 1;
+const COMPANION_JOBS_VERSION = 1;
 
 // A reply frame is the request's answer spread beside the frame's own `ok` and `id`
 // (and `ev`, which marks an event). An answer carrying one of those would rewrite the
@@ -1259,6 +1260,11 @@ function createHost(options = {}) {
           // this machine is set up with, which `keep node audit` diffs against the
           // daemon node's.
           inventory: INVENTORY_VERSION,
+          // companionJobs: this host answers the `companion-jobs` verb
+          // (bin/node-companion-jobs.js): this machine's own Codex companion and Pi
+          // jobs, read-only, so the daemon can tell whether a session here is waiting
+          // on one.
+          companionJobs: COMPANION_JOBS_VERSION,
           // Set while an earlier inventory is stuck past its grace (see runInventory).
           inventoryStuck: inventoryStuck ? inventoryStuck.text : null,
           // spawnReceipts: a spawn naming an operationId is journalled, so a caller
@@ -1877,6 +1883,32 @@ function createHost(options = {}) {
       .finally(() => { inventoryInFlight -= 1; });
   };
 
+  // This machine's own Codex companion and Pi jobs (bin/node-companion-jobs.js). The
+  // read happens in a child process bounded by a timeout, beside the connection's
+  // queue like stats, and every ask that arrives while one is running shares its
+  // answer: a node is asked every few seconds, never by more than one read at once.
+  let companionJobsPending = null;
+  const runCompanionJobs = (connection, socket, request) => {
+    const respond = (response) => {
+      if (socket.destroyed) return;
+      connection.send(encodeFrame(response));
+    };
+    if (!companionJobsPending) {
+      companionJobsPending = require('./node-companion-jobs.js').read({
+        // Test seams only: fixture state roots and a shorter bound.
+        seam: options.companionJobsOptions,
+        timeoutMs: options.companionJobsTimeoutMs,
+        env,
+      }).finally(() => { companionJobsPending = null; });
+    }
+    companionJobsPending
+      .then((answer) => respond({
+        ok: true, id: request.id, codexJobs: answer.codexJobs, piJobs: answer.piJobs,
+        node: nodeName, bootId, version: COMPANION_JOBS_VERSION,
+      }), (error) => respond({ ok: false, id: request.id, error: error.message }))
+      .catch(() => {});
+  };
+
   let transcriptsInFlight = 0;
   const TRANSCRIPTS_IN_FLIGHT_MAX = 32;
   const runTranscript = (connection, socket, request) => {
@@ -1997,6 +2029,10 @@ function createHost(options = {}) {
       }
       if (request && typeof request === 'object' && request.type === 'inventory') {
         runInventory(connection, socket, request);
+        return;
+      }
+      if (request && typeof request === 'object' && request.type === 'companion-jobs') {
+        runCompanionJobs(connection, socket, request);
         return;
       }
       // A live view of a session's browser tabs streams frames for as long as it is

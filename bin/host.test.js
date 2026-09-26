@@ -2723,6 +2723,55 @@ test('a node answers for its own processes and signals them itself', async () =>
 });
 
 
+test('a node answers for its own companion jobs, read-only and bounded, and says so in its hello', async () => {
+  // A fixture companion state: one workspace with a running job owned by a session,
+  // a Keep root with no Pi jobs, and no companion script to fall back on.
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-companion-jobs-'));
+  try {
+    const stateRoot = path.join(dir, 'state');
+    fs.mkdirSync(path.join(stateRoot, 'workspace-a'), { recursive: true });
+    const at = new Date().toISOString();
+    fs.writeFileSync(path.join(stateRoot, 'workspace-a', 'state.json'), JSON.stringify({ jobs: [
+      { id: 'task-fixture-running', status: 'running', sessionId: 'fixture-owner', createdAt: at, updatedAt: at,
+        logFile: path.join(dir, 'missing.log'), summary: 'fixture' },
+      { id: 'task-fixture-done', status: 'completed', sessionId: 'fixture-owner', createdAt: at, updatedAt: at },
+    ] }));
+    const keepRoot = path.join(dir, 'keep');
+    fs.mkdirSync(keepRoot, { recursive: true });
+    const companionJobsOptions = { root: keepRoot, codexStateRoots: [stateRoot], companionScript: path.join(dir, 'no-such-script.mjs') };
+    await withHost({ companionJobsOptions }, async ({ client }) => {
+      const hello = await client.request('hello');
+      assert.equal(hello.companionJobs, 1, 'the hello says this host answers the verb');
+      // Asked twice at once: both are answered, from one read.
+      const [answer, again] = await Promise.all([
+        client.request('companion-jobs', {}, { timeoutMs: 20e3 }),
+        client.request('companion-jobs', {}, { timeoutMs: 20e3 }),
+      ]);
+      assert.equal(answer.bootId, hello.bootId, 'the answer names the host process that read it');
+      assert.equal(answer.node, hello.node);
+      assert.equal(answer.version, 1);
+      assert.equal(answer.codexJobs.discovery, 'ok');
+      assert.deepEqual(answer.codexJobs.jobs.map((job) => [job.id, job.sessionId]), [['task-fixture-running', 'fixture-owner']],
+        'only the unfinished job is listed');
+      assert.deepEqual(answer.piJobs, { known: true, discovery: 'ok', jobs: [] });
+      assert.deepEqual(again.codexJobs.jobs.map((job) => job.id), ['task-fixture-running']);
+      // The fixture state is exactly as it was: the verb lists, and changes nothing.
+      assert.deepEqual(JSON.parse(fs.readFileSync(path.join(stateRoot, 'workspace-a', 'state.json'), 'utf8')).jobs.map((job) => job.status),
+        ['running', 'completed']);
+    });
+    // A read that cannot finish in time answers unknown, and the host is free again.
+    await withHost({ companionJobsOptions, companionJobsTimeoutMs: 1 }, async ({ client }) => {
+      const answer = await client.request('companion-jobs', {}, { timeoutMs: 20e3 });
+      assert.equal(answer.codexJobs.discovery, 'unknown');
+      assert.equal(answer.codexJobs.reason, 'timeout');
+      assert.equal(answer.piJobs.discovery, 'unknown');
+      assert.equal((await client.request('hello')).companionJobs, 1);
+    });
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
+
 test('a receipt the journal has had to forget answers "unknown", never a second spawn', async () => {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-host-receipt-evicted-'));
   const sock = path.join(root, 'host.sock');
