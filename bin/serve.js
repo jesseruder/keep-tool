@@ -4507,10 +4507,13 @@ function unansweredNodes(result) {
 // built from the node's tail; a Codex row needs its rollout's session_meta as well,
 // which the node's `meta` op gives, asked beside the tail. A Pi session there, or one
 // whose agent is not recorded, is refused by name (remoteDeliveryRefusal).
+// `deps.readNode` reads it through that node instead of the one its location record
+// names: a caller that has already decided where the session is from its live pane
+// (the compaction tick) reads it there, so one source decides.
 async function remoteSessionRead(id, deps = {}) {
   const sessionId = String(id || '');
   if (!/^[A-Za-z0-9_-]+$/.test(sessionId)) throw new InjectionError(400, 'bad session id');
-  const node = sessionNodeOf({ id: sessionId }, deps);
+  const node = deps.readNode || sessionNodeOf({ id: sessionId }, deps);
   if (node === daemonNodeName(deps)) return null;
   let location = null;
   try { location = (deps.sessionLocation || accounts.sessionLocation)(sessionId, { root: deps.root || keep.ROOT, env: deps.env || process.env }); } catch {}
@@ -9081,26 +9084,36 @@ async function autoCompactTick(deps = {}) {
           let session;
           let freshTurn;
           if (remoteNode) {
-            // A session on another node: its node's own read says whether it is still
-            // idle, and the mirror its candidate was judged by gives its last turn and
-            // the time compared below. A node that cannot be asked right now is a
+            // A session on another node: its node's own read, through the node its pane
+            // named when it was picked (never the location record, so one source
+            // decides), says whether it is still idle; the mirror its candidate was
+            // judged by gives its last turn. A node that cannot be asked right now is a
             // retryable skip, not a spent request; a node that says there is no such
             // session is an answer.
             phase = 'node';
+            let current;
             try {
-              session = await (deps.loadSessionForAction || loadSessionForAction)(candidate.session.id);
+              current = await (deps.loadRemoteSession || loadRemoteSession)(candidate.session.id, { readNode: remoteNode });
             } catch (e) {
               if (e instanceof InjectionError && e.status === 404) phase = 'resolve';
               throw e;
             }
             phase = 'resolve';
+            if (!current) throw new InjectionError(404, 'no session');
             const mirrored = (deps.mirroredCompactRow || mirroredCompactRow)(candidate.session.id,
               panesBySession.get(candidate.session.id), deps);
-            if (!mirrored) {
+            if (!mirrored || mirrored.mtime !== candidate.session.mtime) {
               phase = 'eligibility';
-              throw new InjectionError(409, `no transcript of this session on ${remoteNode} is mirrored here`);
+              throw new InjectionError(409, mirrored ? 'session changed or left the eligible compaction window'
+                : `no transcript of this session on ${remoteNode} is mirrored here`);
             }
-            session = { ...session, node: remoteNode, mtime: mirrored.mtime };
+            // The mirror moves only when a hook post lands, so a turn that just ended
+            // with its Stop post still queued looks older there than it is. The idle
+            // clock runs on the later of the two; the changed check above compares the
+            // mirror with the mirror, since the node's time is not one the candidate
+            // was picked by.
+            const mtime = Math.max(Number(mirrored.mtime) || 0, Number(current.mtime) || 0);
+            session = { ...current, node: remoteNode, mtime };
             freshTurn = { contextTokens: mirrored.contextTokens, model: mirrored.model,
               usageAt: mirrored.usageAt, cacheTtlMs: mirrored.cacheTtlMs };
           } else {
@@ -9109,7 +9122,7 @@ async function autoCompactTick(deps = {}) {
           }
           const freshNow = Date.now();
           const freshCandidate = autoCompactCandidates([{ ...session, ...freshTurn }], stamps, freshNow, opts)[0];
-          if (session.mtime !== candidate.session.mtime || !freshCandidate
+          if ((!remoteNode && session.mtime !== candidate.session.mtime) || !freshCandidate
               || freshCandidate.path !== candidate.path || freshCandidate.originalModel !== candidate.originalModel) {
             phase = 'eligibility';
             throw new InjectionError(409, 'session changed or left the eligible compaction window');

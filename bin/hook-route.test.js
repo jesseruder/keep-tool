@@ -532,6 +532,35 @@ test('the daemon refuses a final message past its cap, and the node cuts one to 
   assert.deepEqual(calls.at(-1).args.slice(1), ['hook', 'lifecycle']);
 });
 
+// On a node the prompt hook is not carried, so the daemon voids a pending compaction
+// request when that session's lifecycle post for UserPromptSubmit arrives, as the prompt
+// hook does on the daemon node. Only then, only for that session, and not on a replay.
+test('a node session\'s new prompt voids its compaction request on the daemon', async (t) => {
+  const { hooks, calls, root } = services(t);
+  const dir = path.join(root, '.keep', 'compact');
+  fs.mkdirSync(dir, { recursive: true });
+  const request = (sid) => path.join(dir, `${sid}.request.json`);
+  const file = (sid) => fs.writeFileSync(request(sid), `${JSON.stringify({ sessionId: sid, at: 1, expiresAt: Date.now() + 60e3 })}\n`);
+  file('sess-aws1');
+  file('sess-other');
+  const lifecycle = (hookEvent, key) => hooks.handle(AWS1, body({ event: 'lifecycle', idempotencyKey: key,
+    input: { session_id: 'sess-aws1', cwd: '/home/node/project', hook_event_name: hookEvent, prompt: 'more work' } }));
+
+  assert.equal((await lifecycle('PostToolUse', `${KEY}-tool`)).status, 200);
+  assert.equal(fs.existsSync(request('sess-aws1')), true, 'a tool event says nothing about the idle moment');
+  assert.equal((await lifecycle('UserPromptSubmit', `${KEY}-prompt`)).status, 200);
+  assert.equal(fs.existsSync(request('sess-aws1')), false, 'the prompt voided the request');
+  assert.equal(fs.existsSync(request('sess-other')), true, 'another session\'s request is untouched');
+  assert.deepEqual(calls.at(-1).args.slice(1), ['hook', 'lifecycle']);
+
+  // The agent asks again during that turn; a resend of the old prompt post is answered
+  // from the journal and leaves the new request alone.
+  file('sess-aws1');
+  const replay = await lifecycle('UserPromptSubmit', `${KEY}-prompt`);
+  assert.equal(replay.body.replayed, true);
+  assert.equal(fs.existsSync(request('sess-aws1')), true);
+});
+
 test('the session env the daemon\'s hook reads is forwarded from an allow-list, and nothing else', async (t) => {
   const { hooks, calls, root } = services(t);
   const answer = await hooks.handle(AWS1, body({ identity: { agent: 'claude', sessionId: 'sess-aws1', env: {

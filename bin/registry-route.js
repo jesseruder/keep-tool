@@ -31,7 +31,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const {
-  isRegistryCommand, argumentRefusal, forwardedWaitMs, isWaitingTell, openExtraMs, openRequiredMs,
+  isRegistryCommand, argumentRefusal, forwardedWaitMs, runsLikeOpen, isWaitingTell, openExtraMs, openRequiredMs,
   MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, stdinRefusal,
 } = require('./registry-commands.js');
 
@@ -358,8 +358,9 @@ function createRegistryService(options = {}) {
       // An open this daemon's compaction timeout would let run past the capped bound
       // is refused before anything is adopted, journaled or spawned: killing its CLI
       // at the cap would leave the in-process open running with nothing recording it.
-      if (body && body.command === 'open' && openRequiredMs(baseEnv) > MAX_OPEN_EXTRA_MS) {
-        refuse(409, OPEN_UNBOUNDED_REFUSAL);
+      if (body && runsLikeOpen(body.command) && openRequiredMs(baseEnv) > MAX_OPEN_EXTRA_MS) {
+        refuse(409, body.command === 'open' ? OPEN_UNBOUNDED_REFUSAL
+          : OPEN_UNBOUNDED_REFUSAL.replace('a forwarded open', 'a forwarded verify').replace('run keep open', 'run keep verify'));
       }
       const deps = {
         io, location,
@@ -397,9 +398,11 @@ function createRegistryService(options = {}) {
       // ordinary command does: it spawns a session and records its ownership and
       // account pin, and a restart in the middle would leave that half done.
       // An open's bound is read from this daemon's own compaction timeout (baseEnv).
+      // A `verify` is treated as an open (registry-commands runsLikeOpen): it may open
+      // a fresh session for the check, or compact a cold one before delivering it.
       const waitMs = forwardedWaitMs(request.command, request.args, baseEnv);
       const waitingTell = isWaitingTell(request.command, request.args);
-      const ownQueue = waitingTell || request.command === 'open';
+      const ownQueue = waitingTell || runsLikeOpen(request.command);
       return await journaled({
         caller, key: request.idempotencyKey, digest: digestOf(request),
         queue: ownQueue ? `${request.command}\0${caller}\0${request.idempotencyKey}` : caller,

@@ -435,13 +435,21 @@ function openRequiredMs(env = {}) {
   const longest = 45e3 + 15e3 + (compactMs + 30e3) + compactMs + 15e3;
   return Math.max(OPEN_EXTRA_MS, longest + OPEN_MARGIN_MS);
 }
-const OPEN_UNBOUNDED_REFUSAL = "this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
+// `verify <card>` is bounded the same way (runCheckNow in bin/serve.js): it delivers
+// the check into the card's open session, which can compact a cold one first, or opens
+// a fresh session and waits for its prompt and its id. Its /api/run call has no client
+// timeout either, so the ordinary minute would tell the node of a timeout while the
+// daemon carried on, and a rerun would deliver the check twice.
+function runsLikeOpen(command) {
+  return command === 'open' || command === 'verify';
+}
+const OPEN_UNBOUNDED_REFUSAL ="this daemon's compaction timeout is set so high that a forwarded open cannot be bounded; run keep open on the daemon node, or lower KEEP_COMPACT_TIMEOUT_MS";
 
 // `env` is the daemon's own environment, passed only by the daemon's route: a node's
 // environment says nothing about the daemon's compaction timeout, so a node leaves
 // it out and gets the floor.
 function forwardedWaitMs(command, args, env) {
-  if (command === 'open') return env ? openExtraMs(env) : OPEN_EXTRA_MS;
+  if (runsLikeOpen(command)) return env ? openExtraMs(env) : OPEN_EXTRA_MS;
   return Math.min(requestedWaitMs(command, args), MAX_FORWARDED_WAIT_MS);
 }
 
@@ -539,4 +547,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

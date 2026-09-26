@@ -3383,6 +3383,7 @@ test('auto-compact compacts a requested Claude session on another node from its 
   const compacted = [];
   const decisions = [];
   const cleared = [];
+  const readNodes = [];
   let nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: now - 5 * 60e3 });
   const deps = {
     autoCompactDir: dir,
@@ -3396,7 +3397,9 @@ test('auto-compact compacts a requested Claude session on another node from its 
     sessionLastTurn: (session) => { lastTurnReads.push(session.id); return { contextTokens: 900000, model: 'claude-fable-5-1', usageAt: now }; },
     withInjectionLock: async (fn) => fn(),
     loadCurrentSession: () => assert.fail('a node session is read through its node'),
-    loadSessionForAction: (id) => nodeRead(id),
+    loadSessionForAction: () => assert.fail('the location record does not decide; the pane does'),
+    // Read through the node the pane names, whatever the location record says.
+    loadRemoteSession: (id, options) => { readNodes.push(options.readNode); return nodeRead(id); },
     resolveSessionTarget: async (session) => ({ pane: session.id === fleet.mirrored.id ? fleet.mirrored.pane : 'wrong' }),
     readScreen: async () => '❯ ',
     compactSession: async (session, target, instruction, options) => {
@@ -3411,8 +3414,15 @@ test('auto-compact compacts a requested Claude session on another node from its 
   assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due', holdResult: true });
   assert.deepEqual([compacted, cleared, decisions], [[], [], []]);
 
+  // The node says the session was active twenty seconds ago, while the mirror (its Stop
+  // post still queued) says five minutes: the later time holds it back, retryably.
+  nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: Date.now() - 20e3 });
+  assert.deepEqual(await autoCompactTick(deps), { ok: true, detail: 'nothing due', holdResult: true });
+  assert.deepEqual([compacted, cleared, decisions], [[], [], []]);
+
   nodeRead = async (id) => ({ ...fleet.row(fleet.mirrored), id, node: fleet.remoteNode, mtime: now - 5 * 60e3 });
   assert.equal((await autoCompactTick(deps)).detail, 'compacted');
+  assert.deepEqual(readNodes, ['aws1', 'aws1', 'aws1']);
   assert.deepEqual(lastTurnReads, [], 'the stale local copy was never read');
   assert.deepEqual(compacted.map(({ id, node, pane }) => [id, node, pane]), [[fleet.mirrored.id, 'aws1', fleet.mirrored.pane]]);
   const policy = compacted[0].policy;

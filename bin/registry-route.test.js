@@ -629,6 +629,35 @@ test('a forwarded open is killed only after its longer bound', async (t) => {
   assert.equal(opened.status, 200, JSON.stringify(opened.body));
 });
 
+// `verify` can open a fresh session for the check, or compact a cold one before
+// delivering it, so it runs under an open's bound and on a queue of its own: a node is
+// not told a timeout while the daemon carries on, and its other commands do not wait.
+test('a forwarded verify has an open\'s bound and its own queue', async (t) => {
+  assert.equal(forwardedWaitMs('verify', ['card']), OPEN_EXTRA_MS);
+  assert.equal(forwardedWaitMs('verify', ['card'], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '360000' }));
+  const fake = fakeSpawn((call) => (call.args[1] === 'verify' ? 'hang' : { code: 0, stdout: 'ok\n' }));
+  const original = fake.spawn;
+  const children = [];
+  fake.spawn = (...args) => { const child = original(...args); children.push(child); return child; };
+  // 20 ms is the ordinary bound; the verify outlives it by far.
+  const { svc, root } = service(t, { fake, timeoutMs: 20 });
+  const verify = svc.handle(AWS1, body(root, { command: 'verify', args: ['card'], session: null, agent: null, idempotencyKey: `${KEY}-verify` }));
+  for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+  const show = await svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-show` }));
+  assert.equal(show.status, 200, 'the node\'s next command did not queue behind the verify');
+  await new Promise((resolve) => setTimeout(resolve, 60));
+  assert.equal(svc.busy(), true, 'the verify is still running past the ordinary bound');
+  children[0].emit('close', 0, null);
+  assert.equal((await verify).status, 200);
+
+  const high = { KEEP_COMPACT_TIMEOUT_MS: String(2 * 24 * 3600e3) };
+  const unbounded = service(t, { fake: fakeSpawn(), env: high });
+  const refused = await unbounded.svc.handle(AWS1, body(unbounded.root, { command: 'verify', args: ['card'], idempotencyKey: `${KEY}-v2` }));
+  assert.equal(refused.status, 409);
+  assert.match(refused.body.error, /a forwarded verify cannot be bounded; run keep verify on the daemon node/);
+  assert.equal(unbounded.calls.length, 0);
+});
+
 // The subprocess bound is the route's own timer; the kill it makes names the bound.
 for (const [label, env, seconds] of [['the default', {}, 60 + 720], ['a raised', { KEEP_COMPACT_TIMEOUT_MS: '360000' }, 60 + 960]]) {
   test(`the daemon bounds a forwarded open by its own compaction timeout: ${label} one`, async (t) => {

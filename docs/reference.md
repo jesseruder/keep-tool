@@ -1857,7 +1857,9 @@ one; `keep compact <sid> --when-idle` files a request for the session it names. 
 without `--when-idle` is refused on the node: it would compact at once, and the daemon's
 CLI waits for that for up to `KEEP_COMPACT_TIMEOUT_MS`, past the minute a forwarded
 command is given. The daemon compacts a Claude session on a node on its current model
-(see Auto-compact). `keep verify <card>` is forwarded as it is and needs no session.
+(see Auto-compact). `keep verify <card>` is forwarded as it is and needs no session;
+like an open it may start a session for the check, or compact one before delivering
+it, so it runs under an open's bound and on a queue of its own.
 
 `keep artifact` from a node sends the files themselves, since the paths name files the
 daemon does not have. The node's CLI reads each one and posts it to the daemon's
@@ -3221,15 +3223,18 @@ that model's window is spent, when the request waits. Everything else still appl
 busy and waiting sessions, live panes, the per-mtime stamp — and requested sessions go
 first. A requested Claude session on another node is judged by the daemon's mirror of
 its transcript (the tick's scan is the daemon's own transcripts, and never reads the
-copy a move left behind), read again through its node under the lock before anything is
-typed, and compacted on its own model whatever the cache age (a node that does not
+copy a move left behind), read again through the node its live pane names under the
+lock before anything is typed (idle by the later of the node's time and the mirror's,
+since the mirror moves only when a hook post lands), and compacted on its own model whatever the cache age (a node that does not
 answer is a retryable skip); its stamp carries `node` and `pathReason: remote-node`. A session with a pending model-swap record (`.swap.json`) is not
 compacted on request until the record clears; the request stays. A request expires
 after `KEEP_COMPACT_REQUEST_TTL_MIN` (default 30) minutes, is spent by any attempt (a
 retryable skip keeps it), and is refused for Pi and reviewer sessions and for a Codex
 session on another node. A new Claude prompt voids it: `keep hook prompt` deletes the request,
 because new work arrived before the idle moment and the agent can ask again at the end
-of that turn; a Stop block that sends the agent on with more work voids it the same
+of that turn (for a session on another node, whose prompt hook is not carried, the
+daemon deletes it when that session's forwarded lifecycle post for `UserPromptSubmit`
+arrives); a Stop block that sends the agent on with more work voids it the same
 way. Codex has no prompt hook, so a Codex request is voided only by expiry, an
 attempt, or a Stop block. Requests are honoured even with `KEEP_AUTO_COMPACT=off`, where the tick
 considers requested sessions only; `dry` logs them as `would`. Their stamps and

@@ -6492,7 +6492,7 @@
     "bin/serve.js::autoCompactTick|bin/session-numbers.js::ref|3",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::compactSession|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::loadCurrentSession|1",
-    "bin/serve.js::autoCompactTick>call callback|bin/serve.js::loadSessionForAction|1",
+    "bin/serve.js::autoCompactTick>call callback|bin/serve.js::loadRemoteSession|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::mirroredCompactRow|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::resolveSessionTarget|1",
     "bin/serve.js::autoCompactTick>call callback|bin/serve.js::sessionLastTurn|1",

@@ -23,6 +23,7 @@
 // where the mirror ends, so a resend of bytes already appended writes nothing and
 // says where to go on.
 const crypto = require('node:crypto');
+const fsp = require('node:fs/promises');
 const os = require('node:os');
 const path = require('node:path');
 const mirror = require('./transcript-mirror.js');
@@ -731,9 +732,22 @@ function createHookService(options = {}) {
           ...((request.event === 'pre-bash' || request.event === 'pi-pre-tool')
             && isRepairSession(repairDeps, request.sessionId, root) ? { KEEP_REPAIR: '1' } : {}),
         };
+        // A new Claude prompt voids the session's pending compaction request, as the
+        // prompt hook does on the daemon node (bin/commands/hook.js promptHook): work
+        // arrived before the idle moment the agent asked for. A node does not carry the
+        // prompt hook, but its lifecycle post for UserPromptSubmit is this same moment.
+        // Inside the journalled run, so a resend of an old prompt post, answered from the
+        // journal, cannot void a request the agent made since.
+        const voidsRequest = request.agent === 'claude' && request.event === 'lifecycle'
+          && request.input.hook_event_name === 'UserPromptSubmit' && SESSION_RE.test(String(request.sessionId || ''));
         const answer = await shared.journaled({
           caller, key: request.idempotencyKey, digest: digestOf(hookRequest), queue: `hook\0${caller}\0${scope}`,
-          run: () => shared.spawnKeep(argv, { cwd: root, env, stdin: JSON.stringify(input), timeoutMs }),
+          run: async () => {
+            if (voidsRequest) {
+              await fsp.unlink(path.join(root, '.keep', 'compact', `${request.sessionId}.request.json`)).catch(() => {});
+            }
+            return shared.spawnKeep(argv, { cwd: root, env, stdin: JSON.stringify(input), timeoutMs });
+          },
           what: `keep ${argv.join(' ')} for ${request.sessionId ? `session ${request.sessionId}` : `node ${caller}`}`,
         });
         if (answer.status !== 200 && answer.status !== 504) return answer;

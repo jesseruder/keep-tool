@@ -480,6 +480,45 @@ test('the compaction hint for a session on another node says keep compact, like 
   } finally { f.cleanup(); }
 });
 
+// The daemon does not compact a Codex session on another node (its cold fallback
+// rewrites the node's Codex configuration), and refuses its `keep compact`, so a Codex
+// Stop block there still sends it to its own /compact.
+test('the compaction hint for a Codex session on another node says /compact yourself', () => {
+  const f = registryFixture();
+  try {
+    const linked = writeLinkedCard(f);
+    const transcript = path.join(f.root, 'codex-node.jsonl');
+    const row = (type, payload) => JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + '\n';
+    fs.writeFileSync(transcript, row('session_meta', { id: linked.sid, source: 'cli', originator: 'codex-tui' })
+      + row('event_msg', { type: 'user_message', message: 'Continue the work.' })
+      + row('token_usage_record', { usage: { input_tokens: 280000 } })
+      + row('event_msg', { type: 'agent_message', message: 'Finished a chunk.' }));
+    const run = (env) => spawnSync(process.execPath, [CLI, 'hook', 'codex', 'stop'], {
+      cwd: f.root, env: { ...f.env, ...env }, encoding: 'utf8',
+      input: JSON.stringify({ session_id: linked.sid, cwd: linked.project, transcript_path: transcript }),
+    });
+    const onNode = JSON.parse(run({ KEEP_HOOK_NODE: 'aws1', KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }).stdout);
+    assert.match(onNode.reason, /Continue with step 1 of 2/);
+    assert.ok(onNode.reason.endsWith('\n\n[keep] context is 280k tokens. When this turn reaches a stopping point, run /compact yourself; Keep cannot compact a session on this node yet.'), onNode.reason);
+  } finally { f.cleanup(); }
+  // The same Codex session on the daemon node is told to ask the daemon.
+  const g = registryFixture();
+  try {
+    const linked = writeLinkedCard(g);
+    const transcript = path.join(g.root, 'codex-here.jsonl');
+    const row = (type, payload) => JSON.stringify({ type, payload, timestamp: new Date().toISOString() }) + '\n';
+    fs.writeFileSync(transcript, row('session_meta', { id: linked.sid, source: 'cli', originator: 'codex-tui' })
+      + row('event_msg', { type: 'user_message', message: 'Continue the work.' })
+      + row('token_usage_record', { usage: { input_tokens: 280000 } })
+      + row('event_msg', { type: 'agent_message', message: 'Finished a chunk.' }));
+    const here = JSON.parse(spawnSync(process.execPath, [CLI, 'hook', 'codex', 'stop'], {
+      cwd: g.root, env: { ...g.env, KEEP_HOOK_NODE: 'main' }, encoding: 'utf8',
+      input: JSON.stringify({ session_id: linked.sid, cwd: linked.project, transcript_path: transcript }),
+    }).stdout);
+    assert.ok(here.reason.endsWith(`\n\n${HINT_280K}`), here.reason);
+  } finally { g.cleanup(); }
+});
+
 test('Codex Stop shares the plan policy and emits exactly one JSON result', () => {
   const f = registryFixture();
   try {
