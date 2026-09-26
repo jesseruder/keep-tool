@@ -236,6 +236,7 @@ test('attach sets and clears the verdict from the cache only', () => {
 
 test('the prompt reads an unstarted plan as ASKS and a promise with nothing scheduled as not RUNNING', () => {
   assert.match(classifier.INSTRUCTION, /proposing its own next work that it has not started/);
+  assert.match(classifier.INSTRUCTION, /Options offered to the person for what to do next/);
   assert.match(classifier.INSTRUCTION, /Conditional or retrospective advice in a finished report/);
   assert.match(classifier.INSTRUCTION, /RUNNING only when something will wake the agent/);
   assert.match(classifier.INSTRUCTION, /while the scheduled check line says none is not RUNNING/);
@@ -311,6 +312,8 @@ test('a paneless session waiting only on its card is marked cardOnlyWait; any ba
   assert.equal(activity({ ...gone, footer: { recognized: true, shells: 1, agents: 0, running: true } }, card).cardOnlyWait, false);
   assert.equal(activity({ ...gone, agentShells: 1 }, card).cardOnlyWait, false);
   assert.equal(activity({ ...gone, companionComplete: false }, card).cardOnlyWait, false);
+  // Unread history cannot hide live work once the process is gone.
+  assert.equal(activity({ ...gone, unknownBackgroundJobs: ['history-gap'] }, card).cardOnlyWait, true);
   assert.equal(activity(base, card).cardOnlyWait, false, 'a live pane is never card-only');
 });
 

@@ -159,7 +159,8 @@ function activity(session, context = {}) {
   // A session with no live pane whose only wait is its card (a finished check session
   // waiting on its next check), with no background work of its own of any kind: the
   // console does not list it under Running & waiting.
-  const backgroundEvidence = model.background.pending || model.background.uncertain.length || model.background.agents.length
+  // Unread history ('history-gap') cannot hide live work once the process is gone.
+  const backgroundEvidence = model.background.pending || model.background.uncertain.some((id) => id !== 'history-gap') || model.background.agents.length
     || ledgerPending || model.conversation.scheduled.length || session.runtime?.state === 'external'
     || session.footer?.running || session.agentShells > 0 || session.companionComplete === false;
   const cardOnlyWait = !live && chosen.state === 'waiting' && chosen.source === 'registry' && !backgroundEvidence;
