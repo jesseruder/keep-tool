@@ -305,8 +305,7 @@ function runningItems() {
     // check. The card shows the schedule; a question it ended on is under Waiting on
     // you. A paneless wait on its own background work stays listed.
     .filter((session) => (session.state === 'running'
-      || (session.state === 'waiting' && (session.pane || session.runtime?.state === 'external'
-        || session.activity?.decision?.source !== 'registry'))
+      || (session.state === 'waiting' && (session.pane || session.activity?.cardOnlyWait !== true))
       || state.markedRunning.has(session.id))
       && !session.reviewer && !session.agentName && !isClosingSession(session.id, session.pane));
   const tasks = new Map((data.tasks || []).map((task) => [task.id, task]));

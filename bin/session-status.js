@@ -76,8 +76,11 @@ function activity(session, context = {}) {
   // RUNNING and DONE speak for a live pane only; ASKS also for the card's latest
   // session whose pane is gone, whose final ask would otherwise sit behind the card's
   // schedule or read as idle.
+  // Keep's own unattended sessions (recurring checks) keep their declared handoff: a
+  // false ASKS there would notify on every recurrence.
   const verdict = ended && !model.identity.reviewer
-    && (!['hook', 'registry'].includes(model.conversation.source) || session.stopVerdict?.verdict === 'asks') ? session.stopVerdict : null;
+    && (!['hook', 'registry'].includes(model.conversation.source) || (session.stopVerdict?.verdict === 'asks' && session.unattended !== true))
+    ? session.stopVerdict : null;
   const live = model.identity.interactive;
   const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
   const durableWait = model.conversation.waiting && ['scheduled check', 'dependency'].includes(model.conversation.reason);
@@ -94,14 +97,10 @@ function activity(session, context = {}) {
   // A one-shot scheduled job (a cron, a /loop wakeup) well past its time has fired.
   const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service'
     && !(job.kind === 'scheduled' && !job.recurring && Number.isFinite(job.expiresAt) && nowMs - job.expiresAt > 10 * 60e3));
-  // 'history-gap' marks transcript history the ledger never read. Only a gap the
-  // ledger itself settled as a replaced transcript is discounted, and only once a
-  // trusted footer, a counted process table and a complete companion list all speak,
-  // so what it could hide (a shell, an agent, a Codex job) shows in one of them.
-  const settledGap = ledger?.gapSettled === true && ledger?.gapReason === 'transcript-replaced';
-  const coveredGap = settledGap && Boolean(footer) && Number.isInteger(session.agentShells) && session.companionComplete === true;
-  const uncertain = model.background.uncertain.filter((id) => !(coveredGap && id === 'history-gap'));
-  const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || uncertain.length
+  // 'history-gap' (history the ledger never read) stays unknown here: a cron or /loop
+  // created in it would show in no other source. The classifier's own input
+  // discounts a settled one, so the model is not told work is running.
+  const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
     || model.background.agents.length || ledgerPending || model.conversation.scheduled.length
     || (model.task.checkAfter && !model.task.checkOverdue) || model.task.dependencies.length;
   const nothingWakes = Boolean(footer) && ledger?.caughtUp === true && !wakes;
@@ -157,7 +156,13 @@ function activity(session, context = {}) {
   add(true, 'no-current-work', 'fallback', 'idle', 'Idle', null, null, model.foreground.state === 'unknown' ? 'uncertain' : 'inferred');
   const chosen = candidates[0];
   const evidence = ({ rule, source, confidence, at, state }) => ({ rule, source, confidence, at: at ?? null, state });
-  return { state: chosen.state, label: chosen.label, reason: chosen.reason, needsInput: Boolean(chosen.request), request: chosen.request,
+  // A session with no live pane whose only wait is its card (a finished check session
+  // waiting on its next check), with no background work of its own of any kind: the
+  // console does not list it under Running & waiting.
+  const backgroundEvidence = model.background.pending || model.background.uncertain.length || model.background.agents.length
+    || ledgerPending || model.conversation.scheduled.length || session.runtime?.state === 'external';
+  const cardOnlyWait = !live && chosen.state === 'waiting' && chosen.source === 'registry' && !backgroundEvidence;
+  return { state: chosen.state, label: chosen.label, reason: chosen.reason, needsInput: Boolean(chosen.request), request: chosen.request, cardOnlyWait,
     background: { pending: model.background.pending, uncertain: model.background.uncertain, scheduled: model.conversation.scheduled,
       checkAfter: model.task.checkAfter, dependencies: model.task.dependencies },
     decision: { ...evidence(chosen), alternatives: candidates.slice(1).filter((c) => c.rule !== 'no-current-work').map(evidence) } };

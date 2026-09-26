@@ -293,16 +293,22 @@ test('unread history (history-gap) is not running work, for the model and once t
   assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapSettled: false } }), /still running/, 'an unsettled gap stays unknown');
   assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapReason: 'hook-transcript-mismatch' } }), /still running/);
   assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap', 'b1'], backgroundJobs: settled }), /still running/);
+  // The waker rule still treats unread history as unknown: a cron in it shows nowhere else.
   const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
   const covered = { ...base, lastAssistantFull: 'Checked in on the card; it is done.', stopVerdict: { verdict: 'running', reason: 'background still running' },
-    footer, footerTrusted: true, agentShells: 0, companionComplete: true, unknownBackgroundJobs: ['history-gap'],
-    backgroundJobs: settled };
-  assert.equal(activity(covered).decision.rule, 'conversation-ready');
-  assert.equal(activity({ ...covered, backgroundJobs: { ...settled, gapSettled: false } }).decision.rule, 'model-running', 'an unsettled gap still counts');
-  // Without every covering source, the gap still counts as unknown.
-  assert.equal(activity({ ...covered, companionComplete: undefined }).decision.rule, 'model-running');
-  assert.equal(activity({ ...covered, agentShells: undefined }).decision.rule, 'model-running');
-  assert.equal(activity({ ...covered, footerTrusted: false }).decision.rule, 'model-running');
+    footer, footerTrusted: true, agentShells: 0, companionComplete: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: settled };
+  assert.equal(activity(covered).decision.rule, 'model-running');
+});
+
+test('a paneless session waiting only on its card is marked cardOnlyWait; any background evidence clears it', () => {
+  const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, lastAssistantFull: 'Logged the pass; next check in 4 hours.' };
+  const card = { task: { status: 'waiting', check_after: '2030-01-01T00:00', sessions: [{ id: 's1' }] } };
+  assert.equal(activity(gone, card).cardOnlyWait, true);
+  assert.equal(activity({ ...gone, pendingBackground: true }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, unknownBackgroundJobs: ['b1'] }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, lifecycleAgents: [{ id: 'a' }] }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, runtime: { state: 'external' } }, card).cardOnlyWait, false);
+  assert.equal(activity(base, card).cardOnlyWait, false, 'a live pane is never card-only');
 });
 
 test('an ASKS verdict outranks a declared waiting handoff and the card\'s own review', () => {
@@ -317,4 +323,6 @@ test('an ASKS verdict outranks a declared waiting handoff and the card\'s own re
   assert.equal(asked.decision.rule, 'model-asks');
   assert.equal(asked.request.detail, text);
   assert.equal(activity(session, { task: { ...task, status: 'review' }, now: at }).decision.rule, 'model-asks');
+  // Keep's own unattended sessions keep their declared handoff.
+  assert.equal(activity({ ...session, unattended: true }, { task, now: at }).decision.rule, 'conversation-wait');
 });

@@ -125,10 +125,10 @@ test('running panel leaves out a paneless session that waits only on its card, u
   const source = fs.readFileSync(path.join(__dirname, '../web/app/app.js'), 'utf8');
   const data = { tasks: [], sessions: [
     { id: 'live', pane: 'p', state: 'waiting', mtime: 1 },
-    { id: 'checked', state: 'waiting', activity: { decision: { source: 'registry' } }, mtime: 2 },
-    { id: 'background', state: 'waiting', activity: { decision: { source: 'background' } }, mtime: 6 },
-    { id: 'outside', state: 'waiting', runtime: { state: 'external' }, activity: { decision: { source: 'registry' } }, mtime: 3 },
-    { id: 'marked', state: 'waiting', activity: { decision: { source: 'registry' } }, mtime: 4 },
+    { id: 'checked', state: 'waiting', activity: { cardOnlyWait: true }, mtime: 2 },
+    { id: 'background', state: 'waiting', activity: { cardOnlyWait: false }, mtime: 6 },
+    { id: 'outside', state: 'waiting', runtime: { state: 'external' }, mtime: 3 },
+    { id: 'marked', state: 'waiting', activity: { cardOnlyWait: true }, mtime: 4 },
     { id: 'working', state: 'running', mtime: 5 }] };
   const ctx = vm.createContext({ data, runningOrder: new Map(), stableSessionOrder: selection.stableSessionOrder,
     paneMap: () => new Map([['p', { createdAt: '2026-01-15' }]]), isClosingSession: () => false,
