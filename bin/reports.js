@@ -646,6 +646,7 @@ async function settleOnce(options) {
         if (group.card === note.card) {
           group.cardNotedAt = Number(note.plannedAt) || now;
           group.reportersNoted = Number(note.reporters) || 0;
+          group.notedKeys = [...new Set([...(group.notedKeys || []), ...(note.keys || [])])];
           markClean(group, note.seq);
         }
       }
@@ -689,15 +690,17 @@ async function settleOnce(options) {
       group.lastAt = Math.max(Number(group.lastAt) || 0, stats.lastAt);
       if ((group.state === 'known' || group.state === 'real') && group.card) {
         // Later reports on a group somebody already owns go onto its card.
-        const since = Number(group.cardNotedAt) || Number(group.markedAt) || 0;
-        const fresh = stats.reports.filter((item) => (Number(item.firstAt) || 0) > since);
+        // By key, not by time: a report recorded late or merged in is still news to
+        // the card even when its author wrote it before the last note.
+        const known = new Set(group.notedKeys || []);
+        const fresh = stats.reports.filter((item) => !known.has(item.key));
         const noted = Number(group.reportersNoted ?? group.reportersAtMark) || 0;
         if (!fresh.length && stats.reporters <= noted) { markClean(group, group.dirtySeq); continue; }
         if (claimLive(group.noteClaim, now)) continue;
-        const claim = { ...claimFor(group.noteClaim, group, now), reporters: stats.reporters };
+        const claim = { ...claimFor(group.noteClaim, group, now), reporters: stats.reporters, keys: fresh.map((item) => item.key) };
         group.noteClaim = claim;
         notes.push({
-          card: group.card, group: group.id, reporters: stats.reporters, token: claim.token,
+          card: group.card, group: group.id, reporters: stats.reporters, token: claim.token, keys: claim.keys,
           message: `User reports: ${stats.reporters} reporter(s) across ${stats.reports.length} report(s) in group ${group.id}`
             + (fresh.length ? `; new: ${fresh.map((item) => item.permalink || item.key).join(' ')}` : '')
             + ` ${noteMarker(claim.token)}`,
@@ -767,6 +770,7 @@ async function settleOnce(options) {
         if (group.card !== claim.card) continue;
         group.cardNotedAt = now;
         group.reportersNoted = note.reporters;
+        group.notedKeys = [...new Set([...(group.notedKeys || []), ...(note.keys || [])])];
         markClean(group, claim.seq);
       }
     }, lockOpts);
@@ -834,7 +838,10 @@ function mark(id, verdict, options = {}) {
     group.card = card || '';
     // Counted now, not from the last settle: the verdict covers every report the
     // group holds as it is recorded, which is what `keep reports show` printed.
-    group.reportersAtMark = groupStats(state, group).reporters;
+    const atMark = groupStats(state, group);
+    group.reportersAtMark = atMark.reporters;
+    // The verdict covers what the group holds now; its card hears about the rest.
+    group.notedKeys = atMark.reports.map((item) => item.key);
     // A new verdict starts its card's notes and its wake over from here.
     delete group.reportersNoted;
     delete group.cardNotedAt;

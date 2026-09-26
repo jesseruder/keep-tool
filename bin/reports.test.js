@@ -511,6 +511,23 @@ test('a wake that landed before a crash is acknowledged even though the group ch
   assert.ok(after.wokeAt);
 });
 
+test('an older report merged into an owned group still reaches its card', async () => {
+  const f = fixture();
+  f.setVerdicts((prompt) => [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => ({
+    key: m[1], report: true, area: 'app-server', group: null, new_group_title: m[1] === 'discord:o2' ? 'Other' : 'Owned',
+  })));
+  await f.run([discord('o1', 'alice', { starter: true, id: 'o1' })]);
+  await f.run([discord('o2', 'alice', { starter: true, id: 'o2', at: Date.now() - 86400e3 })]);
+  const keepModule = require('./keep.js');
+  const originalLoad = keepModule.loadTaskAnywhere;
+  keepModule.loadTaskAnywhere = () => ({ id: 'owned-card' });
+  try { reports.mark('owned', 'real', { card: 'owned-card', reason: 'real', ...f.opts }); } finally { keepModule.loadTaskAnywhere = originalLoad; }
+  reports.merge('other', 'owned', f.opts);
+  await f.run([]);
+  assert.equal(f.checkins.length, 1);
+  assert.match(f.checkins[0].message, /discord\.com\/channels\/1\/o2/);
+});
+
 test('merging dirties the target, so moved reporters can cross the bar', async () => {
   const f = fixture();
   f.setVerdicts((prompt) => [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => ({
