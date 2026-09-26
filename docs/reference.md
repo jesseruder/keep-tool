@@ -2211,6 +2211,13 @@ client, the editors and anything no responder owns; `areas` overrides the descri
 it is given) and which symptom group it joins. A report the classifier has not answered
 for stays `new` and is offered again on the next poll.
 
+The watchers wait only for the quick half: landing their messages on the reports.
+When that cannot take the registry lock or write, the batch is appended to
+`.keep/reports/spool.jsonl` and the next poll lands it, so a watcher cursor that has
+moved on loses nothing. The classifier, the verdicts and the wakes run after, one at a
+time per daemon, and a wake or card note is acknowledged only once it has landed on the
+agent's feed or the card: a failed one is sent again by the next poll.
+
 A group's reporters are the distinct non-team authors across its reports; each Slack
 report counts as one. The team is `team` plus every name the Slack watcher has seen
 post, matched against Discord authors by whole name or first word, and a reply from

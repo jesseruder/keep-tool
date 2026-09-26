@@ -46,7 +46,7 @@ function fixture() {
     write() {},
   };
   const run = (units, extra = {}) => reports.ingest({ units, slackNames: extra.slackNames || [] }, {
-    root, config: { ...CFG, ...(extra.config || {}) }, deps, withLock: (fn) => fn(), now: extra.now,
+    root, config: { ...CFG, ...(extra.config || {}) }, deps, withLock: (fn) => fn(), now: extra.now, wait: true,
   });
   return {
     root, emitted, checkins, prompts, run,
@@ -84,7 +84,7 @@ function allInto(groupTitle, area = 'app-server', extra = {}) {
 test('disabled config records nothing and never classifies', async () => {
   const f = fixture();
   const result = await f.run([discord('t1', 'alice', { starter: true })], { config: { enabled: false } });
-  assert.deepEqual(result, { recorded: 0, classified: 0, woke: [], cardNotes: [] });
+  assert.deepEqual(result, { recorded: 0, spooled: false, classified: 0, woke: [], cardNotes: [] });
   assert.equal(f.prompts.length, 0);
 });
 
@@ -296,23 +296,93 @@ test('the digest section lists active groups and the reply queue', async () => {
   assert.equal(reports.digestSection(0, { root: f.root, config: { ...CFG, enabled: false } }), '');
 });
 
-test('old non-reports and quiet noise groups are pruned; open groups are kept', async () => {
+test('old non-reports, quiet noise groups and long-quiet open groups are pruned; recent ones are kept', async () => {
   const f = fixture();
   const day = 86400e3;
   const long = Date.now() - 200 * day;
   f.setVerdicts((prompt) => [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => (m[1] === 'discord:chat'
     ? { key: m[1], report: false, area: 'other' }
-    : { key: m[1], report: true, area: 'app-server', group: null, new_group_title: m[1] === 'discord:noisy' ? 'Noise' : 'Kept' })));
+    : { key: m[1], report: true, area: 'app-server', group: null, new_group_title: m[1] === 'discord:noisy' ? 'Noise' : m[1] === 'discord:stale' ? 'Stale' : 'Kept' })));
   await f.run([
     discord('chat', 'alice', { starter: true, id: 'chat', at: long }),
     discord('noisy', 'bob', { starter: true, id: 'noisy', at: long }),
-    discord('kept', 'carol', { starter: true, id: 'kept', at: long }),
+    discord('kept', 'carol', { starter: true, id: 'kept', at: Date.now() - 10 * day }),
+    discord('stale', 'dave', { starter: true, id: 'stale', at: long }),
   ], { now: long });
   reports.mark('noise', 'noise', { reason: 'chatter', ...f.opts });
   await f.run([]);
   const state = f.state();
   assert.deepEqual(Object.keys(state.reports), ['discord:kept']);
   assert.deepEqual(Object.keys(state.groups), ['kept']);
+});
+
+test('a wake the feed refused is retried on the next poll, not acknowledged', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Login broken'));
+  const realEmit = f.emitted;
+  let refuse = true;
+  const emit = (name, event) => { if (refuse) return null; realEmit.push({ name, ...event }); return event; };
+  const run = (units) => reports.ingest({ units }, {
+    root: f.root, config: CFG, withLock: (fn) => fn(), wait: true,
+    deps: { classify: async (prompt) => JSON.stringify(allInto('Login broken')(prompt)), emit, flushAgents() {},
+      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {}, write() {} },
+  });
+  await run([discord('w', 'alice', { starter: true, id: 'w', tags: ['Major bug'] })]);
+  assert.equal(realEmit.length, 0);
+  assert.equal(f.state().groups['login-broken'].wokeAt, undefined);
+  refuse = false;
+  await run([]);
+  assert.equal(realEmit.length, 1);
+  assert.ok(f.state().groups['login-broken'].wokeAt);
+  await run([]);
+  assert.equal(realEmit.length, 1, 'acknowledged once it landed');
+});
+
+test('a batch that could not be recorded is spooled and landed by the next poll', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Crash'));
+  const failing = reports.record({ units: [discord('sp', 'alice', { starter: true, id: 'sp' })] }, {
+    root: f.root, config: CFG, withLock: () => { throw new Error('lock busy'); },
+  });
+  assert.equal(failing.spooled, true);
+  assert.equal(Object.keys(f.state().reports).length, 0);
+  await f.run([]);
+  assert.equal(f.state().reports['discord:sp'].state, 'report');
+  assert.equal(fs.readdirSync(path.join(f.root, '.keep', 'reports')).filter((name) => /spool/.test(name)).length, 0);
+});
+
+test('a group merged away while the classifier ran is not left as a dangling id', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('First'));
+  await f.run([discord('g1', 'alice', { starter: true, id: 'g1' })]);
+  f.setVerdicts((prompt) => {
+    // The classifier answers with the group it saw; meanwhile it is removed.
+    const state = reports.loadState(f.root);
+    delete state.groups.first;
+    fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
+    return [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => ({ key: m[1], report: true, area: 'app-server', group: 'first', new_group_title: 'Second' }));
+  });
+  await f.run([discord('g2', 'bob', { starter: true, id: 'g2' })]);
+  const state = f.state();
+  assert.equal(state.reports['discord:g2'].group, 'second');
+  assert.ok(state.groups.second);
+});
+
+test('a Major bug tag added after the first poll still wakes the responder', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Passes'));
+  await f.run([discord('late', 'alice', { starter: true, id: 'late' })]);
+  assert.equal(f.emitted.length, 0);
+  await f.run([discord('late', 'alice', { tags: ['Major bug'] })]);
+  assert.equal(f.emitted.length, 1);
+  assert.match(f.emitted[0].text, /major bug/);
+});
+
+test('authors with no Latin letters stay distinct reporters', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Crash'));
+  await f.run([discord('u', 'ᴢᴇɴɪᴛʜ', { starter: true, id: 'u' }), discord('u', '📃︲'), discord('u', '🍉')]);
+  assert.equal(f.state().reports['discord:u'].reporters.length, 3);
 });
 
 test('report text is fenced in the prompt so it cannot close the fence', () => {

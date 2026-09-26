@@ -35,6 +35,7 @@ const CLASSIFY_MAX = 25;
 const PROMPT_MAX = 40000;
 const PRUNE_NOT_REPORT_MS = 30 * 86400e3;
 const PRUNE_NOISE_MS = 90 * 86400e3;
+const PRUNE_OWNED_MS = 180 * 86400e3;
 const MODES = new Set(['all', 'bugs']);
 const STATES = new Set(['open', 'noise', 'known', 'real']);
 const DEFAULT_SOURCES = {
@@ -102,8 +103,11 @@ function sourceKey(source, channel) { return `${source}:${channelName(channel)}`
 // A name as it can be compared across Discord and Slack: case, spacing and
 // decoration dropped. `tokens` also offers the first word, so Slack's "Ben" and
 // "Jesse Ruder" meet Discord's "ben" and "jesse".
+// A name with no Latin letters or digits at all ("ᴢᴇɴɪᴛʜ", an emoji handle) keeps its
+// own characters instead, so two such authors never collapse into one reporter.
 function normName(value) {
-  return String(value == null ? '' : value).toLowerCase().normalize('NFKC').replace(/[^a-z0-9]+/g, '');
+  const text = String(value == null ? '' : value).toLowerCase().normalize('NFKC');
+  return text.replace(/[^a-z0-9]+/g, '') || text.replace(/\s+/g, '');
 }
 
 function nameTokens(value) {
@@ -384,15 +388,18 @@ function defaultDeps() {
 }
 
 // What is kept: a non-report for 30 days after its last message (long enough that a
-// late reply still finds it and is not re-classified), and a noise group — with its
-// reports — for 90 days after its last report. Groups with a card, open groups and
-// their reports are kept; they are what the digest and the cards point at.
+// late reply still finds it and is not re-classified); an open or noise group — with
+// its reports — for 90 days after its last report; a known or real group for 180,
+// since its card holds the history by then. A group with work still owed to it (a
+// wake or card note not yet delivered) is kept whatever its age.
 function prune(state, now) {
   for (const [key, record] of Object.entries(state.reports)) {
     if (record.state === 'not-report' && now - (Number(record.lastAt) || 0) > PRUNE_NOT_REPORT_MS) delete state.reports[key];
   }
   for (const [id, group] of Object.entries(state.groups)) {
-    if (group.state !== 'noise' || now - (Number(group.lastAt) || 0) <= PRUNE_NOISE_MS) continue;
+    if (group.dirty) continue;
+    const keepFor = group.state === 'known' || group.state === 'real' ? PRUNE_OWNED_MS : PRUNE_NOISE_MS;
+    if (now - (Number(group.lastAt) || 0) <= keepFor) continue;
     for (const [key, record] of Object.entries(state.reports)) if (record.group === id) delete state.reports[key];
     delete state.groups[id];
   }
@@ -409,82 +416,150 @@ function openAreasNow(deps, cfg, now) {
     .map((incident) => incident.area).filter(Boolean));
 }
 
-// `units` from one watcher poll. Returns { recorded, classified, woke: [...], cardNotes: [...] }.
-async function ingest({ units = [], slackNames = [] } = {}, options = {}) {
+// ---------- ingest ----------
+//
+// Two halves. `record` is synchronous and quick: it lands a poll's messages on their
+// reports under the lock and marks the groups they touched dirty. The watchers await
+// only that, so the report store never holds their cursors back. When it cannot take
+// the lock or write, the batch goes to a spool file instead — an append, no lock —
+// and the next `record` lands it, so a watcher that has already moved its cursor past
+// those messages has not lost them.
+//
+// `settle` does the slow part: the classifier, the verdicts, the wake decisions and
+// the card notes. One runs at a time per process; a poll that arrives while one is
+// running leaves its reports `new` and its groups dirty for the next. A wake or card
+// note is claimed before it is sent and acknowledged only once it landed, so a failed
+// emit is retried and two overlapping settles cannot both send it.
+
+function spoolFile(root) { return path.join(stateDir(root), 'spool.jsonl'); }
+
+function spool(root, batch) {
+  fs.mkdirSync(stateDir(root), { recursive: true });
+  fs.appendFileSync(spoolFile(root), JSON.stringify(batch) + '\n');
+}
+
+// Inside the lock: move the spool aside and read it, together with any earlier
+// taking that never got to delete its file. The caller deletes the files once the
+// state that includes them is written; a crash in between re-reads them, and the
+// per-report message ids make that harmless.
+function takeSpool(root) {
+  const dir = stateDir(root);
+  const taken = path.join(dir, `spool.${process.pid}.${Date.now()}.taking`);
+  try { fs.renameSync(spoolFile(root), taken); } catch {}
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((name) => name.endsWith('.taking')).map((name) => path.join(dir, name)); } catch {}
+  const batches = [];
+  for (const file of files) {
+    let text = '';
+    try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
+    for (const line of text.split('\n')) {
+      if (!line.trim()) continue;
+      try { batches.push(JSON.parse(line)); } catch {}
+    }
+  }
+  return { files, batches };
+}
+
+function landUnits(state, cfg, units, slackNames, now, summary) {
+  for (const name of slackNames || []) {
+    const clean = oneLine(name, 100);
+    if (clean && clean !== 'unknown') state.slackNames[clean] = now;
+  }
+  const team = teamIndex(cfg, state);
+  for (const raw of units || []) {
+    const unit = normalizeUnit(raw);
+    if (!unit) continue;
+    const mode = sourceMode(cfg, unit.source, unit.channel);
+    if (!mode) continue;
+    let record = state.reports[unit.key];
+    if (!record) {
+      // A thread in a chatty channel becomes a report only when the watcher's own
+      // classifier called one of its messages a bug.
+      if (mode === 'bugs' && !unit.bug) continue;
+      record = newRecord(unit, team);
+      state.reports[unit.key] = record;
+      summary.recorded += 1;
+    } else if (recordMessage(record, unit, team)) {
+      summary.recorded += 1;
+    } else continue;
+    if (unit.starter && !record.starter) record.starter = unit.from;
+    // A thread tagged Major bug after its first message is major from then on.
+    record.major = (record.tags || []).some((tag) => cfg.majorTags.includes(String(tag).toLowerCase()));
+    if (record.group && state.groups[record.group]) state.groups[record.group].dirty = true;
+  }
+}
+
+function record({ units = [], slackNames = [] } = {}, options = {}) {
+  const root = options.root || keep.ROOT;
+  const cfg = options.config || config(root);
+  const now = Number(options.now) || Date.now();
+  const summary = { recorded: 0, spooled: false };
+  if (!cfg.enabled) return summary;
+  let taken = { files: [] };
+  try {
+    mutateState((state) => {
+      prune(state, now);
+      taken = takeSpool(root);
+      for (const batch of taken.batches) landUnits(state, cfg, batch.units, batch.slackNames, now, summary);
+      landUnits(state, cfg, units, slackNames, now, summary);
+    }, { root, withLock: options.withLock });
+  } catch (error) {
+    spool(root, { units, slackNames });
+    summary.spooled = true;
+    summary.error = oneLine(error && error.message || error, 200);
+    return summary;
+  }
+  for (const file of taken.files) { try { fs.unlinkSync(file); } catch {} }
+  return summary;
+}
+
+const CLAIM_MS = 10 * 60e3;
+const settling = new Map();
+
+function claimed(claim, now) { return Boolean(claim && now - (Number(claim.at) || 0) < CLAIM_MS); }
+
+async function settleOnce(options) {
   const root = options.root || keep.ROOT;
   const cfg = options.config || config(root);
   const deps = { ...defaultDeps(), ...(options.deps || {}) };
   const now = Number(options.now) || Date.now();
   const say = (line) => { try { deps.write(`keep reports: ${line}\n`); } catch {} };
-  const summary = { recorded: 0, classified: 0, woke: [], cardNotes: [] };
+  const summary = { classified: 0, woke: [], cardNotes: [] };
   if (!cfg.enabled) return summary;
   const lockOpts = { root, withLock: options.withLock };
 
-  // 1. Record every message that belongs to a report channel.
-  const touchedGroups = new Set();
-  const pending = mutateState((state) => {
-    prune(state, now);
-    for (const name of slackNames) {
-      const clean = oneLine(name, 100);
-      if (clean && clean !== 'unknown') state.slackNames[clean] = now;
-    }
-    const team = teamIndex(cfg, state);
-    for (const raw of units) {
-      const unit = normalizeUnit(raw);
-      if (!unit) continue;
-      const mode = sourceMode(cfg, unit.source, unit.channel);
-      if (!mode) continue;
-      let record = state.reports[unit.key];
-      if (record) {
-        if (recordMessage(record, unit, team)) {
-          summary.recorded += 1;
-          if (record.group) touchedGroups.add(record.group);
-        }
-        if (unit.starter && !record.starter) record.starter = unit.from;
-        continue;
-      }
-      // A thread in a chatty channel becomes a report only when the watcher's own
-      // classifier called one of its messages a bug.
-      if (mode === 'bugs' && !unit.bug) continue;
-      record = newRecord(unit, team);
-      record.major = record.tags.some((tag) => cfg.majorTags.includes(tag.toLowerCase()));
-      state.reports[unit.key] = record;
-      summary.recorded += 1;
-    }
-    return Object.values(state.reports).filter((record) => record.state === 'new')
-      .sort((a, b) => a.firstAt - b.firstAt).slice(0, CLASSIFY_MAX)
-      .map((record) => ({ ...record }));
-  }, lockOpts);
-
-  // 2. Classify new reports, outside the lock.
+  // 1. Classify new reports, outside the lock.
+  const state0 = loadState(root);
+  const pending = Object.values(state0.reports).filter((item) => item.state === 'new')
+    .sort((a, b) => a.firstAt - b.firstAt).slice(0, CLASSIFY_MAX);
   let verdicts = new Map();
   if (pending.length) {
     try {
-      const state = loadState(root);
       let batch = pending;
-      while (batch.length > 1 && buildPrompt(cfg, state, batch).length > PROMPT_MAX) batch = batch.slice(0, Math.ceil(batch.length / 2));
-      const raw = await deps.classify(buildPrompt(cfg, state, batch), cfg.model);
-      verdicts = parseVerdicts(raw, batch, cfg, state);
+      while (batch.length > 1 && buildPrompt(cfg, state0, batch).length > PROMPT_MAX) batch = batch.slice(0, Math.ceil(batch.length / 2));
+      const raw = await deps.classify(buildPrompt(cfg, state0, batch), cfg.model);
+      verdicts = parseVerdicts(raw, batch, cfg, state0);
     } catch (error) {
       say(`classifier failed; ${pending.length} report(s) wait for the next poll: ${oneLine(error && error.message || error, 200)}`);
     }
   }
 
-  // 3. Apply verdicts, update groups, decide wakes.
+  // 2. Apply verdicts and decide what to send, claiming each thing to send.
   let incidentCfg = null;
   try { incidentCfg = deps.incidentConfig(); } catch { incidentCfg = null; }
   const openAreas = openAreasNow(deps, cfg, now);
-  const wakes = mutateState((state) => {
+  const plan = mutateState((state) => {
     for (const [key, verdict] of verdicts) {
-      const record = state.reports[key];
-      if (!record || record.state !== 'new') continue;
+      const item = state.reports[key];
+      if (!item || item.state !== 'new') continue;
       summary.classified += 1;
-      if (!verdict.report && !verdict.security) { record.state = 'not-report'; record.summary = verdict.summary; continue; }
-      record.state = 'report';
-      record.summary = verdict.summary;
-      record.security = verdict.security;
-      record.area = verdict.area;
-      let id = verdict.group;
+      item.summary = verdict.summary;
+      if (!verdict.report && !verdict.security) { item.state = 'not-report'; continue; }
+      item.state = 'report';
+      item.security = verdict.security;
+      item.area = verdict.area;
+      // Checked again here: a merge while the classifier ran may have removed it.
+      let id = verdict.group && state.groups[verdict.group] ? verdict.group : '';
       // Two reports in one batch naming the same new symptom belong together: the
       // classifier could not see the group the other one was about to create.
       if (!id && verdict.newTitle) {
@@ -494,66 +569,119 @@ async function ingest({ units = [], slackNames = [] } = {}, options = {}) {
         if (same) id = same.id;
       }
       if (!id) {
-        id = groupIdFor(verdict.newTitle || record.title, state.groups);
+        id = groupIdFor(verdict.newTitle || item.title, state.groups);
         state.groups[id] = {
-          id, title: verdict.newTitle || oneLine(record.title, 60), area: verdict.area,
-          state: 'open', createdAt: now, lastAt: record.lastAt,
+          id, title: verdict.newTitle || oneLine(item.title, 60), area: verdict.area,
+          state: 'open', createdAt: now, lastAt: item.lastAt,
         };
       }
-      record.group = id;
-      touchedGroups.add(id);
+      item.group = id;
+      state.groups[id].dirty = true;
     }
-    const result = [];
-    for (const id of touchedGroups) {
-      const group = state.groups[id];
-      if (!group) continue;
+    const wakes = [];
+    const notes = [];
+    for (const group of Object.values(state.groups)) {
+      if (!group.dirty) continue;
       const stats = groupStats(state, group);
-      const before = Number(group.reporters) || 0;
       group.reporters = stats.reporters;
       group.reports = stats.reports.length;
       group.lastAt = Math.max(Number(group.lastAt) || 0, stats.lastAt);
       if ((group.state === 'known' || group.state === 'real') && group.card) {
         // Later reports on a group somebody already owns go onto its card.
-        const fresh = stats.reports.filter((record) => (Number(record.firstAt) || 0) > (Number(group.cardNotedAt) || Number(group.markedAt) || 0));
-        if (fresh.length || stats.reporters > before) {
-          group.cardNotedAt = now;
-          summary.cardNotes.push({
-            card: group.card, group: id,
-            message: `User reports: ${stats.reporters} reporter(s) across ${stats.reports.length} report(s) in group ${id}`
-              + (fresh.length ? `; new: ${fresh.map((record) => record.permalink || record.key).join(' ')}` : ''),
-          });
-        }
+        const since = Number(group.cardNotedAt) || Number(group.markedAt) || 0;
+        const fresh = stats.reports.filter((item) => (Number(item.firstAt) || 0) > since);
+        const noted = Number(group.reportersNoted ?? group.reportersAtMark) || 0;
+        if (!fresh.length && stats.reporters <= noted) { group.dirty = false; continue; }
+        if (claimed(group.noteClaim, now)) continue;
+        group.noteClaim = { at: now };
+        notes.push({
+          card: group.card, group: group.id, reporters: stats.reporters,
+          message: `User reports: ${stats.reporters} reporter(s) across ${stats.reports.length} report(s) in group ${group.id}`
+            + (fresh.length ? `; new: ${fresh.map((item) => item.permalink || item.key).join(' ')}` : ''),
+        });
         continue;
       }
       const reason = wakeReason(group, stats, cfg, openAreas);
       const agent = reason ? areaAgent(group.area, incidentCfg) : '';
-      if (!agent) continue;
-      group.wokeAt = now;
-      group.wokeReason = reason;
-      if (group.state === 'noise') { group.state = 'open'; group.reportersAtMark = 0; }
-      result.push({
-        agent, group: id, area: group.area, reason, reporters: stats.reporters,
+      if (!agent) { group.dirty = false; continue; }
+      if (claimed(group.wakeClaim, now)) continue;
+      group.wakeClaim = { at: now };
+      wakes.push({
+        agent, group: group.id, area: group.area, reason, reporters: stats.reporters,
         security: stats.security, title: group.title,
       });
     }
-    return result;
+    return { wakes, notes };
   }, lockOpts);
 
-  // 4. Tell the responders and the cards, outside the lock.
-  for (const wake of wakes) {
-    const event = deps.emit(wake.agent, {
-      kind: 'user-reports', area: wake.area, severity: wake.security ? 'high' : 'low', at: now,
-      text: `user reports: ${wake.title} — ${wake.reason}; keep reports show ${wake.group}`,
-    });
-    if (event) summary.woke.push(wake);
+  // 3. Send, outside the lock, then acknowledge only what landed.
+  const sent = [];
+  for (const wake of plan.wakes) {
+    let event = null;
+    try {
+      event = deps.emit(wake.agent, {
+        kind: 'user-reports', area: wake.area, severity: wake.security ? 'high' : 'low', at: now,
+        text: `user reports: ${wake.title} — ${wake.reason}; keep reports show ${wake.group}`,
+      });
+    } catch (error) { say(`could not wake ${wake.agent}: ${oneLine(error && error.message || error, 200)}`); }
+    if (event) { sent.push(wake); summary.woke.push(wake); } else say(`wake for ${wake.group} not delivered to ${wake.agent}; retrying next poll`);
   }
-  if (wakes.length) deps.flushAgents();
-  for (const note of summary.cardNotes) {
-    try { deps.checkinTask(note.card, note.message); } catch (error) {
+  if (sent.length) deps.flushAgents();
+  const noted = [];
+  for (const note of plan.notes) {
+    try { deps.checkinTask(note.card, note.message); noted.push(note); summary.cardNotes.push(note); } catch (error) {
       say(`could not check in on ${note.card}: ${oneLine(error && error.message || error, 200)}`);
     }
   }
+  if (plan.wakes.length || plan.notes.length) {
+    mutateState((state) => {
+      for (const wake of plan.wakes) {
+        const group = state.groups[wake.group];
+        if (!group) continue;
+        delete group.wakeClaim;
+        if (!sent.includes(wake)) continue;
+        group.wokeAt = now;
+        group.wokeReason = wake.reason;
+        if (group.state === 'noise') { group.state = 'open'; group.reportersAtMark = 0; }
+        group.dirty = false;
+      }
+      for (const note of plan.notes) {
+        const group = state.groups[note.group];
+        if (!group) continue;
+        delete group.noteClaim;
+        if (!noted.includes(note)) continue;
+        group.cardNotedAt = now;
+        group.reportersNoted = note.reporters;
+        group.dirty = false;
+      }
+    }, lockOpts);
+  }
   return summary;
+}
+
+function settle(options = {}) {
+  const root = options.root || keep.ROOT;
+  if (settling.has(root)) return settling.get(root);
+  const run = settleOnce(options).finally(() => settling.delete(root));
+  settling.set(root, run);
+  return run;
+}
+
+// What the watchers call with one poll's messages. It lands them and starts a settle
+// without waiting for it, unless `wait` is set (the tests).
+// Returns { recorded, spooled, classified, woke, cardNotes }.
+async function ingest(batch = {}, options = {}) {
+  const recorded = record(batch, options);
+  const cfg = options.config || config(options.root || keep.ROOT);
+  if (!cfg.enabled) return { ...recorded, classified: 0, woke: [], cardNotes: [] };
+  const run = settle(options);
+  if (!options.wait) {
+    run.catch((error) => {
+      try { process.stderr.write(`keep reports: settle failed: ${oneLine(error && error.message || error, 200)}\n`); } catch {}
+    });
+    return { ...recorded, classified: 0, woke: [], cardNotes: [] };
+  }
+  return { ...recorded, ...await run };
 }
 
 // ---------- the verbs ----------
@@ -581,6 +709,11 @@ function mark(id, verdict, options = {}) {
     group.markedBy = oneLine(options.by || '', 80);
     group.card = card || '';
     group.reportersAtMark = Number(group.reporters) || 0;
+    // A new verdict starts its card's notes and its wake over from here.
+    delete group.reportersNoted;
+    delete group.cardNotedAt;
+    delete group.noteClaim;
+    group.dirty = false;
     return { ...group };
   }, options);
 }
@@ -699,5 +832,5 @@ function digestSection(since, options = {}) {
 module.exports = {
   CONFIG_NAME, DEFAULT_SOURCES, configFile, stateFile, config, loadState, mutateState,
   sourceMode, teamIndex, isTeam, nameTokens, normalizeUnit, buildPrompt, parseVerdicts, wakeReason,
-  ingest, mark, reply, merge, markAnswered, listGroups, showGroup, replyQueue, digestSection,
+  ingest, record, settle, mark, reply, merge, markAnswered, listGroups, showGroup, replyQueue, digestSection,
 };
