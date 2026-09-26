@@ -3628,9 +3628,11 @@ written except once to clear a failure an earlier daemon left behind (`no remote
 nodes`), and the row is rewritten only when its result changes. Self-repair excludes the row: a
 repair session on the daemon cannot drain a node's queue, which empties on its own once
 the node reaches the daemon again.
-On the node, every queued event a replay removes without the daemon having taken it (a
-refusal, a transcript replaced since the event fired, a session that ended) is logged to
-`~/.keep-node/hook.log` with its event, session, sequence number and reason. A mirror
+On the node, every queued event removed without the daemon having taken it (a
+refusal, a transcript replaced since the event fired, a session that ended, or the oldest
+entry pushed out when the queue passes its 200-entry cap) is logged to
+`~/.keep-node/hook.log` with its event, session, sequence number and reason (an entry
+that cannot be read is named by its file). A mirror
 that keeps moving under a post (the daemon's 409 `needFrom` past its resend limit) is
 not a refusal: the event stays queued, the node's cursor moves to where the daemon last
 said, and the session goes last in the next replays. Only one hook replays a session's

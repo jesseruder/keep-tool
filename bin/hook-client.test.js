@@ -256,6 +256,19 @@ test('a refusal is not queued, and a queue past its cap drops the oldest', async
   assert.equal(queued.length, client.QUEUE_MAX);
   assert.equal(queued[0].body.input.n, 3);
   assert.equal(queued.at(-1).seq, client.QUEUE_MAX + 3);
+  // Each entry the cap pushed out is in hook.log, oldest first.
+  const drops = fs.readFileSync(client.logFile(env), 'utf8').split('\n').filter((line) => line.includes('the queue is full'));
+  assert.deepEqual(drops.map((line) => line.replace(/^\S+ /, '')), [1, 2, 3].map((seq) =>
+    `dropped queued notification for session sess-aws1 (seq ${seq}): the queue is full (${client.QUEUE_MAX} entries)`));
+  // An entry that cannot be read is named by its file.
+  fs.writeFileSync(path.join(client.queueDir(env), '0000000000000000.json'), 'not json');
+  client.enqueue(env, { event: 'notification', body: { input: { session_id: 'sess-aws1', cwd: '/x' }, identity: { agent: 'claude', sessionId: 'sess-aws1' }, idempotencyKey: 'k-last' } });
+  const later = fs.readFileSync(client.logFile(env), 'utf8').split('\n').filter((line) => line.includes('the queue is full')).slice(3);
+  assert.deepEqual(later.map((line) => line.replace(/^\S+ /, '')), [
+    `dropped queue entry 0000000000000000.json: the queue is full (${client.QUEUE_MAX} entries)`,
+    `dropped queued notification for session sess-aws1 (seq 4): the queue is full (${client.QUEUE_MAX} entries)`,
+  ]);
+  assert.equal(f.queue().length, client.QUEUE_MAX);
 });
 
 test('a mirror that is elsewhere is resent from where the daemon says, and a long delta goes in chunks', async (t) => {

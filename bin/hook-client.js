@@ -510,7 +510,7 @@ function queueFiles(env) {
   try { return fs.readdirSync(queueDir(env)).filter((name) => /^\d{16}\.json$/.test(name)).sort(); } catch { return []; }
 }
 
-// Kept for later, oldest dropped past QUEUE_MAX. The transcript bytes are not kept,
+// Kept for later, oldest dropped (and logged) past QUEUE_MAX. The transcript bytes are not kept,
 // only where the transcript ended when the event fired: a replay sends what the
 // mirror is missing up to there, and no further.
 function enqueue(env, entry) {
@@ -540,8 +540,18 @@ function enqueue(env, entry) {
     try { fs.unlinkSync(temp); } catch {}
   }
   try { writeAtomic(counter, Math.max(seq, Number(readJson(counter)) || 0)); } catch {}
+  // Each entry the cap pushes out says so in hook.log, as every other drop does. One
+  // another hook removed first (delivered or dropped) is that hook's to account for.
   const all = queueFiles(env);
-  for (const name of all.slice(0, Math.max(0, all.length - QUEUE_MAX))) { try { fs.unlinkSync(path.join(dir, name)); } catch {} }
+  for (const name of all.slice(0, Math.max(0, all.length - QUEUE_MAX))) {
+    const file = path.join(dir, name);
+    const old = readJson(file);
+    try { fs.unlinkSync(file); } catch { continue; }
+    const why = `the queue is full (${QUEUE_MAX} entries)`;
+    if (old && typeof old.event === 'string') {
+      logLine(env, `dropped queued ${old.event} for session ${old.body?.identity?.sessionId} (seq ${old.seq}): ${why}`);
+    } else logLine(env, `dropped queue entry ${name}: ${why}`);
+  }
 }
 
 // A replay lock older than this is its holder's leftover (a hook killed at its
