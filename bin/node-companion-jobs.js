@@ -46,6 +46,10 @@ function bounded(read, ms) {
 // companion script, a hanging half); a real host passes nothing and the node's own
 // defaults apply. `timeoutMs` is the child's whole budget.
 async function collect(seam = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
+  // When this read began, on this machine's clock: the daemon compares it with a
+  // session's last activity, which is also this machine's clock (its transcript), so
+  // a job started after this moment is never taken as proven absent by this answer.
+  const readAt = Date.now();
   const processTable = require('./process-table.js');
   const { execFile } = require('node:child_process');
   // Each half gets most of the budget, and the companion's `status` fallback less
@@ -81,7 +85,7 @@ async function collect(seam = {}, timeoutMs = DEFAULT_TIMEOUT_MS) {
     bounded(hang === 'codex' ? never : () => require('./codexjobs.js').list(options), halfMs),
     bounded(hang === 'pi' ? never : () => require('./pi-jobs.js').list(options), halfMs),
   ]);
-  return { codexJobs, piJobs };
+  return { codexJobs, piJobs, readAt };
 }
 
 function killGroup(child) {
@@ -134,6 +138,7 @@ function read(options = {}) {
         finish({
           codexJobs: answer.codexJobs && typeof answer.codexJobs === 'object' ? answer.codexJobs : unknownPart('unreadable'),
           piJobs: answer.piJobs && typeof answer.piJobs === 'object' ? answer.piJobs : unknownPart('unreadable'),
+          ...(Number.isFinite(answer.readAt) ? { readAt: answer.readAt } : {}),
         });
       } catch {
         finish(unknownAnswer('unreadable'));

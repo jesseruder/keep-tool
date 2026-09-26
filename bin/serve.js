@@ -646,29 +646,27 @@ function nodeCompanionEntry(companion, node) {
   return node && byNode && typeof byNode === 'object' && Object.hasOwn(byNode, node) ? byNode[node] : null;
 }
 
-// How old a node's answer may be and still prove a session has no job there: about two
-// dashboard publications. An older answer still attaches the jobs it lists.
-const NODE_COMPANION_PROOF_MS = 10e3;
-
 // Whether the companion job list a session's pane is judged against is complete. A
 // pane on this machine carries no `hostPaneId` (qualifyNodePanes) and is judged by this
 // machine's own discovery, exactly as before nodes answered for theirs; that read is
 // fresh for every publication. A pane on another node is judged by that node's own
 // answer, which a snapshot serves from its last read while the next one runs, so it
-// proves "nothing will wake this session" only when it is recent (NODE_COMPANION_PROOF_MS)
-// and was read at or after the session's last activity: `session.mtime`, the activity
-// time the row carries (transcriptActivityMs of the node's own read of the transcript,
-// remoteSessionFreshness, as a local Claude row has it). A job started during the turn
-// is in any read taken after the turn's last write; a read from before it may not list
-// it. By nothing at all when the node gave no answer.
+// proves "nothing will wake this session" only when the node began that read at or
+// after the session's last activity: `session.mtime`, the activity time the row
+// carries (transcriptActivityMs of the node's own read of the transcript,
+// remoteSessionFreshness, as a local Claude row has it). A job owned by this session
+// can only be started by the session's own tool call, which moves that time past any
+// read taken before it, so a read that began after it lists every such job however old
+// the answer is (until it goes stale at NODE_COMPANION_KEEP_MS). Both times are the
+// node's own clock: `readAt` is stamped by the node as its read starts. By nothing at
+// all when the node gave no answer.
 function paneCompanionComplete(pane, companion, session = null) {
   if (!pane?.hostPaneId) return companionListComplete(companion);
   const entry = nodeCompanionEntry(companion, pane.node);
   if (!entry || !companionListComplete(entry)) return false;
   const readAt = Number(entry.readAt);
-  const staleMs = Number(entry.staleMs ?? 0);
   const activityAt = Number(session?.mtime);
-  if (!Number.isFinite(readAt) || !(staleMs <= NODE_COMPANION_PROOF_MS)) return false;
+  if (!Number.isFinite(readAt) || !(readAt > 0)) return false;
   return Number.isFinite(activityAt) && activityAt > 0 && readAt >= activityAt;
 }
 
@@ -6674,7 +6672,11 @@ function unknownNodeCompanion(node, reason) {
 
 // One node's answer, in the shape of the daemon's own snapshot. Every job carries the
 // node it runs on, so nothing downstream can mistake its pid or state path for one here.
-function summarizeNodeCompanion(node, answer) {
+// `sentAt`: when this daemon sent the request, the stand-in read time for a host whose
+// answer carries no `readAt` of its own (never later than the node's actual read).
+function summarizeNodeCompanion(node, answer, sentAt = null) {
+  const stamped = Number(answer.readAt);
+  const readAt = Number.isFinite(stamped) && stamped > 0 ? stamped : Number.isFinite(Number(sentAt)) ? Number(sentAt) : null;
   const snapshots = [answer.codexJobs, answer.piJobs].filter((part) => part && typeof part === 'object');
   const known = snapshots.some((snapshot) => snapshot.known ?? (snapshot.discovery && snapshot.discovery !== 'unknown'));
   const complete = snapshots.length === 2
@@ -6691,6 +6693,8 @@ function summarizeNodeCompanion(node, answer) {
       pi: answer.piJobs ? { discovery: answer.piJobs.discovery ?? null } : null,
     },
     ...(typeof answer.bootId === 'string' ? { bootId: answer.bootId } : {}),
+    readAt,
+    readClock: Number.isFinite(stamped) && stamped > 0 ? 'node' : 'daemon',
   };
 }
 
@@ -6722,6 +6726,7 @@ async function fetchNodeCompanionJobs(node, deps = {}) {
     }
     // An older host is never asked: it would answer "unknown request" at best.
     if (!(capability.version >= 1)) return unknownNodeCompanion(node, 'host-predates-verb');
+    const sentAt = companionNow(deps);
     const answer = await request('companion-jobs', {}, {
       ...deps, node, hostRequestTimeoutMs: NODE_COMPANION_REQUEST_TIMEOUT_MS,
     });
@@ -6730,7 +6735,7 @@ async function fetchNodeCompanionJobs(node, deps = {}) {
     if (typeof answer.node === 'string' && answer.node && answer.node !== node) {
       return unknownNodeCompanion(node, 'wrong-node');
     }
-    return summarizeNodeCompanion(node, answer);
+    return summarizeNodeCompanion(node, answer, sentAt);
   } catch (error) {
     if (/unknown request/i.test(String(error && error.message || ''))) {
       nodeCompanionJobsCapability.delete(node);
@@ -6740,14 +6745,14 @@ async function fetchNodeCompanionJobs(node, deps = {}) {
   }
 }
 
-// The node's last answer as a snapshot reads it now: when it was read (`readAt`, this
-// daemon's clock) and its age, or 'stale' once it
-// is older than NODE_COMPANION_KEEP_MS. Null before the node has answered at all.
+// The node's last answer as a snapshot reads it now, with its age (since it reached
+// this daemon), or 'stale' once that is past NODE_COMPANION_KEEP_MS. Its `readAt` is
+// the node's own stamp (summarizeNodeCompanion). Null before the node has answered.
 function nodeCompanionView(node, cache, now) {
   if (!cache.value) return null;
   const staleMs = Math.max(0, now - cache.at);
-  if (staleMs >= NODE_COMPANION_KEEP_MS) return { ...unknownNodeCompanion(node, 'stale'), readAt: cache.at, staleMs };
-  return { ...cache.value, readAt: cache.at, staleMs };
+  if (staleMs >= NODE_COMPANION_KEEP_MS) return { ...unknownNodeCompanion(node, 'stale'), staleMs };
+  return { ...cache.value, staleMs };
 }
 
 // Never rejects, and never waits on a node it has an answer from: a refresh that is

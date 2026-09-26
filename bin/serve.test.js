@@ -11949,9 +11949,8 @@ test('a session is judged by the companion list of the node its pane is on', () 
   // it is old, nor for a session with no activity time.
   assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, { mtime: 5001 }), false, 'read before the turn ended');
   assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, { mtime: 5000 }), true, 'read as the turn ended');
-  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], staleMs: 10e3 } } }, ended), true);
-  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], staleMs: 10001 } } }, ended), false,
-    'an answer older than two publications');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], staleMs: 29e3 } } }, ended), true,
+    'an old answer still proves it when its read began after the turn');
   assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], readAt: undefined } } }, ended), false,
     'an answer with no read time');
   assert.equal(paneCompanionComplete(onNode('cj-ok'), complete), false, 'no session to compare with');
@@ -11994,67 +11993,105 @@ test('a node session drops RUNNING when its own node lists no job for it, and ke
   assert.deepEqual(stranger.backgroundJobs.jobs, []);
 });
 
-test('a node session keeps RUNNING until its node is read after the turn that started a job ended', async () => {
-  const { activity } = require('./session-status');
-  const t0 = 3_000_000;
-  let now = t0;
-  let nodeJobs = [];
-  let hang = false;
+// A node whose clock runs ahead of the daemon's: its read stamps and its session's
+// activity times are both on its own clock, and only ever compared with each other.
+function raceFleet(node, { skew = 7000 } = {}) {
+  const fleet = { now: 3_000_000, jobs: [], hang: false, lagMs: 0, stamp: true };
+  fleet.nodeNow = () => fleet.now + skew;
   const hostRequest = async (type, params, deps) => {
     if (type === 'hello') return { node: deps.node, companionJobs: 1 };
-    if (hang) return new Promise(() => {});
-    return { node: deps.node, codexJobs: { discovery: 'ok', jobs: nodeJobs.map((job) => ({ ...job })) },
-      piJobs: { known: true, discovery: 'ok', jobs: [] } };
+    if (fleet.hang) return new Promise(() => {});
+    return { node: deps.node, codexJobs: { discovery: 'ok', jobs: fleet.jobs.map((job) => ({ ...job })) },
+      piJobs: { known: true, discovery: 'ok', jobs: [] },
+      // The node stamps its read as it begins, `lagMs` before the answer is sent.
+      ...(fleet.stamp ? { readAt: fleet.nodeNow() - fleet.lagMs } : {}) };
   };
-  const deps = { ...localCompanion, hostNodes: ['main', 'cj-race'], hostRequest, now: () => now };
-  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const deps = { ...localCompanion, hostNodes: ['main', node], hostRequest, now: () => fleet.now };
   const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
-  // What buildState does per session, each publication, from a fresh row.
-  const publish = async (mtime) => {
+  // What buildState does per session, each publication, from a fresh row whose
+  // activity time (mtime) is the node's.
+  fleet.publish = async (mtime) => {
+    const { activity } = require('./session-status');
     const companion = await companionSnapshot(deps);
-    await settle();
-    const session = { id: 'cj-race-session', kind: 'claude', pane: 'p1@cj-race', node: 'cj-race', endedTurn: true, attentionAt: 1000, mtime,
+    await new Promise((resolve) => setImmediate(resolve));
+    const session = { id: `${node}-session`, kind: 'claude', pane: `p1@${node}`, node, endedTurn: true, attentionAt: 1000, mtime,
       lastAssistantFull: 'The Codex review is running; I will land once it comes back.',
       stopVerdict: { verdict: 'running', reason: 'waiting on the review' },
       footer, footerTrusted: true, agentShells: 0, backgroundJobs: { caughtUp: true, pending: false, jobs: [] } };
-    const pane = { id: 'p1@cj-race', node: 'cj-race', hostPaneId: 'p1' };
+    const pane = { id: `p1@${node}`, node, hostPaneId: 'p1' };
     applyCompanionJobs([session], companion, { daemonNode: 'main', nodeOf: () => pane.node });
     session.companionComplete = paneCompanionComplete(pane, companion, session);
-    return { rule: activity(session).decision.rule, state: activity(session).state, complete: session.companionComplete };
+    return { rule: activity(session).decision.rule, state: activity(session).state, complete: session.companionComplete,
+      entry: companion.byNode[node] };
   };
+  return fleet;
+}
+
+test('a node session keeps RUNNING until its node is read after the turn that started a job ended', async () => {
+  const fleet = raceFleet('cj-race');
+  const t0 = fleet.now;
   // The node is read once, with nothing running.
-  await publish(t0 - 60e3);
+  await fleet.publish(fleet.nodeNow() - 60e3);
   // The session starts a job on its node and ends its turn two seconds later.
-  nodeJobs = [{ id: 'task-race', sessionId: 'cj-race-session', state: 'running' }];
-  const turnEnd = t0 + 2000;
-  now = t0 + 3000;
-  const first = await publish(turnEnd);
+  fleet.jobs = [{ id: 'task-race', sessionId: 'cj-race-session', state: 'running' }];
+  const turnEnd = fleet.nodeNow() + 2000;
+  fleet.now = t0 + 3000;
+  const first = await fleet.publish(turnEnd);
   assert.equal(first.complete, false, 'the answer served was read before the turn ended');
   assert.equal(first.rule, 'model-running', 'so the session keeps RUNNING rather than dropping to ready');
-  now = t0 + 4000;
-  const next = await publish(turnEnd);
+  fleet.now = t0 + 4000;
+  const next = await fleet.publish(turnEnd);
   assert.equal(next.state, 'waiting', 'the read after the turn lists the job');
   // The job finishes: the next served answer is still the one listing it, then a read
   // after the turn with no jobs lets the verdict fall to the rules.
-  nodeJobs = [];
-  now = t0 + 6000;
-  assert.equal((await publish(turnEnd)).state, 'waiting');
-  now = t0 + 7000;
-  const done = await publish(turnEnd);
+  fleet.jobs = [];
+  fleet.now = t0 + 6000;
+  assert.equal((await fleet.publish(turnEnd)).state, 'waiting');
+  fleet.now = t0 + 7000;
+  const done = await fleet.publish(turnEnd);
   assert.equal(done.complete, true);
   assert.equal(done.rule, 'conversation-ready');
-  // A node whose refresh hangs: its last ok answer, read after the turn, stops proving
-  // anything once it is older than two publications, and never drops the session.
-  hang = true;
-  for (const age of [9e3, 12e3, 20e3, 29e3]) {
-    now = t0 + 6000 + age;
-    const held = await publish(turnEnd);
-    if (age <= 10e3) assert.equal(held.rule, 'conversation-ready', `${age} ms old`);
-    else {
-      assert.equal(held.complete, false, `${age} ms old`);
-      assert.equal(held.rule, 'model-running', `${age} ms old`);
-    }
+  assert.equal(done.entry.readClock, 'node');
+  // A quiet fleet publishes every 20 s, and a node whose refresh hangs keeps serving
+  // its last answer (which reached this daemon at t0 + 6000): read after the turn, it
+  // goes on proving it until it is stale.
+  fleet.hang = true;
+  for (const age of [9e3, 15e3, 20e3, 28e3]) {
+    fleet.now = t0 + 7000 + age;
+    const held = await fleet.publish(turnEnd);
+    assert.equal(held.rule, 'conversation-ready', `${age} ms old`);
   }
+  fleet.now = t0 + 7000 + 31e3;
+  const stale = await fleet.publish(turnEnd);
+  assert.equal(stale.complete, false, 'a stale node proves nothing');
+  assert.equal(stale.rule, 'model-running');
+});
+
+test('a node read that began before a turn ended proves nothing about it, however late it lands', async () => {
+  const fleet = raceFleet('cj-late', { skew: -4000 });
+  const t0 = fleet.now;
+  await fleet.publish(fleet.nodeNow() - 60e3);
+  // The node takes three seconds to answer: its read began before the session's turn
+  // ended, and the answer lands after. Nothing is listed, because the job started after
+  // the read.
+  fleet.lagMs = 3000;
+  fleet.now = t0 + 3000;
+  const turnEnd = fleet.nodeNow() - 1000;
+  await fleet.publish(turnEnd);
+  fleet.now = t0 + 4000;
+  const landed = await fleet.publish(turnEnd);
+  assert.equal(landed.entry.readAt, t0 + 3000 - 4000 - 3000, 'the node\'s own stamp');
+  assert.equal(landed.complete, false, 'read before the turn ended, though it arrived after');
+  assert.equal(landed.rule, 'model-running');
+  // A host that sends no stamp is taken as having read when the request was sent.
+  fleet.lagMs = 0;
+  fleet.stamp = false;
+  fleet.now = t0 + 7000;
+  await fleet.publish(turnEnd);
+  fleet.now = t0 + 8000;
+  const unstamped = await fleet.publish(turnEnd);
+  assert.equal(unstamped.entry.readClock, 'daemon');
+  assert.equal(unstamped.entry.readAt, t0 + 7000, 'the request-sent time');
 });
 
 test('buildState includes companion ownership in normal session classification', () => {

@@ -1904,6 +1904,8 @@ function createHost(options = {}) {
     companionJobsPending
       .then((answer) => respond({
         ok: true, id: request.id, codexJobs: answer.codexJobs, piJobs: answer.piJobs,
+        // When the read began, on this machine's clock (absent when it never ran).
+        ...(Number.isFinite(answer.readAt) ? { readAt: answer.readAt } : {}),
         node: nodeName, bootId, version: COMPANION_JOBS_VERSION,
       }), (error) => respond({ ok: false, id: request.id, error: error.message }))
       .catch(() => {});

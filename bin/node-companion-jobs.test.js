@@ -51,8 +51,11 @@ test('a read past its whole budget answers unknown and takes its group down', as
     const answer = await read({ seam: { ...seam, hold: pidFile }, timeoutMs: 1 });
     assert.equal(answer.codexJobs.reason, 'timeout');
     assert.equal(answer.piJobs.reason, 'timeout');
+    const before = Date.now();
     const ok = await read({ seam, timeoutMs: 5000 });
     assert.equal(ok.codexJobs.discovery, 'ok');
+    assert.ok(ok.readAt >= before && ok.readAt <= Date.now(), 'the node stamps when its read began');
+    assert.equal(answer.readAt, undefined);
     assert.deepEqual(ok.codexJobs.jobs.map((job) => job.id), ['task-fixture-running']);
     if (fs.existsSync(pidFile)) {
       const sleeper = Number(fs.readFileSync(pidFile, 'utf8'));

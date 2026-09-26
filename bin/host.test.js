@@ -2743,6 +2743,7 @@ test('a node answers for its own companion jobs, read-only and bounded, and says
       const hello = await client.request('hello');
       assert.equal(hello.companionJobs, 1, 'the hello says this host answers the verb');
       // Asked twice at once: both are answered, from one read.
+      const asked = Date.now();
       const [answer, again] = await Promise.all([
         client.request('companion-jobs', {}, { timeoutMs: 20e3 }),
         client.request('companion-jobs', {}, { timeoutMs: 20e3 }),
@@ -2750,6 +2751,7 @@ test('a node answers for its own companion jobs, read-only and bounded, and says
       assert.equal(answer.bootId, hello.bootId, 'the answer names the host process that read it');
       assert.equal(answer.node, hello.node);
       assert.equal(answer.version, 1);
+      assert.ok(Number.isFinite(answer.readAt) && answer.readAt >= asked && answer.readAt <= Date.now(), 'stamped by the node as its read began');
       assert.equal(answer.codexJobs.discovery, 'ok');
       assert.deepEqual(answer.codexJobs.jobs.map((job) => [job.id, job.sessionId]), [['task-fixture-running', 'fixture-owner']],
         'only the unfinished job is listed');
@@ -2765,6 +2767,7 @@ test('a node answers for its own companion jobs, read-only and bounded, and says
       assert.equal(answer.codexJobs.discovery, 'unknown');
       assert.equal(answer.codexJobs.reason, 'timeout');
       assert.equal(answer.piJobs.discovery, 'unknown');
+      assert.equal(answer.readAt, undefined, 'a read that never ran carries no read time');
       assert.equal((await client.request('hello')).companionJobs, 1);
     });
   } finally {
