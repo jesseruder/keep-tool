@@ -132,9 +132,13 @@ async function upstreamOf(git, branch, kind) {
 // STEP_MIN_MS left is not made, so the run answers refused and the next update tries
 // again. The one exception is `merge --ff-only`: once it starts it gets its full
 // timeout, because a merge cut off part way leaves the checkout in a state the next
-// run refuses as busy, and a person would have to clear it. The calls after it only
-// read, so they get what is left, but at least a second. The code update runs with no
-// deadline, as it always has.
+// run refuses as busy, and a person would have to clear it. So it is started only
+// when that full timeout (GIT_TIMEOUT_MS) still fits before the deadline; with less
+// left the run answers refused without merging, and since the fetch has already
+// landed the next update's run is quick. The calls after the merge only read, so they
+// get what is left, but at least a second: a merge that uses its whole timeout leaves
+// those reads a second or two past the 40 s, still well inside the caller's 50 s.
+// The code update runs with no deadline, as it always has.
 async function runUpdate(options, checkout, kind) {
   const run = options.git || ((args, timeoutMs) => runGit(checkout, args, timeoutMs));
   const deadline = Number.isFinite(options.deadline) ? options.deadline : null;
@@ -181,7 +185,7 @@ async function runUpdate(options, checkout, kind) {
     if (target === before) return { status: 'current', checkout, before, after: before, branch };
     try { await git(['merge-base', '--is-ancestor', before, target]); }
     catch (error) { unlessLate()(error); return refused(`has commits ${remote}/${defaultName} does not`, { before, target }); }
-    if (deadline !== null && deadline - clock() < STEP_MIN_MS) throw new OutOfTime('git merge');
+    if (deadline !== null && deadline - clock() < GIT_TIMEOUT_MS) throw new OutOfTime('git merge');
     merging = true;
     try { await git(['merge', '--ff-only', '-q', target], GIT_TIMEOUT_MS, { whole: true }); }
     catch (error) { return refused(`could not fast-forward: ${error.message}`, { before, target }); }

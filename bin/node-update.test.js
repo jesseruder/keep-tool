@@ -315,8 +315,16 @@ test('a registry update stops before a step it has no time left for, and never s
     'each call gets what is left, not its own timeout');
   assert.equal(tight.calls.some((call) => call.step === 'merge'), false);
 
-  // A merge started in time gets its full timeout, and the update reports what it did.
-  const merged = stubbedRegistry({ fetchMs: 35e3, mergeMs: 5e3 });
+  // Under the merge's full 15 s left: not started either, though a step would still fit.
+  const short = stubbedRegistry({ fetchMs: 25.1e3 });
+  const skipped = await short.update();
+  assert.deepEqual([skipped.status, skipped.reason, skipped.target],
+    ['refused', 'ran out of time before git merge; will be tried again next update', short.target]);
+  assert.equal(short.calls.some((call) => call.step === 'merge'), false);
+
+  // A merge is started only with its full 15 s left, keeps all of it, and the update
+  // reports what it did.
+  const merged = stubbedRegistry({ fetchMs: 25e3, mergeMs: 15e3 });
   const done = await merged.update();
   assert.deepEqual([done.status, done.commits], ['updated', 2]);
   assert.equal(merged.calls.find((call) => call.step === 'merge').timeoutMs, 15e3);
