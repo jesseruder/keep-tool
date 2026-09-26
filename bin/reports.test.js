@@ -410,8 +410,8 @@ test('a retry after a crash finds its wake already on the feed and does not send
   // As if a daemon had claimed and sent this wake, then died before acknowledging it.
   const state = reports.loadState(f.root);
   const group = state.groups['login-broken'];
-  group.wakeClaim = { at: 1, token: 'tok123', seq: group.dirtySeq || 0, state: 'open', card: '' };
   group.dirtySeq = (group.dirtySeq || 0) + 1;
+  group.wakeClaim = { at: 1, token: 'tok123', seq: group.dirtySeq, state: 'open', card: '' };
   state.reports['discord:cr'].tags = ['Major bug'];
   state.reports['discord:cr'].major = true;
   fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
@@ -465,6 +465,57 @@ test('a verdict recorded while a wake is in flight stands, and a report landing 
   const group = f.state().groups['login-broken'];
   assert.equal(group.state, 'noise', 'the wake did not reopen a group marked noise meanwhile');
   assert.ok((group.dirtySeq || 0) > (group.cleanSeq || 0), 'the report that landed meanwhile keeps it dirty');
+});
+
+test('a claim whose group changed since gets a new token, so the news is not suppressed', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Login broken'));
+  await f.run([discord('ch', 'alice', { starter: true, id: 'ch' })]);
+  const state = reports.loadState(f.root);
+  const group = state.groups['login-broken'];
+  group.wakeClaim = { at: 1, token: 'old', seq: group.dirtySeq || 0, state: 'open', card: '' };
+  group.dirtySeq = (group.dirtySeq || 0) + 1;
+  state.reports['discord:ch'].major = true;
+  fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
+  const seen = [];
+  await reports.ingest({ units: [] }, {
+    root: f.root, config: CFG, withLock: (fn) => fn(), wait: true,
+    deps: { classify: async () => '[]', emit: (name, event) => { seen.push(event); return event; }, flushAgents() {},
+      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {},
+      feedHas: (name, token) => token === 'old', cardHas: () => false, write() {} },
+  });
+  assert.equal(seen.length, 1);
+  assert.notEqual(seen[0].token, 'old');
+});
+
+test('merging dirties the target, so moved reporters can cross the bar', async () => {
+  const f = fixture();
+  f.setVerdicts((prompt) => [...prompt.matchAll(/"key": "([^"]+)"/g)].map((m) => ({
+    key: m[1], report: true, area: 'app-server', group: null, new_group_title: m[1] === 'discord:m3' ? 'B' : 'A',
+  })));
+  await f.run([discord('m1', 'alice', { starter: true, id: 'm1' }), discord('m2', 'bob', { starter: true, id: 'm2' })]);
+  await f.run([discord('m3', 'carol', { starter: true, id: 'm3' })]);
+  assert.equal(f.emitted.length, 0);
+  reports.merge('b', 'a', f.opts);
+  await f.run([]);
+  assert.equal(f.emitted.length, 1);
+  assert.match(f.emitted[0].text, /3 distinct reporters/);
+});
+
+test('a spooled batch lands once even if its file outlives the write that landed it', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Crash'));
+  reports.record({ units: [discord('once', 'alice', { starter: true, id: 'once' })] }, {
+    root: f.root, config: CFG, withLock: () => { throw new Error('busy'); },
+  });
+  const dir = path.join(f.root, '.keep', 'reports');
+  const spoolText = fs.readFileSync(path.join(dir, 'spool.jsonl'), 'utf8');
+  await f.run([]);
+  assert.equal(f.state().reports['discord:once'].messages, 1);
+  // As if the daemon died after writing state but before deleting the taken file.
+  fs.writeFileSync(path.join(dir, 'spool.1.1.taking'), spoolText);
+  await f.run([]);
+  assert.equal(f.state().reports['discord:once'].messages, 1);
 });
 
 test('authors with no Latin letters stay distinct reporters', async () => {

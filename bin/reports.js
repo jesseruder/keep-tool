@@ -159,13 +159,13 @@ function config(root = keep.ROOT) {
   };
 }
 
-function emptyState() { return { reports: {}, groups: {}, slackNames: {} }; }
+function emptyState() { return { reports: {}, groups: {}, slackNames: {}, spooled: {} }; }
 
 function loadState(root = keep.ROOT) {
   const value = readJson(stateFile(root), null);
   if (!value) return emptyState();
   const map = (field) => (value[field] && typeof value[field] === 'object' && !Array.isArray(value[field]) ? value[field] : {});
-  return { reports: map('reports'), groups: map('groups'), slackNames: map('slackNames') };
+  return { reports: map('reports'), groups: map('groups'), slackNames: map('slackNames'), spooled: map('spooled') };
 }
 
 // The one way to change state.json: load, change and write inside the registry
@@ -383,7 +383,17 @@ function defaultDeps() {
     incidentConfig: () => require('./incidents.js').config(),
     openIncidents: () => require('./incidents.js').openIncidents(),
     checkinTask: (id, message) => keep.checkinTask(id, { message, linkSession: false }),
-    feedHas: (name, token) => require('./agents.js').readTail(name, { limit: 200 }).events.some((event) => event.token === token),
+    // The whole feed, page by page: a retry can come after more events than any tail.
+    feedHas: (name, token) => {
+      const agents = require('./agents.js');
+      let cursor = 0;
+      for (;;) {
+        const page = agents.readAfterSeq(name, cursor);
+        if (page.events.some((event) => event.token === token)) return true;
+        if (!page.more || !page.events.length) return false;
+        cursor = page.events[page.events.length - 1].seq;
+      }
+    },
     cardHas: (id, marker) => {
       for (const dir of ['tasks', 'archive']) {
         try { if (fs.readFileSync(path.join(keep.ROOT, dir, `${id}.md`), 'utf8').includes(marker)) return true; } catch {}
@@ -527,12 +537,21 @@ function record({ units = [], slackNames = [] } = {}, options = {}) {
     mutateState((state) => {
       prune(state, now);
       taken = takeSpool(root);
-      for (const batch of taken.batches) landUnits(state, cfg, batch.units, batch.slackNames, now, summary);
+      // A batch lands once: its id is written in the same state write that lands it,
+      // so a crash before its spool file is deleted replays nothing, however many
+      // messages it held.
+      state.spooled = state.spooled && typeof state.spooled === 'object' ? state.spooled : {};
+      for (const [id, at] of Object.entries(state.spooled)) if (now - (Number(at) || 0) > 7 * 86400e3) delete state.spooled[id];
+      for (const batch of taken.batches) {
+        if (!batch || (batch.id && state.spooled[batch.id])) continue;
+        landUnits(state, cfg, batch.units, batch.slackNames, now, summary);
+        if (batch.id) state.spooled[batch.id] = now;
+      }
       landUnits(state, cfg, units, slackNames, now, summary);
     }, { root, withLock: options.withLock });
   } catch (error) {
     if (units.length || slackNames.length) {
-      spool(root, { units, slackNames });
+      spool(root, { id: crypto.randomBytes(8).toString('hex'), units, slackNames });
       summary.spooled = true;
     }
     summary.error = oneLine(error && error.message || error, 200);
@@ -547,13 +566,16 @@ const settling = new Map();
 
 function claimLive(claim, now) { return Boolean(claim && now - (Number(claim.at) || 0) < CLAIM_MS); }
 
-// A fresh claim, or the expired one again: its token is what a retry looks for on the
-// feed or the card, so a retry after a crash must carry the same one.
+// A fresh claim, or the expired one again. Its token is what a retry looks for on the
+// feed or the card, so a retry after a crash carries the same one — but only when it
+// would send the same thing: a group that changed since (a new report, a verdict, a
+// new card) gets a new token, because finding the old one would suppress news the old
+// send did not carry. That trades a possible repeat for never losing a report.
 function claimFor(previous, group, now) {
-  return {
-    at: now, token: (previous && previous.token) || crypto.randomBytes(8).toString('hex'),
-    seq: Number(group.dirtySeq) || 0, state: group.state, card: group.card || '',
-  };
+  const seq = Number(group.dirtySeq) || 0;
+  const card = group.card || '';
+  const same = previous && previous.token && previous.seq === seq && previous.state === group.state && previous.card === card;
+  return { at: now, token: same ? previous.token : crypto.randomBytes(8).toString('hex'), seq, state: group.state, card };
 }
 
 function noteMarker(token) { return `(report note ${token})`; }
@@ -816,6 +838,8 @@ function merge(from, into, options = {}) {
     target.reporters = stats.reporters;
     target.reports = stats.reports.length;
     target.lastAt = Math.max(Number(target.lastAt) || 0, Number(source.lastAt) || 0);
+    // What moved in may cross the wake bar or belong on the target's card.
+    markDirty(target);
     delete state.groups[source.id];
     return { moved, into: target.id };
   }, options);
