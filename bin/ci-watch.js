@@ -39,8 +39,10 @@ const RED_POLL_MS = 24 * 3600e3;
 const RED_SLOW_POLL_MS = 30 * 60e3;
 // A pass stops starting lookups after this, well inside the scheduler's timeout.
 const TICK_BUDGET_MS = 3 * 60e3;
-// Notes and messages get another minute; a message tries at most three sessions.
-const OUTBOX_BUDGET_MS = 60e3;
+// Notes and messages get another half minute, and a message tries at most three
+// sessions of 20 s each, so a pass ends inside the scheduler's five-minute timeout.
+const OUTBOX_BUDGET_MS = 30e3;
+const SEND_TIMEOUT_MS = 20e3;
 const TELL_CANDIDATES = 3;
 const PASS_LOCK_STALE_MS = 6 * 60e3;
 const DELIVER_GIVE_UP_MS = 30 * 60e3;
@@ -443,7 +445,7 @@ function sessionCandidates(watch) {
 async function postSend(ids, text) {
   for (const sessionId of ids) {
     let response;
-    try { response = await keep.postKeepApi('/api/send', { sessionId, text }, 30e3); }
+    try { response = await keep.postKeepApi('/api/send', { sessionId, text }, SEND_TIMEOUT_MS); }
     catch (error) {
       if (/timed out/.test(String(error && error.message))) return { sessionId, uncertain: true };
       continue;
@@ -483,12 +485,18 @@ async function workTell(watch, item, deliver, now) {
   if (notes.some((note) => !note.doneAt && !note.gaveUp)) return item;
   const reopened = notes.filter((note) => note.reopened).map((note) => note.card);
   const text = item.kind === 'stuck' ? stuckMessage(watch) : redMessage(watch, reopened);
-  const ids = sessionCandidates(watch).slice(0, TELL_CANDIDATES);
+  // Three at a time, starting further along on each retry, so a live session behind
+  // three dead ones is still reached.
+  const all = sessionCandidates(watch);
+  const offset = all.length ? (Number(item.attempts || 0) * TELL_CANDIDATES) % all.length : 0;
+  const ids = [...all.slice(offset), ...all.slice(0, offset)].slice(0, TELL_CANDIDATES);
   let result = null;
   if (ids.length) {
     try { result = await deliver(ids, text); } catch {}
   }
-  if (result) return { ...item, doneAt: now, sessionId: result.sessionId || null };
+  // A send that timed out may or may not have arrived; it is not repeated (the same
+  // alert twice is worse), but the record says so.
+  if (result) return { ...item, doneAt: now, sessionId: result.sessionId || null, ...(result.uncertain ? { uncertain: true } : {}) };
   const retry = { ...item, attempts: Number(item.attempts || 0) + 1 };
   if (!ids.length) return { ...retry, gaveUp: 'no session to tell' };
   return now - Number(item.at) > DELIVER_GIVE_UP_MS ? { ...retry, gaveUp: 'no session took it' } : retry;
@@ -560,18 +568,23 @@ async function tick({
 function passLock(root, now) {
   const file = path.join(dir(root), 'pass.lock');
   fs.mkdirSync(dir(root), { recursive: true });
+  const token = `${process.pid}:${Math.random().toString(36).slice(2)}`;
+  const holder = () => { try { return fs.readFileSync(file, 'utf8'); } catch { return null; } };
   for (let attempt = 0; attempt < 2; attempt += 1) {
     try {
-      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
-      return () => { try { fs.unlinkSync(file); } catch {} };
+      fs.writeFileSync(file, token, { flag: 'wx' });
+      // Released only while it is still ours: a pass that outlived its lock must not
+      // delete the one that took over.
+      return () => { if (holder() === token) { try { fs.unlinkSync(file); } catch {} } };
     } catch (error) {
       if (error.code !== 'EEXIST') throw error;
       // A pass is killed at the scheduler's five-minute timeout; a lock older than
-      // that belongs to a dead one.
+      // that belongs to a dead one, and is removed only if it is still the same one.
+      const stale = holder();
       let age = 0;
       try { age = now - fs.statSync(file).mtimeMs; } catch { continue; }
       if (age < PASS_LOCK_STALE_MS) return null;
-      try { fs.unlinkSync(file); } catch {}
+      if (holder() === stale) { try { fs.unlinkSync(file); } catch {} }
     }
   }
   return null;
