@@ -308,6 +308,9 @@ test('a paneless session waiting only on its card is marked cardOnlyWait; any ba
   assert.equal(activity({ ...gone, unknownBackgroundJobs: ['b1'] }, card).cardOnlyWait, false);
   assert.equal(activity({ ...gone, lifecycleAgents: [{ id: 'a' }] }, card).cardOnlyWait, false);
   assert.equal(activity({ ...gone, runtime: { state: 'external' } }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, footer: { recognized: true, shells: 1, agents: 0, running: true } }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, agentShells: 1 }, card).cardOnlyWait, false);
+  assert.equal(activity({ ...gone, companionComplete: false }, card).cardOnlyWait, false);
   assert.equal(activity(base, card).cardOnlyWait, false, 'a live pane is never card-only');
 });
 

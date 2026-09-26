@@ -160,7 +160,8 @@ function activity(session, context = {}) {
   // waiting on its next check), with no background work of its own of any kind: the
   // console does not list it under Running & waiting.
   const backgroundEvidence = model.background.pending || model.background.uncertain.length || model.background.agents.length
-    || ledgerPending || model.conversation.scheduled.length || session.runtime?.state === 'external';
+    || ledgerPending || model.conversation.scheduled.length || session.runtime?.state === 'external'
+    || session.footer?.running || session.agentShells > 0 || session.companionComplete === false;
   const cardOnlyWait = !live && chosen.state === 'waiting' && chosen.source === 'registry' && !backgroundEvidence;
   return { state: chosen.state, label: chosen.label, reason: chosen.reason, needsInput: Boolean(chosen.request), request: chosen.request, cardOnlyWait,
     background: { pending: model.background.pending, uncertain: model.background.uncertain, scheduled: model.conversation.scheduled,
