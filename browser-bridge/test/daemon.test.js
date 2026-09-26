@@ -196,7 +196,20 @@ test("a host from before rename is reconnected, and its new hello carries the na
 
   const owner = ownerTag(deriveSessionKey(SECRET, transport.sessionId));
   assert.equal((await rename(port, { owner, name: "#405" })).status, 200);
-  await client.callTool({ name: "browser_status", arguments: {} });
+  // Delivered before /rename answers, with no tool call needed to trigger it.
+  assert.equal(host.hellos().length, 2);
+  assert.equal(host.hellos().at(-1).params.name, "#405");
+});
+
+test("a session whose client has not connected yet connects to take its name", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port } = await startDaemon(t, dir);
+  const { transport } = await connectClient(t, port);
+  // No tool call yet, so no socket client and no hello.
+  assert.equal(host.hellos().length, 0);
+  const owner = ownerTag(deriveSessionKey(SECRET, transport.sessionId));
+  assert.equal((await rename(port, { owner, name: "#405" })).status, 200);
   assert.equal(host.hellos().at(-1).params.name, "#405");
 });
 

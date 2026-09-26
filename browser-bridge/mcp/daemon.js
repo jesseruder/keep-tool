@@ -423,11 +423,18 @@ export function createDaemon({
     if (!found) return reply(404, { error: "no live session owns that tab" });
     const [id, entry] = found;
     if (name !== entry.name) {
+      // Held like a request, so the sweep does not end the session under the rename.
+      entry.lastSeenAt = now();
+      entry.inFlight += 1;
       try {
         await entry.client.rename?.(name);
       } catch (error) {
         return reply(502, { error: `the browser did not take the name: ${error?.message ?? error}` });
+      } finally {
+        entry.inFlight -= 1;
       }
+      // Ended (or ended and adopted again) meanwhile: its record is not ours to write.
+      if (sessions.get(id) !== entry) return reply(409, { error: "the session ended while it was being renamed" });
       log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
       entry.name = name;
       known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
