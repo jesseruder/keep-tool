@@ -144,3 +144,20 @@ test('a view whose restart failed after its tab detached restarts on a click', a
   expect(browserEvents().filter(e => e.t === 'start').at(-1).tabId).toBe(11);
   await expect(panel(page).locator('.bv-status')).toBeHidden();
 });
+
+test('a view that recovers on its own after a failed restart takes clicks as input again', async ({ page }) => {
+  fixture.configure({ browserViews: [view({ tabId: 11 })] });
+  await expect(panel(page).locator('.bv-status')).toBeHidden();
+  const starts = () => browserEvents().filter(e => e.t === 'start').length;
+  for (let seen = -1; seen !== starts();) { seen = starts(); await page.waitForTimeout(500); }
+  const before = starts();
+
+  fixture.browserSend({ t: 'state', state: 'error', reason: 'Debugger is not attached' });
+  await expect(panel(page).locator('.bv-status')).toContainText('click to retry');
+  // The extension's own reattach worked after all: a frame arrives.
+  fixture.browserFrame(11);
+  await expect(panel(page).locator('.bv-status')).toBeHidden();
+  await panel(page).locator('.bv-canvas').click();
+  await expect.poll(() => browserEvents().filter(e => e.t === 'input' && e.input.type === 'mousePressed').length).toBe(1);
+  expect(starts()).toBe(before);
+});

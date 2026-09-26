@@ -61,6 +61,12 @@ async function createFixture() {
   const secretWrites = [];
   let secretRefusal = null;
   const browserClients = new Set();
+  const browserFrameMessage = (tabId, size = {}) => {
+    const header = Buffer.from(JSON.stringify({ seq: 1, tabId, metadata: { deviceWidth: size.width, deviceHeight: size.height } }));
+    const length = Buffer.alloc(4);
+    length.writeUInt32BE(header.length, 0);
+    return Buffer.concat([length, header, BROWSER_FRAME]);
+  };
   let browserTabs = [
     { id: 11, url: 'https://app.example.test/', title: 'App', active: true, popup: false },
     { id: 12, url: 'https://accounts.example.test/signin', title: 'Sign in', active: false, popup: true, openerTabId: 11 },
@@ -437,10 +443,8 @@ async function createFixture() {
           record('browser', { pane, ...message });
           if (message.t === 'start') {
             client.send(JSON.stringify({ t: 'started', tab: browserTabs.find(tab => tab.id === message.tabId) || null }));
-            const header = Buffer.from(JSON.stringify({ seq: 1, tabId: message.tabId, metadata: { deviceWidth: message.width, deviceHeight: message.height } }));
-            const length = Buffer.alloc(4);
-            length.writeUInt32BE(header.length, 0);
-            client.send(Buffer.concat([length, header, BROWSER_FRAME]));
+            client.lastSize = { width: message.width, height: message.height };
+            client.send(browserFrameMessage(message.tabId, client.lastSize));
           }
         });
         client.on('close', () => record('browser', { pane, t: 'disconnect' }));
@@ -471,6 +475,8 @@ async function createFixture() {
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, secretWrites, update, publish, churn,
     // What the bridge would say to every open browser view, e.g. a viewer_state.
     browserSend: message => { for (const client of browserClients) client.send(JSON.stringify(message)); },
+    // A screencast frame for `tabId`, at the size each view last started at.
+    browserFrame: tabId => { for (const client of browserClients) client.send(browserFrameMessage(tabId, client.lastSize)); },
     configure: options => {
       if ('secretRequests' in options) { state.secretRequests = options.secretRequests; publish(); }
       if ('browserViews' in options) { state.browserViews = options.browserViews; publish(); }

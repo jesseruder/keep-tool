@@ -159,6 +159,9 @@ function startView(root, ctx, request, key) {
   let decoding = false;
   let queued = null;
   let needsStart = false;
+  // needsStart came from a failed restart: a frame arriving after it means the tab came
+  // back by itself, and a click is input again.
+  let retryArmed = false;
 
   const setStatus = (text) => {
     status.textContent = text || '';
@@ -181,6 +184,7 @@ function startView(root, ctx, request, key) {
     if (id == null) return;
     tabId = id;
     needsStart = false;
+    retryArmed = false;
     sentSize = size();
     send({ t: 'start', tabId: id, ...sentSize, fit: true });
     renderTabs();
@@ -229,6 +233,7 @@ function startView(root, ctx, request, key) {
       }
       draw.drawImage(bitmap, 0, 0);
       bitmap.close?.();
+      if (retryArmed) { retryArmed = false; needsStart = false; }
       const meta = header.metadata || {};
       device = {
         width: meta.deviceWidth || bitmap.width / (sentSize?.pixelRatio || 1),
@@ -282,9 +287,9 @@ function startView(root, ctx, request, key) {
       if (message.state === 'detached') setStatus('reconnecting to the tab');
       else if (message.state === 'tab-closed') { tabId = null; send({ t: 'tabs' }); }
       // A restart after the tab detached failed: a click tries again.
-      else if (message.state === 'error') { needsStart = true; setStatus(`${message.reason || 'the view stopped'} · click to retry`); }
-      else if (message.state === 'taken-over') { needsStart = true; setStatus('another view opened this tab · click to take it back'); }
-      else if (message.state === 'stopped') { needsStart = true; setStatus(`the view stopped${message.reason ? `: ${message.reason}` : ''} · click to restart`); }
+      else if (message.state === 'error') { needsStart = true; retryArmed = true; setStatus(`${message.reason || 'the view stopped'} · click to retry`); }
+      else if (message.state === 'taken-over') { needsStart = true; retryArmed = false; setStatus('another view opened this tab · click to take it back'); }
+      else if (message.state === 'stopped') { needsStart = true; retryArmed = false; setStatus(`the view stopped${message.reason ? `: ${message.reason}` : ''} · click to restart`); }
     } else if (message.t === 'error') {
       setStatus(message.message || 'error');
     }
@@ -297,6 +302,7 @@ function startView(root, ctx, request, key) {
     tabId = null;
     sentSize = null;
     needsStart = false;
+    retryArmed = false;
     queued = null;
     const protocol = location.protocol === 'https:' ? 'wss:' : 'ws:';
     const query = new URLSearchParams({ session: String(request.num) });

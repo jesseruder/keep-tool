@@ -14,7 +14,7 @@
 // which is what keeps a slow link from queueing seconds of stale pictures.
 
 import { attach, detach, isAttached, onOwnDetach, send } from "./cdp.js";
-import { allSessions, tabsInGroup } from "./sessions.js";
+import { activityGeneration, allSessions, tabsInGroup, withSessionLock } from "./sessions.js";
 import { CTRL, META, macCommands } from "./keys.js";
 
 const IS_MAC = typeof navigator !== "undefined" && /Mac/i.test(navigator.platform ?? "");
@@ -127,20 +127,33 @@ export function createViewerHandlers() {
    * watching. Otherwise headed Edge would keep its "being debugged" bar after the view.
    */
   async function releaseTab(tabId) {
-    if (!isAttached(tabId)) return;
-    for (const other of viewers.values()) if (other.tabId === tabId) return;
+    const held = () => starting.has(tabId) || [...viewers.values()].some((other) => other.tabId === tabId);
+    if (!isAttached(tabId) || held()) return;
+    let owner = null;
     try {
       const tab = await chrome.tabs.get(tabId);
       if (tab.groupId != null && tab.groupId >= 0) {
         const store = await allSessions();
-        if (Object.values(store).some((record) => record?.groupId === tab.groupId && !record.ended)) return;
+        owner = Object.keys(store).find((key) => store[key]?.groupId === tab.groupId) ?? null;
+        if (owner && !store[owner].ended) return;
       }
     } catch {
       return; // the tab is gone, and its attachment with it
     }
-    // A view may have taken the tab while that was looked up.
-    for (const other of viewers.values()) if (other.tabId === tabId) return;
-    await detach(tabId);
+    if (!owner) {
+      if (!held()) await detach(tabId);
+      return;
+    }
+    // An ended session can come back at any moment, and with it a tool call on this tab.
+    // Its return runs under the session's lock, so this does too: a request that came in
+    // first has revived the session by the time the lock is ours, and one that comes in
+    // later moves the activity count read here (the same test closeSession uses).
+    const generation = activityGeneration(owner);
+    await withSessionLock(owner, async () => {
+      const store = await allSessions();
+      if (!store[owner]?.ended || activityGeneration(owner) !== generation || held()) return;
+      await detach(tabId);
+    });
   }
 
   function otherViewerFits(tabId, exceptId) {
@@ -153,6 +166,7 @@ export function createViewerHandlers() {
   // A viewer's start and stop run one at a time: a resize restart racing a tab switch
   // must not leave a screencast or an override on a tab no viewer owns any more.
   const chains = new Map(); // viewerId -> promise
+  const starting = new Map(); // tabId -> starts in progress
   function serial(id, fn) {
     const run = (chains.get(id) ?? Promise.resolve()).then(fn);
     const settled = run.then(() => {}, () => {});
@@ -294,7 +308,18 @@ export function createViewerHandlers() {
      */
     viewer_start(params, emit) {
       if (!validViewerId(params.viewer)) return Promise.reject(new Error("viewer id is required"));
-      return serial(params.viewer, () => startNow(params, emit));
+      // Marked before the start queues, so a view letting go of this tab meanwhile does
+      // not detach it from under the start.
+      const tabId = Number(params.tabId);
+      starting.set(tabId, (starting.get(tabId) ?? 0) + 1);
+      const run = serial(params.viewer, () => startNow(params, emit));
+      const done = () => {
+        const left = (starting.get(tabId) ?? 1) - 1;
+        if (left > 0) starting.set(tabId, left);
+        else starting.delete(tabId);
+      };
+      run.then(done, done);
+      return run;
     },
 
     /** The viewer drew a frame: release the ack CDP is waiting for, if one is held. */

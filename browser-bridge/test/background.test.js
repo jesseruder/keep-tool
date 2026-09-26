@@ -68,7 +68,14 @@ globalThis.chrome = {
     session: {
       async get(key) {
         await tick();
-        return key in state.storage ? { [key]: structuredClone(state.storage[key]) } : {};
+        const value = key in state.storage ? { [key]: structuredClone(state.storage[key]) } : {};
+        // A test can hold one read open after it has taken its snapshot.
+        if (state.holdNextGet) {
+          const hold = state.holdNextGet;
+          state.holdNextGet = null;
+          await hold;
+        }
+        return value;
       },
       async set(values) {
         await tick();
@@ -81,6 +88,7 @@ globalThis.chrome = {
     onRemoved: { addListener: (fn) => state.listeners.tabsRemoved.push(fn) },
     async query({ groupId }) {
       await tick();
+      if (state.holdQuery) await state.holdQuery;
       return [...state.tabs.values()].filter((tab) => groupId === undefined || tab.groupId === groupId);
     },
     async get(id) {
@@ -572,6 +580,64 @@ test("a view lets go of a tab only it held, and leaves a live session's tab atta
   assert.equal((await call("v_4", "viewer_stop", { viewer: "v2" })).ok, true);
   for (let i = 0; i < 20; i++) await tick();
   assert.equal(state.detachCalls.length, before, "a live session's tab stays attached");
+});
+
+test("a view starting on a tab keeps it attached when another view lets go of it", async () => {
+  const session = await makeSession("shared", "#78 card");
+  const popup = { id: state.nextTabId++, windowId: 3, groupId: -1, openerTabId: session.tab.id, url: "https://accounts.example", title: "Sign in" };
+  state.tabs.set(popup.id, popup);
+  const reply = (id) => waitFor(() => replyFor(id), `the reply to ${id}`);
+  const view = (viewer) => ({ viewer, session: "#78", tabId: popup.id, width: 800, height: 600, fit: true });
+  deliver({ id: "s_1", method: "viewer_start", params: view("s1") });
+  assert.equal((await reply("s_1")).ok, true);
+
+  // The next start is still looking the tab up when the stop lets go of it.
+  let release;
+  state.holdQuery = new Promise((resolve) => { release = resolve; });
+  deliver({ id: "s_3", method: "viewer_start", params: view("s2") });
+  deliver({ id: "s_2", method: "viewer_stop", params: { viewer: "s1" } });
+  assert.equal((await reply("s_2")).ok, true);
+  for (let i = 0; i < 20; i++) await tick();
+  state.holdQuery = null;
+  release();
+  assert.equal((await reply("s_3")).ok, true);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(state.detachCalls.includes(popup.id), false);
+});
+
+test("an ended session's tab is let go of after its view, unless the session came back", async () => {
+  const reply = (id) => waitFor(() => replyFor(id), `the reply to ${id}`);
+  const view = (viewer, session, tabId) => ({ viewer, session, tabId, width: 800, height: 600, fit: true });
+
+  const gone = await makeSession("gone", "#79 card");
+  state.tabs.get(gone.tab.id).url = "https://example.com/kept";
+  deliver({ method: "session_closed", params: { sessionKey: "gone" } });
+  await waitFor(async () => (await sessions.getSession("gone"))?.ended, "the session ended");
+  deliver({ id: "e_1", method: "viewer_start", params: view("e1", "#79", gone.tab.id) });
+  assert.equal((await reply("e_1")).ok, true);
+  deliver({ id: "e_2", method: "viewer_stop", params: { viewer: "e1" } });
+  await reply("e_2");
+  await waitFor(() => state.detachCalls.includes(gone.tab.id), "the ended session's tab detached");
+
+  const back = await makeSession("back", "#80 card");
+  state.tabs.get(back.tab.id).url = "https://example.com/back";
+  deliver({ method: "session_closed", params: { sessionKey: "back" } });
+  await waitFor(async () => (await sessions.getSession("back"))?.ended, "the session ended");
+  deliver({ id: "b_1", method: "viewer_start", params: view("b1", "#80", back.tab.id) });
+  assert.equal((await reply("b_1")).ok, true);
+  // The view's release reads the session as ended; it comes back with a tool call
+  // before the release acts on that.
+  let release;
+  const read = new Promise((resolve) => { release = resolve; });
+  state.holdNextGet = read; // the stop reads nothing else from storage first
+  deliver({ id: "b_2", method: "viewer_stop", params: { viewer: "b1" } });
+  await waitFor(() => state.holdNextGet === null, "the release to take its snapshot");
+  deliver({ id: "w_back", sessionKey: "back", session: { name: "#80 card" }, method: "tabs_context_mcp", params: {} });
+  await reply("w_back");
+  release();
+  await reply("b_2");
+  for (let i = 0; i < 30; i++) await tick();
+  assert.equal(state.detachCalls.includes(back.tab.id), false);
 });
 
 test("an ended session that comes back takes its group out of (ended)", async () => {
