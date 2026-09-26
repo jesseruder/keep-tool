@@ -1576,6 +1576,13 @@ presence or hash only. The node's host answers the `inventory` verb
 `keep host reload` on that node. [Node provisioning](node-provisioning.md) is the
 checklist for applying what the audit finds.
 
+`keep nodes update [<name>...] [--json] [--no-reload]`, run by `wt land` after a land,
+asks each other node's host to fast-forward its keep-tool checkout to origin's default
+branch (reloading the host when its own code moved) and its registry clone to the branch
+that clone tracks. Anything but a clean fast-forward is refused and left for a person;
+a refusal of either, or an unreachable node, exits 1. The daemon node's registry is
+never pulled. Details are in [node provisioning](node-provisioning.md).
+
 Parity is the node's half. The daemon's half is that every scheduler tick survives
 sessions on another node: a scheduler must pass `bin/remote-node-schedulers.test.js`
 before sessions of the kind it touches may move to a node. The rule and how to add a

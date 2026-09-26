@@ -19,6 +19,17 @@ person. Run it by hand to retry a node that was down. A host from before this an
 that it predates `update-self`, and needs one `git pull --ff-only` and `keep host
 reload` on the node.
 
+The same run fast-forwards the node's registry clone (`KEEP_DIR`, `~/keep`), which the
+pane-only gate, `keep who`, `keep codex context` and the Codex companion's job state
+read: on the branch the clone tracks (its upstream, else `origin/HEAD`), by the same
+rules, so a clone with uncommitted tracked changes, local commits, a detached HEAD, an
+unfinished git operation or no upstream is refused and left alone. Its gitignored
+`.keep/` runtime state does not count as a change. Each node's line ends with
+`registry: updated N commits`, `current`, `refused (why)`, or `not offered by its
+host` for a host that predates it (`updateRegistry` in its hello); a refusal exits
+non-zero like a code refusal. The daemon node's own registry is never pulled this way:
+the daemon commits and pushes there itself.
+
 ## What `keep node audit` covers
 
 ```sh

@@ -249,7 +249,8 @@ async function nodeUsage(argv, deps) {
 
 // Every other machine catches up with what origin has: each node's host
 // fast-forwards its own keep-tool checkout (bin/node-update.js) and reloads onto
-// it. wt land runs this after it restarts the daemon, so a land reaches every node.
+// it, and fast-forwards its registry clone on the branch that clone tracks. wt land
+// runs this after it restarts the daemon, so a land reaches every node.
 // A node that is down, or whose checkout someone is working in, is reported and
 // skipped; the rest are not held up by it.
 async function updateNodes(argv, deps) {
@@ -288,7 +289,8 @@ async function updateNodes(argv, deps) {
   else for (const row of rows) console.log(describeUpdate(row.node, row));
   // A node left behind is worth a non-zero exit, so a caller can tell; wt land
   // prints it and carries on.
-  if (rows.some((row) => row.error || row.status === 'refused')) process.exitCode = 1;
+  // A registry clone left behind counts too: its gate and job state are stale.
+  if (rows.some((row) => row.error || row.status === 'refused' || (row.registry && row.registry.status === 'refused'))) process.exitCode = 1;
 }
 
 const AUDIT_USAGE = 'usage: keep node audit <name> [--json] [--all]';

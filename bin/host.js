@@ -1275,6 +1275,9 @@ function createHost(options = {}) {
           // updateSelf: this host answers `update-self` (bin/node-update.js), a
           // fast-forward of its own keep-tool checkout that `keep nodes update` asks for.
           updateSelf: 1,
+          // updateRegistry: its `update-self` answer also carries `registry`, a
+          // fast-forward of this node's registry clone (never the daemon node's).
+          updateRegistry: 1,
           // browserView: this host answers `browser-view` (bin/browser-view-host.js), a
           // live view of a session's tabs in this machine's Browser Bridge browser.
           browserView: 1,
@@ -1376,11 +1379,14 @@ function createHost(options = {}) {
         // The daemon asking this machine to run the code it just landed. Only a
         // fast-forward of this checkout; when the host's own code moved it reloads
         // after answering, keeping its panes, unless the caller asked it not to.
-        const result = await require('./node-update.js').updateSelf();
+        // The node's registry clone is fast-forwarded alongside (a separate checkout,
+        // so no lock is shared), and whatever becomes of it never changes the code's
+        // status or the reload.
+        const { result, registry } = await require('./node-update.js').updateNode({ registry: { env, node: nodeName } });
         const reload = result.status === 'updated' && result.hostChanged && params.reload !== false
           && options.boot && typeof options.boot.reload === 'function';
         return {
-          result: { ...result, reloading: Boolean(reload) },
+          result: { ...result, reloading: Boolean(reload), registry },
           ...(reload ? { after: () => options.boot.reload().catch((error) => eventLog(`host: reload after update failed: ${error.message}`)) } : {}),
         };
       }
