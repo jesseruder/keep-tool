@@ -69,18 +69,14 @@ function activity(session, context = {}) {
   const task = context.task?.fm || context.task || {};
   const taskStatus = model.task.status;
   // The turn-end model verdict (bin/stop-classifier.js) outranks the prose rules and
-  // tracked-job waits below. A stop intent a hook or card handoff declared outranks
-  // RUNNING and DONE, but not ASKS: a turn that schedules a check and ends on options
-  // for Owner is asking. DONE cannot pull a session out of a scheduled or dependency
-  // wait it does not see, and RUNNING and DONE cannot hide the card's review or needs.
+  // tracked-job waits below, but not a stop intent a hook or card handoff declared.
+  // It sees only the message, so it cannot hide the card's own review or needs, and
+  // DONE cannot pull a session out of a scheduled or dependency wait it does not see.
   // RUNNING and DONE speak for a live pane only; ASKS also for the card's latest
   // session whose pane is gone, whose final ask would otherwise sit behind the card's
   // schedule or read as idle.
-  // Keep's own unattended sessions (recurring checks) keep their declared handoff: a
-  // false ASKS there would notify on every recurrence.
   const verdict = ended && !model.identity.reviewer
-    && (!['hook', 'registry'].includes(model.conversation.source) || (session.stopVerdict?.verdict === 'asks' && session.unattended !== true))
-    ? session.stopVerdict : null;
+    && !['hook', 'registry'].includes(model.conversation.source) ? session.stopVerdict : null;
   const live = model.identity.interactive;
   const cardAsks = taskStatus === 'review' || (taskStatus !== 'done' && model.task.needs);
   const durableWait = model.conversation.waiting && ['scheduled check', 'dependency'].includes(model.conversation.reason);
@@ -97,9 +93,6 @@ function activity(session, context = {}) {
   // A one-shot scheduled job (a cron, a /loop wakeup) well past its time has fired.
   const ledgerPending = (ledger?.jobs || []).some((job) => job.status === 'pending' && job.kind !== 'service'
     && !(job.kind === 'scheduled' && !job.recurring && Number.isFinite(job.expiresAt) && nowMs - job.expiresAt > 10 * 60e3));
-  // 'history-gap' (history the ledger never read) stays unknown here: a cron or /loop
-  // created in it would show in no other source. The classifier's own input
-  // discounts a settled one, so the model is not told work is running.
   const wakes = session.companionComplete === false || footer?.running || session.agentShells > 0 || model.background.pending || model.background.uncertain.length
     || model.background.agents.length || ledgerPending || model.conversation.scheduled.length
     || (model.task.checkAfter && !model.task.checkOverdue) || model.task.dependencies.length;
@@ -111,9 +104,7 @@ function activity(session, context = {}) {
   // turn is listed as finished below. An ASKS verdict still counts for it.
   const unattended = session.unattended === true;
   // The agent's own words stay the row's (and a push's) detail when it asked something.
-  // The agent's own question is the row's detail, so it can stand ahead of the card's
-  // review or needs text too.
-  add(verdict?.verdict === 'asks' && (live || model.task.cardLatest), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
+  add(verdict?.verdict === 'asks' && !cardAsks && (live || model.task.cardLatest), 'model-asks', 'model', 'needs-input', 'Needs an answer', 'question',
     { kind: 'input', detail: text || verdict?.reason }, 'inferred');
   add(live && verdict?.verdict === 'done' && !durableWait && !cardAsks && !unattended, 'model-done', 'model', 'needs-input', 'Ready for next instruction',
     'next instruction', { kind: 'input', detail: verdict?.reason || 'Ready for your next instruction.' }, 'inferred');
@@ -156,15 +147,7 @@ function activity(session, context = {}) {
   add(true, 'no-current-work', 'fallback', 'idle', 'Idle', null, null, model.foreground.state === 'unknown' ? 'uncertain' : 'inferred');
   const chosen = candidates[0];
   const evidence = ({ rule, source, confidence, at, state }) => ({ rule, source, confidence, at: at ?? null, state });
-  // A session with no live pane whose only wait is its card (a finished check session
-  // waiting on its next check), with no background work of its own of any kind: the
-  // console does not list it under Running & waiting.
-  // Unread history ('history-gap') cannot hide live work once the process is gone.
-  const backgroundEvidence = model.background.pending || model.background.uncertain.some((id) => id !== 'history-gap') || model.background.agents.length
-    || ledgerPending || model.conversation.scheduled.length || session.runtime?.state === 'external'
-    || session.footer?.running || session.agentShells > 0 || session.companionComplete === false;
-  const cardOnlyWait = !live && chosen.state === 'waiting' && chosen.source === 'registry' && !backgroundEvidence;
-  return { state: chosen.state, label: chosen.label, reason: chosen.reason, needsInput: Boolean(chosen.request), request: chosen.request, cardOnlyWait,
+  return { state: chosen.state, label: chosen.label, reason: chosen.reason, needsInput: Boolean(chosen.request), request: chosen.request,
     background: { pending: model.background.pending, uncertain: model.background.uncertain, scheduled: model.conversation.scheduled,
       checkAfter: model.task.checkAfter, dependencies: model.task.dependencies },
     decision: { ...evidence(chosen), alternatives: candidates.slice(1).filter((c) => c.rule !== 'no-current-work').map(evidence) } };

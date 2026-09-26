@@ -236,7 +236,6 @@ test('attach sets and clears the verdict from the cache only', () => {
 
 test('the prompt reads an unstarted plan as ASKS and a promise with nothing scheduled as not RUNNING', () => {
   assert.match(classifier.INSTRUCTION, /proposing its own next work that it has not started/);
-  assert.match(classifier.INSTRUCTION, /Options offered to the person for what to do next/);
   assert.match(classifier.INSTRUCTION, /Conditional or retrospective advice in a finished report/);
   assert.match(classifier.INSTRUCTION, /RUNNING only when something will wake the agent/);
   assert.match(classifier.INSTRUCTION, /while the scheduled check line says none is not RUNNING/);
@@ -286,49 +285,4 @@ test('a RUNNING verdict falls to the rules only when a trusted footer, the proce
   assert.equal(activity({ ...idle, ...wakeup(at - 20 * 60e3) }, { now: at }).decision.rule, 'conversation-ready');
   // A long-running service is not something that wakes the session.
   assert.equal(activity({ ...idle, backgroundJobs: { caughtUp: true, jobs: [{ id: 's1', kind: 'service', status: 'pending' }] } }).decision.rule, 'conversation-ready');
-});
-
-test('unread history (history-gap) is not running work, for the model and once the other sources cover it', () => {
-  const settled = { caughtUp: true, gapSettled: true, gapReason: 'transcript-replaced', jobs: [] };
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: settled }), /Keep tracks for this session: none running/);
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapSettled: false } }), /still running/, 'an unsettled gap stays unknown');
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap'], backgroundJobs: { ...settled, gapReason: 'hook-transcript-mismatch' } }), /still running/);
-  assert.match(classifier.input({ ...base, unknownBackgroundJobs: ['history-gap', 'b1'], backgroundJobs: settled }), /still running/);
-  // The waker rule still treats unread history as unknown: a cron in it shows nowhere else.
-  const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
-  const covered = { ...base, lastAssistantFull: 'Checked in on the card; it is done.', stopVerdict: { verdict: 'running', reason: 'background still running' },
-    footer, footerTrusted: true, agentShells: 0, companionComplete: true, unknownBackgroundJobs: ['history-gap'], backgroundJobs: settled };
-  assert.equal(activity(covered).decision.rule, 'model-running');
-});
-
-test('a paneless session waiting only on its card is marked cardOnlyWait; any background evidence clears it', () => {
-  const gone = { ...base, pane: undefined, runtime: { state: 'unknown' }, lastAssistantFull: 'Logged the pass; next check in 4 hours.' };
-  const card = { task: { status: 'waiting', check_after: '2030-01-01T00:00', sessions: [{ id: 's1' }] } };
-  assert.equal(activity(gone, card).cardOnlyWait, true);
-  assert.equal(activity({ ...gone, pendingBackground: true }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, unknownBackgroundJobs: ['b1'] }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, lifecycleAgents: [{ id: 'a' }] }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, runtime: { state: 'external' } }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, footer: { recognized: true, shells: 1, agents: 0, running: true } }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, agentShells: 1 }, card).cardOnlyWait, false);
-  assert.equal(activity({ ...gone, companionComplete: false }, card).cardOnlyWait, false);
-  // Unread history cannot hide live work once the process is gone.
-  assert.equal(activity({ ...gone, unknownBackgroundJobs: ['history-gap'] }, card).cardOnlyWait, true);
-  assert.equal(activity(base, card).cardOnlyWait, false, 'a live pane is never card-only');
-});
-
-test('an ASKS verdict outranks a declared waiting handoff and the card\'s own review', () => {
-  const at = Date.parse('2026-09-26T09:00');
-  const asks = { verdict: 'asks', reason: 'offers two next steps' };
-  const text = 'Scheduled the check for the 28th. Next: shrink the bundle, or move on to step 4.';
-  const session = { ...base, taskId: 't', lastAssistantFull: text, turnStartedAt: at - 60e3, lastUserAt: at - 60e3, stopVerdict: asks };
-  const task = { status: 'waiting', check_after: '2030-09-28T16:34', check: 'read it', scheduled_by: 's1',
-    scheduled_at: new Date(at - 30e3).toISOString(), scheduled_for: '2030-09-28T16:34', scheduled_intent: 'waiting', sessions: [{ id: 's1' }] };
-  assert.equal(activity({ ...session, stopVerdict: { verdict: 'running' } }, { task, now: at }).decision.rule, 'conversation-wait', 'RUNNING leaves the handoff');
-  const asked = activity(session, { task, now: at });
-  assert.equal(asked.decision.rule, 'model-asks');
-  assert.equal(asked.request.detail, text);
-  assert.equal(activity(session, { task: { ...task, status: 'review' }, now: at }).decision.rule, 'model-asks');
-  // Keep's own unattended sessions keep their declared handoff.
-  assert.equal(activity({ ...session, unattended: true }, { task, now: at }).decision.rule, 'conversation-wait');
 });

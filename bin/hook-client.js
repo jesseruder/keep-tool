@@ -17,6 +17,9 @@
 //                                    have reached the daemon, which sizes the next
 //                                    ones; an hour old, it is no longer believed.
 //   ~/.keep-node/hook.log            what the queue dropped, and why.
+//   ~/.keep-node/replay-locks/<sid>.lock  { pid, at }: the hook replaying this
+//                                    session's queued entries now; another hook
+//                                    leaves them to it.
 //   ~/.keep-node/hook-context.json   { at, steps, sessions: { <sid>: { repairSession, at } } }:
 //                                    what GET /api/hook/context last said, asked
 //                                    again after a minute and kept past it.
@@ -139,6 +142,7 @@ function queueDir(env) { return path.join(stateDir(env), 'hook-queue'); }
 function logFile(env) { return path.join(stateDir(env), 'hook.log'); }
 function linkFile(env) { return path.join(stateDir(env), 'link.json'); }
 function replayStateFile(env) { return path.join(stateDir(env), 'hook-queue.state.json'); }
+function replayLockFile(env, sid) { return path.join(stateDir(env), 'replay-locks', `${sid}.lock`); }
 const LOG_MAX_BYTES = 1024 * 1024;
 
 // One line to ~/.keep-node/hook.log, the file cut short when it grows past 1 MiB.
@@ -406,6 +410,15 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       bytes: readRange(plan.path, start, end).toString('base64'),
     });
     const advance = (sent) => { try { writeAtomic(cursorFile(env, mirrorId), { generation: plan.generation, sent }); } catch {} };
+    // A 409 is the daemon saying where its mirror is, and running out of resends is
+    // not a refusal for good: another hook of this session was moving the mirror
+    // meanwhile (two replays at once, or a replay and a live event). The event stays
+    // queued, and the cursor goes where the daemon last said, so the next replay
+    // starts there instead of where this one began.
+    const mirrorMoved = (needFrom) => {
+      if (plan && needFrom <= plan.size) advance(needFrom);
+      return { ok: false, retry: true, why: `the mirror moved ${resends + 1} times during this post; will resend from ${needFrom}` };
+    };
     let response;
     try {
       // Every chunk of a long delta but the last goes on its own, each sized to what
@@ -445,7 +458,8 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
           advance(from);
           continue;
         }
-        if (chunk.status === 409 && Number.isSafeInteger(value.needFrom) && resends < NEED_FROM_RETRIES) {
+        if (chunk.status === 409 && Number.isSafeInteger(value.needFrom)) {
+          if (resends >= NEED_FROM_RETRIES) return mirrorMoved(value.needFrom);
           resends += 1;
           from = value.needFrom;
           // Planned again: the mirror may now hold more than this event saw.
@@ -463,7 +477,8 @@ async function deliver({ event, input, identity, key, transcriptPath, snapshot, 
       return { ok: false, retry: true, link: true, why: error.message };
     }
     const value = parsed(response) || {};
-    if (response.status === 409 && Number.isSafeInteger(value.needFrom) && resends < NEED_FROM_RETRIES) {
+    if (response.status === 409 && Number.isSafeInteger(value.needFrom)) {
+      if (resends >= NEED_FROM_RETRIES) return mirrorMoved(value.needFrom);
       resends += 1;
       from = value.needFrom;
       continue;
@@ -529,6 +544,68 @@ function enqueue(env, entry) {
   for (const name of all.slice(0, Math.max(0, all.length - QUEUE_MAX))) { try { fs.unlinkSync(path.join(dir, name)); } catch {} }
 }
 
+// A replay lock older than this is its holder's leftover (a hook killed at its
+// timeout never reaches its finally): no hook's replay runs past its own budget, and
+// the longest budget twice over, plus a replay's own bound, is past any of them.
+const REPLAY_LOCK_STALE_MS = 2 * Math.max(...Object.values(BUDGET_MS)) + REPLAY_MS;
+
+function pidAlive(pid) {
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false;
+  try { process.kill(pid, 0); return true; } catch (error) { return error.code === 'EPERM'; }
+}
+
+// Takes this session's replay lock: true when this hook now holds it, false when
+// another live hook does. Two hooks of one session (a start and a lifecycle event, a
+// stop and a notification) run as separate processes, and two replays of the same
+// entries at once interleave their chunks and push each other's mirror offsets back
+// and forth until the daemon's 409s run out. A lock whose holder is gone, or older
+// than REPLAY_LOCK_STALE_MS, is taken over. Never waits: the holder is already
+// replaying these entries. Best effort only: two hooks that both find the lock stale
+// in the same instant may both take it, and the 409s they then cause stay queued.
+// The lock is between processes, so it goes by the real clock, never a test's.
+function takeReplayLock(env, sid) {
+  if (!SESSION_RE.test(String(sid))) return true;
+  const file = replayLockFile(env, sid);
+  const at = Date.now();
+  const body = `${JSON.stringify({ pid: process.pid, at })}\n`;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      let fd;
+      try { fd = fs.openSync(file, 'wx', 0o600); } catch (error) {
+        if (error.code !== 'ENOENT') throw error;
+        fs.mkdirSync(path.dirname(file), { recursive: true, mode: 0o700 });
+        fd = fs.openSync(file, 'wx', 0o600);
+      }
+      try { fs.writeSync(fd, body); } finally { fs.closeSync(fd); }
+      return true;
+    } catch (error) {
+      // A lock that cannot be made at all (a full disk, a read-only home) must not
+      // stop the queue: the replay goes on unlocked, as it did before there were locks.
+      if (error.code !== 'EEXIST') return true;
+    }
+    const held = readJson(file);
+    // A lock being written (read empty) is held.
+    if (!held) {
+      let age = 0;
+      try { age = at - fs.statSync(file).mtimeMs; } catch { continue; }
+      if (age < REPLAY_LOCK_STALE_MS) return false;
+    } else if (Number.isFinite(held.at) && at - held.at < REPLAY_LOCK_STALE_MS
+      && (held.pid === process.pid || pidAlive(held.pid))) {
+      // This process's own other replay counts as a holder too.
+      return false;
+    }
+    try { fs.unlinkSync(file); } catch {}
+  }
+  return false;
+}
+
+// Gives the lock back, only when it is still this hook's.
+function releaseReplayLock(env, sid) {
+  const file = replayLockFile(env, sid);
+  const held = readJson(file);
+  if (held && held.pid === process.pid) { try { fs.unlinkSync(file); } catch {} }
+}
+
 // Replays the queue until it is empty, the daemon stops answering, or the time is
 // up. An entry the daemon answered, or refused for good, is removed.
 //
@@ -540,6 +617,11 @@ function enqueue(env, entry) {
 // replay time. A failure the daemon answered skips only that
 // session's remaining entries; one it did not answer, or the time running out, stops
 // the replay, since the next entry would meet the same link.
+//
+// One hook replays a session's entries at a time (takeReplayLock): a hook that finds
+// another replaying a session leaves that session's entries to it, and its own event
+// of that session queues behind them. Every entry removed without the daemon having
+// taken it says why in hook.log.
 async function replayQueue({ env, where, token, deadline, deps }) {
   const now = deps.now || Date.now;
   const stalled = readStalled(env, now());
@@ -547,33 +629,51 @@ async function replayQueue({ env, where, token, deadline, deps }) {
   for (const name of queueFiles(env)) {
     const file = path.join(queueDir(env), name);
     const entry = readJson(file);
-    if (!entry || !EVENTS.includes(entry.event) || !entry.body || !entry.body.identity) { try { fs.unlinkSync(file); } catch {} continue; }
+    if (!entry || !EVENTS.includes(entry.event) || !entry.body || !entry.body.identity) {
+      try { fs.unlinkSync(file); } catch {}
+      logLine(env, `dropped queue entry ${name}: it is not an event this node can replay`);
+      continue;
+    }
     entries.push({ file, entry, session: entry.body.identity.sessionId });
   }
   const isStalled = (item) => Object.hasOwn(stalled, item.session);
   const ordered = [...entries.filter((item) => !isStalled(item)), ...entries.filter(isStalled)];
   const failed = new Set();
+  // The sessions this replay holds the lock of, and those another hook is replaying.
+  const held = new Set();
+  const busy = new Set();
   let sent = 0;
-  for (const { file, entry, session } of ordered) {
-    if (now() >= deadline) break;
-    if (failed.has(session)) continue;
-    // Another hook's replay may have delivered it since the queue was read.
-    if (!fs.existsSync(file)) continue;
-    const result = await deliver({
-      event: entry.event, input: entry.body.input, identity: entry.body.identity, key: entry.body.idempotencyKey,
-      transcriptPath: entry.body.transcriptPath, snapshot: entry.body.transcript || null, deadline, where, token, env, deps,
-    });
-    if (!result.ok && result.retry) {
-      failed.add(session);
-      updateStalled(env, { stalls: { [session]: now() }, at: now() });
-      if (result.link || result.why === 'out of time') break;
-      continue;
+  try {
+    for (const { file, entry, session } of ordered) {
+      if (now() >= deadline) break;
+      if (failed.has(session) || busy.has(session)) continue;
+      if (!held.has(session)) {
+        if (!takeReplayLock(env, session)) { busy.add(session); continue; }
+        held.add(session);
+      }
+      // Another hook's replay may have delivered it since the queue was read.
+      if (!fs.existsSync(file)) continue;
+      const result = await deliver({
+        event: entry.event, input: entry.body.input, identity: entry.body.identity, key: entry.body.idempotencyKey,
+        transcriptPath: entry.body.transcriptPath, snapshot: entry.body.transcript || null, deadline, where, token, env, deps,
+      });
+      if (!result.ok && result.retry) {
+        failed.add(session);
+        updateStalled(env, { stalls: { [session]: now() }, at: now() });
+        if (result.link || result.why === 'out of time') break;
+        continue;
+      }
+      // Delivered, or answered for good: a stale transcript, a refusal, or a hook the
+      // daemon ran and stopped. Only a delivery goes unlogged.
+      if (!result.ok) {
+        const reason = result.why || result.code || 'the daemon refused it';
+        logLine(env, `dropped queued ${entry.event} for session ${session} (seq ${entry.seq}): ${reason}`);
+      }
+      try { fs.unlinkSync(file); } catch {}
+      sent += 1;
     }
-    if (result.stale) {
-      logLine(env, `dropped queued ${entry.event} for session ${entry.body.identity.sessionId} (seq ${entry.seq}): ${result.why}`);
-    }
-    try { fs.unlinkSync(file); } catch {}
-    sent += 1;
+  } finally {
+    for (const session of held) releaseReplayLock(env, session);
   }
   // A stalled session whose entries have all gone no longer goes last. The queue is
   // read once for every session it still holds.
@@ -935,7 +1035,7 @@ function report(env = process.env) {
 
 module.exports = {
   runHook, runBashHook, runCodexToolHook, runPiHook, deliver, logLine, replayQueue, enqueue, dropSession, fitInput, report, generationOf, snapshotOf, stateDir, queueDir, cursorFile, logFile,
-  hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, chunkSize, chunkTimeout,
+  hookContext, contextFile, CONTEXT_TTL_MS, linkFile, replayStateFile, replayLockFile, REPLAY_LOCK_STALE_MS, NEED_FROM_RETRIES, chunkSize, chunkTimeout,
   EVENTS, CLAUDE_EVENTS, CODEX_EVENTS, PI_EVENTS, TRANSCRIPTLESS, QUEUED, ENDS, BUDGET_MS, QUEUE_MAX,
   CHUNK_BYTES, CHUNK_MIN, CHUNK_MAX, CHUNK_FIRST, CHUNK_FLOOR_MS, STALL_TTL_MS, LINK_TTL_MS, INPUT_MAX_BYTES, TEXT_CAPS, FORWARDED_ENV,
 };

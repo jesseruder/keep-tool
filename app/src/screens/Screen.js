@@ -2,7 +2,6 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react'
 import {
   AppState,
   KeyboardAvoidingView,
-  Platform,
   Pressable,
   ScrollView,
   StyleSheet,
@@ -335,9 +334,8 @@ export default function Screen({
   const terminalWidth = Math.max(bodyWidth, cols * fontSize * CELL_WIDTH_EM + BODY_PADDING * 2);
   const inputDisabled = inputBusy || keyBusy || history.active;
 
-  // Android: App.js pads every screen above the keyboard; padding here too would double it.
   return (
-    <KeyboardAvoidingView behavior={Platform.OS === 'ios' ? 'padding' : undefined} style={styles.root}>
+    <KeyboardAvoidingView behavior="padding" style={styles.root}>
       <View style={styles.header}>
         <View style={styles.headerTop}>
           <Pressable accessibilityRole="button" onPress={onBack} style={({ pressed }) => [styles.back, pressed && { opacity: 0.7 }]}>

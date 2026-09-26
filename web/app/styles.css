@@ -908,19 +908,11 @@ html.mobile .mobile-sheet .health dl { grid-template-columns: 96px 1fr; }
 /* Triage: the queue is the screen, and a selected row pushes the stage over it. */
 html.mobile #triage { flex-direction: column; min-width: 0; }
 html.mobile #triage .rail, html.mobile #triage .queue-strip { display: none; }
-/* The column stacks the queue and the stage; min-height: 0 lets each be only as tall
-   as the screen, so its own list scrolls instead of the whole column growing past the
-   screen, where body clips it and nothing scrolls at all. */
-html.mobile #triage .queue, html.mobile #triage .queue.collapsed { display: flex; width: 100%; min-width: 0; min-height: 0; flex: 1; border-right: 0; }
-html.mobile #triage .qlist { min-height: 0; }
+html.mobile #triage .queue, html.mobile #triage .queue.collapsed { display: flex; width: 100%; min-width: 0; flex: 1; border-right: 0; }
 html.mobile #triage .qhead .collapse { display: none; }
 html.mobile #triage .stage { display: none; }
 html.mobile.mobile-stage-open #triage .queue { display: none; }
-html.mobile.mobile-stage-open #triage .stage { display: flex; flex: 1; min-width: 0; min-height: 0; }
-/* On a phone the stage scrolls as one page: a long card or brief would otherwise
-   squeeze the terminal panel under it to nothing, with no way to reach its button. */
-html.mobile.mobile-stage-open #triage .stage { overflow-y: auto; }
-html.mobile #triage .stage-body { flex: 1 0 auto; min-height: 200px; }
+html.mobile.mobile-stage-open #triage .stage { display: flex; flex: 1; min-width: 0; }
 .mobile-stagebar { display: none; }
 html.mobile.mobile-stage-open #triage .mobile-stagebar {
   display: flex; align-items: center; gap: 10px; flex: none; min-height: 48px;

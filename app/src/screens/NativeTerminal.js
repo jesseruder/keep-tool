@@ -697,9 +697,6 @@ export default function NativeTerminal({ colors, config, onBack, onOpenSession, 
               keyboardShouldPersistTaps="always"
               nestedScrollEnabled
               onContentSizeChange={() => { if (followRef.current) scrollRef.current?.scrollToEnd({ animated: false }); }}
-              // The keyboard opening shrinks the view (App.js pads every screen above it);
-              // a reader at the bottom stays there, so the prompt being typed into is seen.
-              onLayout={() => { if (followRef.current) scrollRef.current?.scrollToEnd({ animated: false }); }}
               onScroll={onScroll}
               ref={scrollRef}
               scrollEventThrottle={64}

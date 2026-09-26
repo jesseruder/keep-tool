@@ -787,6 +787,117 @@ test('every stalled session goes last, so two stuck sessions cannot starve a hea
   assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(stateFile, 'utf8')).stalled).sort(), ['sess-a', 'sess-b']);
 });
 
+// A replay driven in-process: `answer(payload, url)` answers each post, and the
+// queue is the fixture's.
+function queued(client, env, session, extra = {}) {
+  client.enqueue(env, { event: 'notification', body: { input: { session_id: session, cwd: '/x', notification_type: 'idle_prompt' },
+    identity: { agent: 'claude', sessionId: session }, idempotencyKey: `k-${session.padEnd(16, '0')}`, ...extra } });
+}
+const replayWith = (client, env, answer) => {
+  const posts = [];
+  const request = async (url, pathname, options) => {
+    if (options.method === 'GET') return { status: 404, data: '{"error":"not found"}' };
+    posts.push(options.payload);
+    return answer(options.payload);
+  };
+  const run = () => client.replayQueue({ env, where: { url: 'http://127.0.0.1:1' }, token: 't', deadline: Date.now() + 10_000, deps: { request } });
+  return { posts, run };
+};
+const answered = { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '' }) };
+
+test('a queued entry the daemon refuses for good is dropped with a line in hook.log saying why', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const env = { HOME: f.home };
+  queued(client, env, 'sess-refused');
+  queued(client, env, 'sess-ok');
+  const r = replayWith(client, env, (payload) => (payload.identity.sessionId === 'sess-refused'
+    ? { status: 400, data: JSON.stringify({ error: 'the session is not one this node runs', code: 'foreign-session' }) } : answered));
+  assert.equal(await r.run(), 2);
+  assert.deepEqual(f.queue(), []);
+  const log = fs.readFileSync(client.logFile(env), 'utf8');
+  assert.match(log, /dropped queued notification for session sess-refused \(seq 1\): the session is not one this node runs\n/);
+  assert.doesNotMatch(log, /sess-ok/, 'a delivery is not logged');
+});
+
+test('a 409 storm past the resend limit leaves the entry queued, the cursor at the last needFrom, and the session stalled', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const env = { HOME: f.home };
+  fs.writeFileSync(f.transcript, 'x'.repeat(4000));
+  const snapshot = client.snapshotOf(f.transcript);
+  client.enqueue(env, { event: 'session-start', body: { input: { session_id: 'sess-aws1', hook_event_name: 'SessionStart' },
+    identity: { agent: 'claude', sessionId: 'sess-aws1' }, idempotencyKey: 'k'.repeat(32), transcriptPath: f.transcript, transcript: snapshot } });
+  // Another hook keeps moving the mirror: each post is told a different place.
+  let at = 0;
+  const r = replayWith(client, env, () => { at += 100; return { status: 409, data: JSON.stringify({ error: 'resend', needFrom: at }) }; });
+  assert.equal(await r.run(), 0);
+  assert.equal(r.posts.length, client.NEED_FROM_RETRIES + 1);
+  assert.deepEqual(f.queue().map((entry) => entry.event), ['session-start'], 'still queued');
+  assert.deepEqual(JSON.parse(fs.readFileSync(client.cursorFile(env, 'sess-aws1'), 'utf8')), { generation: snapshot.generation, sent: at });
+  assert.deepEqual(Object.keys(JSON.parse(fs.readFileSync(client.replayStateFile(env), 'utf8')).stalled), ['sess-aws1']);
+  assert.equal(fs.existsSync(client.logFile(env)), false, 'nothing was dropped');
+
+  // The next replay starts where the daemon last said, and delivers.
+  const next = replayWith(client, env, () => answered);
+  assert.equal(await next.run(), 1);
+  assert.deepEqual(next.posts.map((post) => post.transcript.fromOffset), [at]);
+  assert.deepEqual(f.queue(), []);
+
+  // A chunk answered with 409s past the limit is the same: resent later, from there.
+  fs.writeFileSync(f.transcript, 'y'.repeat(client.CHUNK_FIRST * 3));
+  const d = driven(f, (payload) => ({ status: 409, data: JSON.stringify({ error: 'resend', needFrom: 10 }) }));
+  const result = await d.run({ snapshot: client.snapshotOf(f.transcript), deadline: 10_000 });
+  assert.deepEqual(result, { ok: false, retry: true, why: `the mirror moved ${client.NEED_FROM_RETRIES + 1} times during this post; will resend from 10` });
+  assert.equal(JSON.parse(fs.readFileSync(client.cursorFile(env, 'sess-aws1'), 'utf8')).sent, 10);
+});
+
+test('one hook replays a session at a time: a second replay leaves that session to the first and still replays the others', async (t) => {
+  const f = fixture(t);
+  const client = require('./hook-client.js');
+  const env = { HOME: f.home };
+  queued(client, env, 'sess-a');
+  queued(client, env, 'sess-b');
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  const first = replayWith(client, env, async (payload) => {
+    if (payload.identity.sessionId === 'sess-a') await gate;
+    return answered;
+  });
+  const running = first.run();
+  // The first replay is inside sess-a's post, holding its lock.
+  while (!first.posts.length) await new Promise((resolve) => setImmediate(resolve));
+  assert.equal(fs.existsSync(client.replayLockFile(env, 'sess-a')), true);
+  const second = replayWith(client, env, () => answered);
+  assert.equal(await second.run(), 1);
+  assert.deepEqual(second.posts.map((post) => post.identity.sessionId), ['sess-b'], 'sess-a left to the replay holding it');
+  release();
+  assert.equal(await running, 1);
+  assert.deepEqual(first.posts.map((post) => post.identity.sessionId), ['sess-a'], 'sess-b was already delivered');
+  assert.deepEqual(f.queue(), []);
+  assert.equal(fs.existsSync(client.replayLockFile(env, 'sess-a')), false, 'released');
+  assert.equal(fs.existsSync(client.replayLockFile(env, 'sess-b')), false, 'released');
+
+  // Another live process's lock is honoured; a dead one's, or one past its bound, is taken over.
+  const lock = (session, value) => {
+    fs.mkdirSync(path.dirname(client.replayLockFile(env, session)), { recursive: true });
+    fs.writeFileSync(client.replayLockFile(env, session), JSON.stringify(value));
+  };
+  queued(client, env, 'sess-live');
+  queued(client, env, 'sess-dead');
+  queued(client, env, 'sess-old');
+  const dead = spawn(process.execPath, ['-e', '']);
+  await new Promise((resolve) => dead.once('exit', resolve));
+  lock('sess-live', { pid: process.ppid, at: Date.now() });
+  lock('sess-dead', { pid: dead.pid, at: Date.now() });
+  lock('sess-old', { pid: process.ppid, at: Date.now() - client.REPLAY_LOCK_STALE_MS - 1000 });
+  const third = replayWith(client, env, () => answered);
+  assert.equal(await third.run(), 2);
+  assert.deepEqual(third.posts.map((post) => post.identity.sessionId), ['sess-dead', 'sess-old']);
+  assert.deepEqual(f.queue().map((entry) => entry.body.identity.sessionId), ['sess-live']);
+  assert.equal(fs.existsSync(client.replayLockFile(env, 'sess-live')), true, 'not this replay\'s to remove');
+});
+
 // ---------- pre-bash ----------
 
 const CONTEXT = { status: 200, body: { steps: ['terraform apply'], repairSession: false } };
