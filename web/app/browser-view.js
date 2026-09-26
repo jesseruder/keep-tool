@@ -281,7 +281,8 @@ function startView(root, ctx, request, key) {
     } else if (message.t === 'state') {
       if (message.state === 'detached') setStatus('reconnecting to the tab');
       else if (message.state === 'tab-closed') { tabId = null; send({ t: 'tabs' }); }
-      else if (message.state === 'error') setStatus(message.reason || 'the view stopped');
+      // A restart after the tab detached failed: a click tries again.
+      else if (message.state === 'error') { needsStart = true; setStatus(`${message.reason || 'the view stopped'} · click to retry`); }
       else if (message.state === 'taken-over') { needsStart = true; setStatus('another view opened this tab · click to take it back'); }
       else if (message.state === 'stopped') { needsStart = true; setStatus(`the view stopped${message.reason ? `: ${message.reason}` : ''} · click to restart`); }
     } else if (message.t === 'error') {

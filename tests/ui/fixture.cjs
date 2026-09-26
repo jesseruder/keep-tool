@@ -60,6 +60,7 @@ async function createFixture() {
   state.browserViews = [];
   const secretWrites = [];
   let secretRefusal = null;
+  const browserClients = new Set();
   let browserTabs = [
     { id: 11, url: 'https://app.example.test/', title: 'App', active: true, popup: false },
     { id: 12, url: 'https://accounts.example.test/signin', title: 'Sign in', active: false, popup: true, openerTabId: 11 },
@@ -425,6 +426,8 @@ async function createFixture() {
       // frame at the size the view asks for, every time it asks.
       sockets.handleUpgrade(req, socket, head, client => {
         const pane = decodeURIComponent(browserPane[1]);
+        browserClients.add(client);
+        client.on('close', () => browserClients.delete(client));
         record('browser', { pane, t: 'connect', session: url.searchParams.get('session') });
         client.send(JSON.stringify({ t: 'open', node: null, session: `#${url.searchParams.get('session')}`, extensionConnected: true }));
         client.send(JSON.stringify({ t: 'tabs', tabs: browserTabs }));
@@ -466,6 +469,8 @@ async function createFixture() {
   });
   await new Promise(resolve => server.listen(0, '127.0.0.1', resolve));
   return { url: `http://127.0.0.1:${server.address().port}`, events, state, portableTransfers, secretWrites, update, publish, churn,
+    // What the bridge would say to every open browser view, e.g. a viewer_state.
+    browserSend: message => { for (const client of browserClients) client.send(JSON.stringify(message)); },
     configure: options => {
       if ('secretRequests' in options) { state.secretRequests = options.secretRequests; publish(); }
       if ('browserViews' in options) { state.browserViews = options.browserViews; publish(); }

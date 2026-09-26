@@ -13,7 +13,7 @@
 // until the viewer says it has drawn one: at most MAX_UNACKED frames are ever in flight,
 // which is what keeps a slow link from queueing seconds of stale pictures.
 
-import { attach, isAttached, onOwnDetach, send } from "./cdp.js";
+import { attach, detach, isAttached, onOwnDetach, send } from "./cdp.js";
 import { allSessions, tabsInGroup } from "./sessions.js";
 import { CTRL, META, macCommands } from "./keys.js";
 
@@ -118,6 +118,29 @@ export function createViewerHandlers() {
       }
     }
     viewer.emit({ event: "viewer_state", viewer: viewer.id, state: "stopped", reason });
+    await releaseTab(tabId);
+  }
+
+  /**
+   * Detach a tab only a view was holding: a pop-up, or a tab of a session that has ended.
+   * A live session's tab stays attached for its tools, and so does one another view is
+   * watching. Otherwise headed Edge would keep its "being debugged" bar after the view.
+   */
+  async function releaseTab(tabId) {
+    if (!isAttached(tabId)) return;
+    for (const other of viewers.values()) if (other.tabId === tabId) return;
+    try {
+      const tab = await chrome.tabs.get(tabId);
+      if (tab.groupId != null && tab.groupId >= 0) {
+        const store = await allSessions();
+        if (Object.values(store).some((record) => record?.groupId === tab.groupId && !record.ended)) return;
+      }
+    } catch {
+      return; // the tab is gone, and its attachment with it
+    }
+    // A view may have taken the tab while that was looked up.
+    for (const other of viewers.values()) if (other.tabId === tabId) return;
+    await detach(tabId);
   }
 
   function otherViewerFits(tabId, exceptId) {
@@ -349,6 +372,7 @@ export function createViewerHandlers() {
         } catch {
           // the old tab went away
         }
+        await releaseTab(previous);
       }
       if (!viewer) {
         viewer = { id: params.viewer, seq: 0, stopped: false };

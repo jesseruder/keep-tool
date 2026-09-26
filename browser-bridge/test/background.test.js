@@ -81,7 +81,7 @@ globalThis.chrome = {
     onRemoved: { addListener: (fn) => state.listeners.tabsRemoved.push(fn) },
     async query({ groupId }) {
       await tick();
-      return [...state.tabs.values()].filter((tab) => tab.groupId === groupId);
+      return [...state.tabs.values()].filter((tab) => groupId === undefined || tab.groupId === groupId);
     },
     async get(id) {
       await tick();
@@ -551,6 +551,27 @@ test("a session renamed after it started retitles its group, by hello or by requ
   assert.equal((await waitFor(() => replyFor("w9_c1"), "the reply")).ok, true);
   assert.equal(state.groups.get(session.group.groupId).title, "#405 fix");
   assert.equal((await sessions.getSession("unnamed")).name, "#405 fix");
+});
+
+test("a view lets go of a tab only it held, and leaves a live session's tab attached", async () => {
+  const session = await makeSession("viewed", "#77 card");
+  const popup = { id: state.nextTabId++, windowId: 3, groupId: -1, openerTabId: session.tab.id, url: "https://accounts.example", title: "Sign in" };
+  state.tabs.set(popup.id, popup);
+  const call = async (id, method, params) => {
+    deliver({ id, method, params });
+    return waitFor(() => replyFor(id), `the reply to ${id}`);
+  };
+  const view = (viewer, tabId) => ({ viewer, session: "#77", tabId, width: 800, height: 600, fit: true });
+
+  assert.equal((await call("v_1", "viewer_start", view("v1", popup.id))).ok, true);
+  assert.equal((await call("v_2", "viewer_stop", { viewer: "v1" })).ok, true);
+  await waitFor(() => state.detachCalls.includes(popup.id), "the pop-up detached");
+
+  const before = state.detachCalls.length;
+  assert.equal((await call("v_3", "viewer_start", view("v2", session.tab.id))).ok, true);
+  assert.equal((await call("v_4", "viewer_stop", { viewer: "v2" })).ok, true);
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(state.detachCalls.length, before, "a live session's tab stays attached");
 });
 
 test("an ended session that comes back takes its group out of (ended)", async () => {

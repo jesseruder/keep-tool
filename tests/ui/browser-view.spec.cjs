@@ -129,3 +129,18 @@ test('the view shows only on the session that asked', async ({ page }) => {
   await expect(panel(page)).toBeVisible();
   await expect.poll(() => browserEvents().filter(e => e.t === 'connect').length).toBe(2);
 });
+
+test('a view whose restart failed after its tab detached restarts on a click', async ({ page }) => {
+  fixture.configure({ browserViews: [view({ tabId: 11 })] });
+  await expect(panel(page).locator('.bv-status')).toBeHidden();
+  const starts = () => browserEvents().filter(e => e.t === 'start').length;
+  for (let seen = -1; seen !== starts();) { seen = starts(); await page.waitForTimeout(500); }
+  const before = starts();
+
+  fixture.browserSend({ t: 'state', state: 'error', reason: 'Debugger is not attached' });
+  await expect(panel(page).locator('.bv-status')).toContainText('click to retry');
+  await panel(page).locator('.bv-screen').click();
+  await expect.poll(starts).toBe(before + 1);
+  expect(browserEvents().filter(e => e.t === 'start').at(-1).tabId).toBe(11);
+  await expect(panel(page).locator('.bv-status')).toBeHidden();
+});
