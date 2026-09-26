@@ -611,9 +611,10 @@ function KeepShell() {
                 colors={terminalColors}
                 config={config}
                 onBack={() => nav.goBack()}
-                // A session a reference in this terminal names opens on top, so Back
-                // returns to the terminal it was tapped in.
-                onOpenSession={(target) => nav.push('Terminal', { target })}
+                // A session a reference in this terminal names takes this screen's
+                // place: a stack of terminals would each keep its pane socket and
+                // polls open behind the one on screen.
+                onOpenSession={(target) => nav.replace('Terminal', { target })}
                 target={route.params?.target}
               />
             </Frame>

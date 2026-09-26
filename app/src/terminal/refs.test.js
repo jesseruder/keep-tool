@@ -17,9 +17,21 @@ const CORPUS = [
   'landed 3229e2e and f92d3c2eb8401, (caca843). deadbeef 1234567 b1ecee59-908c-413e a/3229e2e #abc1234 0x3229e2e',
 ];
 
+// Lines built from the pieces the rules turn on (boundaries, exclusions, hex, slugs,
+// brackets), from a fixed seed so a failure reproduces.
+function generatedLines(count) {
+  const pieces = ['#', '12', '453', '7', 'PR ', 'pr#', 'issue (', 'pull request ', 'color: ', 'fill="', 'castle', '-', '--', 'a1b2c3d',
+    '3229e2e', 'deadbeef', 'f00d1234567', '[', ']', 'device:android-box', ', ', 'db:main', 'hold-', 'mfq2x1ab', '/', '.', '.js', 'x', ' ',
+    '(', ')', '&', '0x', ':', '@', '=', '"', '`', 'keep-compact', 'task-2', 'é', '界', '🙂', '\t', 'https://a-b.dev/', 'b1ecee59-908c'];
+  let seed = 453;
+  const random = () => { seed = (seed * 1103515245 + 12345) % 2147483648; return seed / 2147483648; };
+  return Array.from({ length: count }, () => Array.from({ length: 4 + Math.floor(random() * 14) },
+    () => pieces[Math.floor(random() * pieces.length)]).join(''));
+}
+
 test('the app finds what the console finds, on every line', async () => {
   const web = await import(pathToFileURL(path.join(__dirname, '../../../web/app/terminal-refs.js')).href);
-  for (const line of CORPUS) {
+  for (const line of [...CORPUS, ...generatedLines(3000)]) {
     for (const name of ['findSessionRefs', 'findCardRefs', 'findHoldRefs', 'findShaRefs']) {
       assert.deepEqual(refs[name](line), web[name](line), `${name} on: ${line}`);
     }

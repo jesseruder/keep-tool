@@ -327,20 +327,28 @@ export default function NativeTerminal({ colors, config, onBack, onOpenSession, 
 
   // The sessions, cards and holds a row's references are checked against, re-read
   // while the screen is open. A failed read keeps what the last one had.
+  // Each half keeps its last good answer on its own, and `known` is only replaced
+  // when an answer changed: every mounted row re-renders when it is.
   useEffect(() => {
     let live = true;
     let timer = null;
+    let last = { view: null, holds: [], signature: '' };
     const read = async () => {
-      try {
-        const [view, holds] = await Promise.all([api.refsView(config), api.holds(config).catch(() => [])]);
-        if (!live) return;
+      const [view, holds] = await Promise.all([
+        api.refsView(config).catch(() => last.view),
+        api.holds(config).catch(() => last.holds),
+      ]);
+      if (!live) return;
+      const signature = JSON.stringify([view?.sessions, view?.tasks, holds]);
+      if (view && signature !== last.signature) {
         setKnown({
-          sessions: new Map((view?.sessions || []).map((session) => [session.num, session])),
-          cards: new Map((view?.tasks || []).map((task) => [task.id, task])),
+          sessions: new Map((view.sessions || []).map((session) => [session.num, session])),
+          cards: new Map((view.tasks || []).map((task) => [task.id, task])),
           holds,
         });
-      } catch {}
-      if (live) timer = setTimeout(read, REFS_MS);
+      }
+      last = { view, holds, signature: view ? signature : last.signature };
+      timer = setTimeout(read, REFS_MS);
     };
     read();
     return () => { live = false; if (timer) clearTimeout(timer); };
@@ -761,6 +769,9 @@ export default function NativeTerminal({ colors, config, onBack, onOpenSession, 
         onCopy={(text) => { setRefTarget(null); copyRow(text); }}
         onOpenSession={(sessionId) => {
           setRefTarget(null);
+          const here = target?.session === sessionId
+            || [...(known?.sessions?.values() || [])].some((session) => session.id === sessionId && pane && session.pane === pane);
+          if (here) { note('That is this session.'); return; }
           if (onOpenSession) onOpenSession({ session: sessionId });
         }}
         project={[...(known?.sessions?.values() || [])].find((session) => session.id === target?.session || (pane && session.pane === pane))?.project || ''}
