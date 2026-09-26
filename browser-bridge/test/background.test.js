@@ -69,8 +69,10 @@ globalThis.chrome = {
       async get(key) {
         await tick();
         const value = key in state.storage ? { [key]: structuredClone(state.storage[key]) } : {};
-        // A test can hold one read open after it has taken its snapshot.
-        if (state.holdNextGet) {
+        // A test can hold one read open after it has taken its snapshot, after letting
+        // holdGetSkip reads go by.
+        if (state.holdNextGet && state.holdGetSkip > 0) state.holdGetSkip -= 1;
+        else if (state.holdNextGet) {
           const hold = state.holdNextGet;
           state.holdNextGet = null;
           await hold;
@@ -603,6 +605,51 @@ test("a view starting on a tab keeps it attached when another view lets go of it
   assert.equal((await reply("s_3")).ok, true);
   for (let i = 0; i < 20; i++) await tick();
   assert.equal(state.detachCalls.includes(popup.id), false);
+});
+
+test("a release a failed start held off happens once that start fails", async () => {
+  const session = await makeSession("failing", "#81 card");
+  const popup = { id: state.nextTabId++, windowId: 3, groupId: -1, openerTabId: session.tab.id, url: "https://accounts.example", title: "Sign in" };
+  state.tabs.set(popup.id, popup);
+  const reply = (id) => waitFor(() => replyFor(id), `the reply to ${id}`);
+  deliver({ id: "f_1", method: "viewer_start", params: { viewer: "f1", session: "#81", tabId: popup.id, width: 800, height: 600, fit: true } });
+  assert.equal((await reply("f_1")).ok, true);
+
+  let release;
+  state.holdQuery = new Promise((resolve) => { release = resolve; });
+  // A start that will be refused: the tab is not #999's.
+  deliver({ id: "f_2", method: "viewer_start", params: { viewer: "f2", session: "#999", tabId: popup.id, width: 800, height: 600 } });
+  deliver({ id: "f_3", method: "viewer_stop", params: { viewer: "f1" } });
+  await reply("f_3");
+  for (let i = 0; i < 20; i++) await tick();
+  assert.equal(state.detachCalls.includes(popup.id), false, "held off while the start was on its way");
+  state.holdQuery = null;
+  release();
+  assert.equal((await reply("f_2")).ok, false);
+  await waitFor(() => state.detachCalls.includes(popup.id), "released after the start failed");
+});
+
+test("an ended session's tab that moved into a live group is not detached", async () => {
+  const reply = (id) => waitFor(() => replyFor(id), `the reply to ${id}`);
+  const live = await makeSession("live-owner", "#82 card");
+  const gone = await makeSession("moved-from", "#83 card");
+  state.tabs.get(gone.tab.id).url = "https://example.com/moving";
+  deliver({ method: "session_closed", params: { sessionKey: "moved-from" } });
+  await waitFor(async () => (await sessions.getSession("moved-from"))?.ended, "the session ended");
+  deliver({ id: "m_1", method: "viewer_start", params: { viewer: "m1", session: "#83", tabId: gone.tab.id, width: 800, height: 600, fit: true } });
+  assert.equal((await reply("m_1")).ok, true);
+
+  // Hold the release's second read (the one under the lock) and move the tab meanwhile.
+  let release;
+  state.holdGetSkip = 1;
+  state.holdNextGet = new Promise((resolve) => { release = resolve; });
+  deliver({ id: "m_2", method: "viewer_stop", params: { viewer: "m1" } });
+  await waitFor(() => state.holdNextGet === null, "the locked read");
+  state.tabs.get(gone.tab.id).groupId = live.group.groupId;
+  release();
+  await reply("m_2");
+  for (let i = 0; i < 30; i++) await tick();
+  assert.equal(state.detachCalls.includes(gone.tab.id), false);
 });
 
 test("an ended session's tab is let go of after its view, unless the session came back", async () => {

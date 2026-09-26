@@ -130,8 +130,10 @@ export function createViewerHandlers() {
     const held = () => starting.has(tabId) || [...viewers.values()].some((other) => other.tabId === tabId);
     if (!isAttached(tabId) || held()) return;
     let owner = null;
+    let groupId = null;
     try {
       const tab = await chrome.tabs.get(tabId);
+      groupId = tab.groupId;
       if (tab.groupId != null && tab.groupId >= 0) {
         const store = await allSessions();
         owner = Object.keys(store).find((key) => store[key]?.groupId === tab.groupId) ?? null;
@@ -151,7 +153,15 @@ export function createViewerHandlers() {
     const generation = activityGeneration(owner);
     await withSessionLock(owner, async () => {
       const store = await allSessions();
-      if (!store[owner]?.ended || activityGeneration(owner) !== generation || held()) return;
+      if (!store[owner]?.ended || store[owner].groupId !== groupId) return;
+      // The tab may have moved into another (live) session's group meanwhile.
+      let tab;
+      try {
+        tab = await chrome.tabs.get(tabId);
+      } catch {
+        return;
+      }
+      if (tab.groupId !== groupId || activityGeneration(owner) !== generation || held()) return;
       await detach(tabId);
     });
   }
@@ -315,8 +325,10 @@ export function createViewerHandlers() {
       const run = serial(params.viewer, () => startNow(params, emit));
       const done = () => {
         const left = (starting.get(tabId) ?? 1) - 1;
-        if (left > 0) starting.set(tabId, left);
-        else starting.delete(tabId);
+        if (left > 0) return starting.set(tabId, left);
+        starting.delete(tabId);
+        // A release this start held off, for a start that then failed: try it now.
+        releaseTab(tabId).catch(() => {});
       };
       run.then(done, done);
       return run;

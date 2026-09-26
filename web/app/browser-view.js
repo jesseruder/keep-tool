@@ -162,6 +162,8 @@ function startView(root, ctx, request, key) {
   // needsStart came from a failed restart: a frame arriving after it means the tab came
   // back by itself, and a click is input again.
   let retryArmed = false;
+  // Counts restart errors, so a frame knows whether it arrived before or after the last.
+  let errorSeq = 0;
 
   const setStatus = (text) => {
     status.textContent = text || '';
@@ -220,7 +222,7 @@ function startView(root, ctx, request, key) {
   // Every frame is acked exactly once, drawn or not: the stream waits on those acks.
   // A frame belongs to the socket it came on: one still decoding when the view
   // reconnected is neither drawn nor acked on the new one.
-  const drawFrame = async (buffer) => {
+  const drawFrame = async ({ buffer, errors }) => {
     const from = socket;
     try {
       const { header, image } = parseFrame(buffer);
@@ -233,29 +235,32 @@ function startView(root, ctx, request, key) {
       }
       draw.drawImage(bitmap, 0, 0);
       bitmap.close?.();
-      if (retryArmed) { retryArmed = false; needsStart = false; }
+      // Only a frame that arrived after the error shows the tab came back; one that was
+      // already on its way says nothing.
+      if (retryArmed && errors === errorSeq) { retryArmed = false; needsStart = false; }
       const meta = header.metadata || {};
       device = {
         width: meta.deviceWidth || bitmap.width / (sentSize?.pixelRatio || 1),
         height: meta.deviceHeight || bitmap.height / (sentSize?.pixelRatio || 1),
       };
-      setStatus('');
+      if (!retryArmed) setStatus('');
     } finally {
       if (from === socket) send({ t: 'ack' });
     }
   };
   // One decode at a time, and only the newest waiting frame: a slow phone skips
   // pictures rather than falling behind.
-  const onFrame = async (buffer) => {
+  const onFrame = async (data) => {
+    const frame = { buffer: data, errors: errorSeq };
     if (decoding) {
       // The frame it replaces is never drawn; its ack goes back now.
       if (queued) send({ t: 'ack' });
-      queued = buffer;
+      queued = frame;
       return;
     }
     decoding = true;
     try {
-      await drawFrame(buffer);
+      await drawFrame(frame);
       while (queued && !disposed) {
         const next = queued;
         queued = null;
@@ -287,7 +292,7 @@ function startView(root, ctx, request, key) {
       if (message.state === 'detached') setStatus('reconnecting to the tab');
       else if (message.state === 'tab-closed') { tabId = null; send({ t: 'tabs' }); }
       // A restart after the tab detached failed: a click tries again.
-      else if (message.state === 'error') { needsStart = true; retryArmed = true; setStatus(`${message.reason || 'the view stopped'} · click to retry`); }
+      else if (message.state === 'error') { needsStart = true; retryArmed = true; errorSeq += 1; setStatus(`${message.reason || 'the view stopped'} · click to retry`); }
       else if (message.state === 'taken-over') { needsStart = true; retryArmed = false; setStatus('another view opened this tab · click to take it back'); }
       else if (message.state === 'stopped') { needsStart = true; retryArmed = false; setStatus(`the view stopped${message.reason ? `: ${message.reason}` : ''} · click to restart`); }
     } else if (message.t === 'error') {
