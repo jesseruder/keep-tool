@@ -736,7 +736,10 @@ export function mountTerminal(container, pane, options = {}) {
       sessionLinks?.hide();
     },
     syncVisibility() {
-      if (document.hidden) profiler.stop('hidden');
+      if (document.hidden) {
+        profiler.stop('hidden');
+        sessionLinks?.hide();
+      }
       expireRendererTrialIfNeeded();
       reportVisibility();
       if (isVisible()) show(false);
