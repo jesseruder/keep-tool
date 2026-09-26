@@ -2219,6 +2219,30 @@ test('a node registers a delegation only to a worker that is its own session or 
   assert.equal(calls.length, 0);
   assert.equal((await register('sess-aws1-b', 'd3')).status, 200);
   assert.deepEqual(calls[0].args.slice(1), ['delegate', 'card', '--step', '1', '--session', 'sess-aws1-b', '--agent', 'codex']);
+  // A number-like worker is the literal id delegate takes it as, never deferred to the
+  // CLI as a session number: sessions named 3 and s3 on the daemon node are refused,
+  // and the same names on the calling node are allowed.
+  const literal = service(t, { locations: {
+    'sess-aws1': { node: 'aws1', agent: 'claude' }, 3: { node: 'main', agent: 'codex' }, s3: { node: 'main', agent: 'codex' },
+    4: { node: 'aws1', agent: 'codex' }, s4: { node: 'aws1', agent: 'codex' },
+  } });
+  let k = 0;
+  const delegateTo = (worker) => literal.svc.handle(AWS1, body(literal.root, {
+    command: 'delegate', args: ['card', '--step', '1', '--session', worker, '--agent', 'codex'], idempotencyKey: `${KEY}-lit-${k += 1}`,
+  }));
+  for (const worker of ['3', 's3']) {
+    const answer = await delegateTo(worker);
+    assert.equal(answer.status, 403, `${worker}: ${JSON.stringify(answer.body)}`);
+    assert.match(answer.body.error, new RegExp(`a node acts only on its own sessions: ${worker} is neither the calling session`));
+  }
+  assert.equal(literal.calls.length, 0);
+  for (const worker of ['4', 's4']) {
+    const answer = await delegateTo(worker);
+    assert.equal(answer.status, 200, `${worker}: ${JSON.stringify(answer.body)}`);
+    assert.deepEqual(literal.calls.at(-1).args.slice(1), ['delegate', 'card', '--step', '1', '--session', worker, '--agent', 'codex']);
+  }
+  // A number-like target elsewhere is still the CLI's to resolve (keep.js remoteTargetRefusal).
+  assert.equal((await literal.svc.handle(AWS1, body(literal.root, { command: 'mark', args: ['s3', '--emoji', '🔥'], idempotencyKey: `${KEY}-lit-mark` }))).status, 200);
   // The other forms name no worker and need none.
   const prepared = await svc.handle(AWS1, body(root, { command: 'delegate', args: ['card', '--step', '1', '--prepare'], idempotencyKey: `${KEY}-d4` }));
   assert.equal(prepared.status, 200);

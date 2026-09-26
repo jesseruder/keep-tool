@@ -406,7 +406,13 @@ function targetRefusal(command, args, identity, { resolve, location } = {}) {
   const target = sessionTargetOf(command, args);
   if (target === null || target === undefined) return null;
   let resolved = null;
-  try { resolved = resolve ? resolve(String(target)) : null; } catch { resolved = null; }
+  // A delegation's --session is taken as the literal id it is (keep.js commands.delegate
+  // tests it against delegation.SESSION_RE and never looks up a number), so `3` or `s3`
+  // there is a session named 3 or s3, checked here, not a number the CLI resolves.
+  if (command === 'delegate') resolved = /^[A-Za-z0-9_-]{1,128}$/.test(String(target)) ? { id: String(target) } : null;
+  else {
+    try { resolved = resolve ? resolve(String(target)) : null; } catch { resolved = null; }
+  }
   // A `#n` the resolver leaves to the daemon's CLI, which checks the id it finds.
   if (resolved && resolved.deferred === true) return null;
   if (!resolved || !resolved.id) return NODE_OWN_REFUSAL(target, identity.node);
