@@ -7,9 +7,10 @@
 // A press on a link belongs to the link, not the pane: xterm would otherwise send it
 // to the agent (Claude Code takes the mouse, and a click there can press one of its
 // buttons) before the link opened. So a plain press there never reaches xterm, and
-// the link opens on release, after a pause long enough to see a double-click, which
-// instead goes through to xterm to select the word. Option, or Shift, is xterm's
-// "select, don't send" modifier and passes through untouched. (The first version
+// the link opens on release. Selecting a link's text takes Option (Shift off a Mac),
+// xterm's "select, don't send" modifier, which passes through untouched, as it must
+// anywhere an agent holds the mouse. A double-click is not waited for: the system's
+// double-click interval is unknown here and can be half a second. (The first version
 // wanted ⌘/Ctrl-click, and a plain click on a #n in the reviewer did nothing.)
 //
 // Each kind of reference is a `kind`: `find(text)` returns its spans, `has(key)`
@@ -283,17 +284,13 @@ export function refCardHTML(esc, info, { openHint = true } = {}) {
 
 // Registers one provider on an xterm for every kind.
 const CLICK_SLOP_PX = 4;
-const DOUBLE_CLICK_MS = 250;
 
-export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThis.document, doubleClickMs = DOUBLE_CLICK_MS } = {}) {
+export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThis.document } = {}) {
   let pop = null;
   let current = null;
-  // The link under the pointer (xterm's hover/leave), a press taken for it, and an
-  // open waiting out the double-click pause.
+  // The link under the pointer (xterm's hover/leave) and a press taken for it.
   let hovered = null;
   let pressed = null;
-  let pending = null;
-  const cancelPending = () => { clearTimeout(pending); pending = null; };
   const hide = () => { pop?.remove(); pop = null; current = null; };
   const place = (event) => {
     const view = doc.defaultView || globalThis;
@@ -342,13 +339,13 @@ export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThi
     },
   });
   // Capture on xterm's own element runs before its press handler (which sends the
-  // press to the pane) and before its selection starts.
+  // press to the pane) and before its selection starts; stopping immediate
+  // propagation also covers a press whose target is that element itself.
   const onPress = (event) => {
     const ref = hovered;
     if (!ref?.kind.open || event.button !== 0 || event.altKey || event.shiftKey) return;
-    if (event.detail >= 2) { cancelPending(); pressed = null; return; }
     event.preventDefault();
-    event.stopPropagation();
+    event.stopImmediatePropagation();
     pressed = { ref, x: event.clientX, y: event.clientY };
   };
   const onRelease = (event) => {
@@ -356,12 +353,8 @@ export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThi
     pressed = null;
     if (!press || event.button !== 0) return;
     if (hovered !== press.ref || Math.hypot(event.clientX - press.x, event.clientY - press.y) > CLICK_SLOP_PX) return;
-    cancelPending();
-    pending = setTimeout(() => {
-      pending = null;
-      hide();
-      press.ref.kind.open(press.ref.key);
-    }, doubleClickMs);
+    hide();
+    press.ref.kind.open(press.ref.key);
   };
   const element = terminal.element;
   element?.addEventListener('mousedown', onPress, true);
@@ -371,9 +364,8 @@ export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThi
   // hide() is for the terminal going out of view: a detached xterm sends no
   // mouseleave, and the card lives on document.body, outside it.
   return {
-    hide() { cancelPending(); hide(); },
+    hide,
     dispose() {
-      cancelPending();
       hide();
       element?.removeEventListener('mousedown', onPress, true);
       doc?.removeEventListener?.('mouseup', onRelease, true);

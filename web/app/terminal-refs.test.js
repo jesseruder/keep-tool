@@ -273,23 +273,22 @@ function pressTerminal(lineText) {
     removeEventListener: (type, fn) => { listeners.doc = listeners.doc.filter((l) => l.fn !== fn); } };
   const fire = (where, type, init = {}) => {
     const event = { button: 0, detail: 1, clientX: 10, clientY: 10, stopped: false, prevented: false, ...init,
-      stopPropagation() { this.stopped = true; }, preventDefault() { this.prevented = true; } };
+      stopImmediatePropagation() { this.stopped = true; }, preventDefault() { this.prevented = true; } };
     for (const listener of listeners[where].filter((l) => l.type === type)) listener.fn(event);
     return event;
   };
   return { terminal, doc, listeners, fire };
 }
 
-test('a press on a link never reaches xterm; release opens it after the double-click pause', async () => {
+test('a press on a link never reaches xterm; release opens it', () => {
   const { terminal, doc, listeners, fire } = pressTerminal('see #5 here');
   const opened = [];
-  const handle = installTerminalRefs(terminal, { esc, doc, doubleClickMs: 5,
+  const handle = installTerminalRefs(terminal, { esc, doc,
     kinds: [{ find: findSessionRefs, has: () => true, describe: (num) => ({ title: String(num) }), open: (num) => opened.push(num) }] });
   let links;
   terminal.provider.provideLinks(1, (value) => { links = value; });
   assert.ok(listeners.element.every((l) => l.capture), 'captured before xterm sends it to the pane');
 
-  const wait = () => new Promise((resolve) => setTimeout(resolve, 15));
   // Not over a link: xterm has it.
   assert.equal(fire('element', 'mousedown').stopped, false);
 
@@ -297,15 +296,6 @@ test('a press on a link never reaches xterm; release opens it after the double-c
   const press = fire('element', 'mousedown');
   assert.ok(press.stopped && press.prevented);
   fire('doc', 'mouseup');
-  assert.deepEqual(opened, [], 'waits out a possible double-click');
-  await wait();
-  assert.deepEqual(opened, [5]);
-
-  // Double-click: the second press cancels the open and goes to xterm to select.
-  fire('element', 'mousedown');
-  fire('doc', 'mouseup');
-  assert.equal(fire('element', 'mousedown', { detail: 2 }).stopped, false);
-  await wait();
   assert.deepEqual(opened, [5]);
 
   // Option or Shift selects instead; a drag or a release off the link does nothing.
@@ -316,7 +306,6 @@ test('a press on a link never reaches xterm; release opens it after the double-c
   fire('element', 'mousedown');
   links[0].leave();
   fire('doc', 'mouseup');
-  await wait();
   assert.deepEqual(opened, [5]);
 
   handle.dispose();
