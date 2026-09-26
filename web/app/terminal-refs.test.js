@@ -127,7 +127,7 @@ function fakeTerminal(lineText) {
   };
 }
 
-test('only known references become links, and a click opens one unless Option forces a selection', () => {
+test('only known references become links', () => {
   const terminal = fakeTerminal('see #5 and #6, PR #5');
   const opened = [];
   const handle = installTerminalRefs(terminal, {
@@ -138,12 +138,6 @@ test('only known references become links, and a click opens one unless Option fo
   assert.equal(links.length, 1);
   assert.deepEqual(links[0].range, { start: { x: 5, y: 3 }, end: { x: 6, y: 3 } });
   assert.equal(links[0].text, '#5');
-  links[0].activate({ altKey: true });
-  assert.deepEqual(opened, []);
-  links[0].activate({});
-  assert.deepEqual(opened, [5]);
-  links[0].activate({ metaKey: true });
-  assert.deepEqual(opened, [5, 5]);
   assert.equal(typeof handle.hide, 'function');
   handle.dispose();
   assert.deepEqual(terminal.disposed.sort(), ['key', 'provider', 'scroll']);
@@ -264,4 +258,67 @@ test('the mentions section lists sessions then cards, or says there are none', (
   } }, { rel: () => '3m' });
   assert.deepEqual(section.items, ['#12 Fix login · 3m ago', 'fedcba98 x-y', 'card Hover links (active)']);
   assert.match(refCardHTML(esc, { title: 't', sections: [section] }), /mentioned by.*#12 Fix login/s);
+});
+
+// xterm's element with capture listeners, and a document for the release.
+function pressTerminal(lineText) {
+  const listeners = { element: [], doc: [] };
+  const terminal = fakeTerminal(lineText);
+  terminal.element = {
+    addEventListener: (type, fn, capture) => listeners.element.push({ type, fn, capture }),
+    removeEventListener: (type, fn) => { listeners.element = listeners.element.filter((l) => l.fn !== fn); },
+  };
+  const doc = { ...fakeDoc(),
+    addEventListener: (type, fn, capture) => listeners.doc.push({ type, fn, capture }),
+    removeEventListener: (type, fn) => { listeners.doc = listeners.doc.filter((l) => l.fn !== fn); } };
+  const fire = (where, type, init = {}) => {
+    const event = { button: 0, detail: 1, clientX: 10, clientY: 10, stopped: false, prevented: false, ...init,
+      stopPropagation() { this.stopped = true; }, preventDefault() { this.prevented = true; } };
+    for (const listener of listeners[where].filter((l) => l.type === type)) listener.fn(event);
+    return event;
+  };
+  return { terminal, doc, listeners, fire };
+}
+
+test('a press on a link never reaches xterm; release opens it after the double-click pause', async () => {
+  const { terminal, doc, listeners, fire } = pressTerminal('see #5 here');
+  const opened = [];
+  const handle = installTerminalRefs(terminal, { esc, doc, doubleClickMs: 5,
+    kinds: [{ find: findSessionRefs, has: () => true, describe: (num) => ({ title: String(num) }), open: (num) => opened.push(num) }] });
+  let links;
+  terminal.provider.provideLinks(1, (value) => { links = value; });
+  assert.ok(listeners.element.every((l) => l.capture), 'captured before xterm sends it to the pane');
+
+  const wait = () => new Promise((resolve) => setTimeout(resolve, 15));
+  // Not over a link: xterm has it.
+  assert.equal(fire('element', 'mousedown').stopped, false);
+
+  links[0].hover({ clientX: 10, clientY: 10 });
+  const press = fire('element', 'mousedown');
+  assert.ok(press.stopped && press.prevented);
+  fire('doc', 'mouseup');
+  assert.deepEqual(opened, [], 'waits out a possible double-click');
+  await wait();
+  assert.deepEqual(opened, [5]);
+
+  // Double-click: the second press cancels the open and goes to xterm to select.
+  fire('element', 'mousedown');
+  fire('doc', 'mouseup');
+  assert.equal(fire('element', 'mousedown', { detail: 2 }).stopped, false);
+  await wait();
+  assert.deepEqual(opened, [5]);
+
+  // Option or Shift selects instead; a drag or a release off the link does nothing.
+  assert.equal(fire('element', 'mousedown', { altKey: true }).stopped, false);
+  assert.equal(fire('element', 'mousedown', { shiftKey: true }).stopped, false);
+  fire('element', 'mousedown');
+  fire('doc', 'mouseup', { clientX: 40 });
+  fire('element', 'mousedown');
+  links[0].leave();
+  fire('doc', 'mouseup');
+  await wait();
+  assert.deepEqual(opened, [5]);
+
+  handle.dispose();
+  assert.equal(listeners.element.length + listeners.doc.length, 0);
 });
