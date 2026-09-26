@@ -127,7 +127,7 @@ function fakeTerminal(lineText) {
   };
 }
 
-test('only known references become links, and only ⌘/Ctrl-click opens', () => {
+test('only known references become links, and a click opens one unless Option forces a selection', () => {
   const terminal = fakeTerminal('see #5 and #6, PR #5');
   const opened = [];
   const handle = installTerminalRefs(terminal, {
@@ -138,10 +138,12 @@ test('only known references become links, and only ⌘/Ctrl-click opens', () => 
   assert.equal(links.length, 1);
   assert.deepEqual(links[0].range, { start: { x: 5, y: 3 }, end: { x: 6, y: 3 } });
   assert.equal(links[0].text, '#5');
-  links[0].activate({});
+  links[0].activate({ altKey: true });
   assert.deepEqual(opened, []);
-  links[0].activate({ metaKey: true });
+  links[0].activate({});
   assert.deepEqual(opened, [5]);
+  links[0].activate({ metaKey: true });
+  assert.deepEqual(opened, [5, 5]);
   assert.equal(typeof handle.hide, 'function');
   handle.dispose();
   assert.deepEqual(terminal.disposed.sort(), ['key', 'provider', 'scroll']);

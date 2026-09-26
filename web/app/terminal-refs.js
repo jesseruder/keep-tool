@@ -2,8 +2,10 @@
 // by number (`#453`), cards by id (`keep-compact-is-refused-on-a-node`), holds by id
 // (`hold-mfq2x1ab`) and by the scopes they cover (`[device:android-box]`). This
 // makes each one the console knows a link: hovering shows what it is right now, and
-// ⌘/Ctrl-click opens it. A plain click still goes to the pane, since the agent in it
-// may be taking the mouse, and a selection drag must not navigate.
+// a click opens it. xterm only activates a link when the press and release both land
+// on it, so a selection drag that starts there does not navigate; Option-click, which
+// forces a selection while an agent holds the mouse, never does. (The first version
+// wanted ⌘/Ctrl-click, and a plain click on a #n in the reviewer did nothing.)
 //
 // Each kind of reference is a `kind`: `find(text)` returns its spans, `has(key)`
 // says whether the console knows that key (asked for every reference on every row
@@ -271,7 +273,7 @@ export function refCardHTML(esc, info, { openHint = true } = {}) {
     + (info.quote ? `<div class="sl-quote">${esc(info.quote)}</div>` : '')
     + sections
     + (info.pending ? `<div class="sl-hint">${esc(info.pending)}</div>` : '')
-    + (openHint ? `<div class="sl-hint">${/Mac/.test(globalThis.navigator?.platform || '') ? '⌘' : 'Ctrl'}-click to open</div>` : '');
+    + (openHint ? '<div class="sl-hint">click to open</div>' : '');
 }
 
 // Registers one provider on an xterm for every kind.
@@ -316,7 +318,7 @@ export function installTerminalRefs(terminal, { kinds = [], esc, doc = globalThi
         text: text.slice(ref.start, ref.end),
         decorations: { underline: true, pointerCursor: Boolean(ref.kind.open) },
         activate(event) {
-          if (!ref.kind.open || !(event.metaKey || event.ctrlKey)) return;
+          if (!ref.kind.open || event.altKey) return;
           hide();
           ref.kind.open(ref.key);
         },
