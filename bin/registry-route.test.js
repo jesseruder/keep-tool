@@ -1898,20 +1898,28 @@ test('a node\'s delegate names its own session, never runs a command on the daem
   assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, 'sess-aws1', 'the parent is the verified caller');
 });
 
-test('move, handoff, force-restart and restore run under a long bound on their own queue and hold a restart', async (t) => {
+test('move, handoff and force-restart run under a long bound on their own queue and hold a restart; restore only plans', async (t) => {
   const { MOVE_EXTRA_MS, runsLikeOpen, boundedLikeOpen } = require('./registry-commands.js');
-  for (const command of ['move', 'handoff', 'force-restart', 'restore']) {
+  for (const command of ['move', 'handoff', 'force-restart']) {
     assert.equal(runsLikeOpen(command), true, command);
     assert.equal(boundedLikeOpen(command), command !== 'move', command);
   }
+  assert.equal(runsLikeOpen('restore'), false, 'a node\'s restore is its plan, an ordinary read');
+  assert.equal(forwardedWaitMs('restore', ['--dry']), 0);
+  const restoreRefusal = /a node runs only keep restore --dry: .*run it on the daemon node, or use the console/;
+  for (const args of [[], ['--since', '+48h'], ['--project', 'keep-tool'], ['--', '--dry']]) {
+    assert.match(argumentRefusal('restore', args, ME), restoreRefusal, args.join(' '));
+    assert.match(nodeSideRefusal('restore', args), restoreRefusal, args.join(' '));
+  }
+  for (const args of [['--recover', 'tx-1'], ['--abandon=tx-1']]) {
+    assert.match(argumentRefusal('move', args, ME), /recover or abandon a move journal on the daemon node or in the console/, args.join(' '));
+  }
   assert.equal(forwardedWaitMs('handoff', ['s', '--pane', 'p1@aws1', '--account', 'a']), OPEN_EXTRA_MS);
-  assert.equal(forwardedWaitMs('restore', [], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), openExtraMs({ KEEP_COMPACT_TIMEOUT_MS: '360000' }));
   assert.ok(MOVE_EXTRA_MS > 30 * 60e3, 'a move outlasts the thirty minutes its CLI gives the daemon');
   assert.equal(forwardedWaitMs('move', ['#3', '--node', 'main']), MOVE_EXTRA_MS);
   assert.equal(forwardedWaitMs('move', ['#3', '--node', 'main'], { KEEP_COMPACT_TIMEOUT_MS: '360000' }), MOVE_EXTRA_MS);
   // --node is where the session goes, not who is asking.
   assert.equal(argumentRefusal('move', ['#3', '--node', 'main'], ME), null);
-  assert.equal(argumentRefusal('move', ['--recover', 'tx-1'], { node: 'aws1' }), null);
   assert.equal(argumentRefusal('restore', ['--dry', '--project', 'keep-tool'], { node: 'aws1' }), null);
 
   const fake = fakeSpawn((call) => (call.args[1] === 'move' ? 'hang' : { code: 0, stdout: 'ok\n' }));
@@ -2029,3 +2037,125 @@ test('each command a node deliberately does not forward has a reason, and none o
   assert.equal(daemonOnlyReason('constructor', []), null, 'a name inherited from Object.prototype is not an entry');
   assert.ok(Object.isFrozen(DAEMON_ONLY));
 });
+
+// ---------- a node acts on its own sessions; every newly forwarded command end to end ----------
+
+// A command that stops, moves, restarts or relabels a session may name only the
+// caller's own session or one the location record places on the calling node, and a
+// --pane only on the calling node. tell and open are the cross-node exceptions.
+test('a node stops, moves, restarts and relabels only its own sessions, and only panes on itself', async (t) => {
+  const locations = {
+    'sess-aws1': { node: 'aws1', agent: 'claude' }, 'sess-aws1-b': { node: 'aws1', agent: 'codex' },
+    'sess-main': { node: 'main', agent: 'claude' },
+  };
+  const { svc, root, calls } = service(t, { locations });
+  const own = /a node acts only on its own sessions: .* is neither the calling session nor a session on node aws1; tell and open are the ones that reach other nodes/;
+  const refused = [
+    ['force-restart', ['sess-main', '--pane', 'p4@main'], 400, /--pane must be a pane on the calling node \(<pane-id>@aws1\)/],
+    ['force-restart', ['sess-main', '--pane', 'p4@aws1'], 403, own],
+    ['handoff', ['sess-main', '--pane', 'p4@aws1', '--account', 'other'], 403, own],
+    ['handoff', ['sess-aws1', '--pane', 'p4@aws2', '--account', 'other'], 400, /must be a pane on the calling node/],
+    ['move', ['sess-main', '--node', 'aws1'], 403, own],
+    ['move', ['sess-unknown', '--node', 'aws1'], 403, own],
+    ['mark', ['sess-main', '--emoji', '🔥'], 403, own],
+    ['rename', ['sess-main', 'a title'], 403, own],
+    ['rename', ['sess-main', '--clear'], 403, own],
+    ['keep-running', ['sess-main', 'on'], 403, own],
+  ];
+  let n = 0;
+  for (const [command, args, status, pattern] of refused) {
+    const answer = await svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-own-${n += 1}` }));
+    assert.equal(answer.status, status, `${command} ${args.join(' ')}: ${JSON.stringify(answer.body)}`);
+    assert.match(answer.body.error, pattern, `${command} ${args.join(' ')}`);
+  }
+  assert.equal(calls.length, 0, 'nothing was spawned for a refused target');
+  const allowed = [
+    ['force-restart', ['sess-aws1-b', '--pane', 'p4@aws1'], 'sess-aws1'],
+    ['handoff', ['sess-aws1', '--pane', 'p4@aws1', '--account', 'other'], 'sess-aws1'],
+    ['move', ['sess-aws1-b', '--node', 'main'], 'sess-aws1'],
+    // A shell on the node, with no session, may name a session the node hosts.
+    ['mark', ['sess-aws1-b', '--emoji', '🔥'], null],
+    ['keep-running', ['sess-aws1', 'off'], null],
+    ['rename', ['sess-aws1-b', 'a title'], null],
+    // A number is resolved by the daemon's CLI, which checks the id it names.
+    ['mark', ['#3', '--emoji', '🔥'], 'sess-aws1'],
+  ];
+  for (const [command, args, session] of allowed) {
+    const answer = await svc.handle(AWS1, body(root, {
+      command, args, idempotencyKey: `${KEY}-own-${n += 1}`, ...(session ? {} : { session: null, agent: null }),
+    }));
+    assert.equal(answer.status, 200, `${command} ${args.join(' ')}: ${JSON.stringify(answer.body)}`);
+    assert.deepEqual(calls.at(-1).args.slice(1), [command, ...args]);
+  }
+  // The daemon's own callers act for the daemon node.
+  const admin = await svc.handle({ class: 'admin' }, body(root, {
+    command: 'force-restart', args: ['sess-main', '--pane', 'p4@main'], session: null, agent: null, idempotencyKey: `${KEY}-own-admin`,
+  }));
+  assert.equal(admin.status, 200, JSON.stringify(admin.body));
+});
+
+// The `#n` half, in the daemon's CLI: the id the number names must be the caller's
+// own or on the calling node.
+test('the daemon\'s CLI checks the session a node\'s #n names before it acts', () => {
+  const { remoteTargetRefusal } = require('./keep.js');
+  const location = (id) => ({ 'sess-aws1-b': { node: 'aws1' }, 'sess-main': { node: 'main' } })[id] || null;
+  const env = { KEEP_REMOTE_CALLER: 'aws1' };
+  const self = () => ({ id: 'sess-aws1', agent: 'claude' });
+  assert.doesNotThrow(() => remoteTargetRefusal('#1', 'sess-aws1', { env, location, currentSession: self }));
+  assert.doesNotThrow(() => remoteTargetRefusal('#2', 'sess-aws1-b', { env, location, currentSession: () => null }));
+  assert.throws(() => remoteTargetRefusal('#3', 'sess-main', { env, location, currentSession: self }),
+    /a node acts only on its own sessions: #3 is neither the calling session nor a session on node aws1/);
+  assert.throws(() => remoteTargetRefusal('#4', 'sess-gone', { env, location, currentSession: self }), /acts only on its own sessions/);
+  assert.doesNotThrow(() => remoteTargetRefusal('#3', 'sess-main', { env: {}, location, currentSession: self }), 'on the daemon node itself nothing changes');
+});
+
+// Every newly forwarded command, as the daemon's route runs it: the argv its CLI is
+// given, in the node's project directory, under the node session's identity (or none),
+// and under the bound and on the queue its kind calls for. `ordinary` is killed at the
+// route's bound and queues the node's next command behind it; `long` outlives the bound
+// on a queue of its own and holds a restart; `waiting` does the same but holds none.
+const FORWARDED = [
+  ['usage', [], null, 'ordinary'], ['lint', ['--json'], null, 'ordinary'], ['alerts', ['--all'], null, 'ordinary'],
+  ['brief', ['--send'], null, 'ordinary'], ['accounts', ['list'], null, 'ordinary'],
+  ['incidents', ['close', 'inc-card', '-m', 'why'], 'sess-aws1', 'ordinary'], ['discord', ['status'], null, 'ordinary'],
+  ['slack', ['status'], null, 'ordinary'], ['ideas', ['--dry'], null, 'ordinary'], ['codex-jobs', ['--json'], null, 'ordinary'],
+  ['leftovers', [], null, 'ordinary'], ['quiet', ['2h'], null, 'ordinary'], ['restore', ['--dry'], null, 'ordinary'],
+  ['nodes', ['ls'], null, 'ordinary'], ['probe', ['some-card'], null, 'long'],
+  ['wait', ['--card', 'x', '--for', '1s'], null, 'waiting'],
+  ['mark', ['--emoji', '🔥'], 'sess-aws1', 'ordinary'], ['rename', ['sess-aws1', 'new title'], null, 'ordinary'],
+  ['keep-running', ['on'], 'sess-aws1', 'ordinary'], ['delegate', ['card', '--step', '1', '--prepare'], 'sess-aws1', 'ordinary'],
+  ['move', ['sess-aws1', '--node', 'main'], 'sess-aws1', 'long'],
+  ['handoff', ['sess-aws1', '--pane', 'p4@aws1', '--account', 'other'], 'sess-aws1', 'long'],
+  ['force-restart', ['sess-aws1', '--pane', 'p4@aws1', '--recover'], 'sess-aws1', 'long'],
+];
+for (const [command, args, session, kind] of FORWARDED) {
+  test(`the daemon runs a node's keep ${command} ${args.join(' ')} as its own CLI, ${kind}`, async (t) => {
+    const fake = fakeSpawn((call) => (call.args[1] === command ? 'hang' : { code: 0, stdout: 'shown\n' }));
+    const original = fake.spawn;
+    const children = [];
+    fake.spawn = (...spawnArgs) => { const child = original(...spawnArgs); children.push(child); return child; };
+    const { svc, root, calls } = service(t, { fake, timeoutMs: 20 });
+    const settled = [];
+    const run = svc.handle(AWS1, body(root, { command, args, idempotencyKey: `${KEY}-fw`, ...(session ? {} : { session: null, agent: null }) }))
+      .then((answer) => { settled.push('command'); return answer; });
+    for (let i = 0; i < 5; i += 1) await new Promise((resolve) => setImmediate(resolve));
+    assert.equal(calls.length, 1, 'the command was spawned');
+    assert.deepEqual(calls[0].args.slice(1), [command, ...args]);
+    assert.equal(calls[0].options.cwd, root);
+    assert.equal(calls[0].options.env.KEEP_REMOTE_CALLER, 'aws1');
+    assert.equal(calls[0].options.env.KEEP_NODE_NAME, 'main');
+    assert.equal(calls[0].options.env.CLAUDE_CODE_SESSION_ID, session || undefined);
+    assert.equal(svc.busy(), kind !== 'waiting', 'a restart waits for it unless it only waits');
+    const show = svc.handle(AWS1, body(root, { idempotencyKey: `${KEY}-fw-show` })).then((answer) => { settled.push('show'); return answer; });
+    await new Promise((resolve) => setTimeout(resolve, 60));
+    if (kind === 'ordinary') {
+      assert.equal((await run).status, 504, 'killed at the ordinary bound');
+      assert.equal((await show).status, 200);
+      assert.deepEqual(settled, ['command', 'show'], 'the node\'s next command queued behind it');
+    } else {
+      assert.deepEqual(settled, ['show'], 'still running past the ordinary bound, beside the node\'s next command');
+      children[0].emit('close', 0, null);
+      assert.equal((await run).status, 200);
+    }
+  });
+}

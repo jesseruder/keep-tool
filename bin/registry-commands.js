@@ -122,12 +122,15 @@ const REGISTRY_COMMANDS = Object.freeze([
   // prepares the delegation and has the worker accept it instead.
   'delegate',
   // The ones that stop, move or restart sessions, and may take minutes: they run
-  // under a long bound on a queue of their own (runsLikeOpen). A move, handoff or
-  // force-restart of the caller's own session ends the caller's pane partway, so the
-  // node never prints the answer, exactly as for a forwarded open that replaces it;
-  // the daemon carries on and the console shows the outcome. A pane a node names is
-  // qualified with that node before it is sent (qualifyPaneArgs), since on the daemon
-  // a bare pane id is one of the daemon's own.
+  // under a long bound on a queue of their own (runsLikeOpen). A node acts on its own
+  // sessions only: the one it runs in or one the location record places on it, and a
+  // pane on itself (sessionTargetOf, targetRefusal). A move, handoff or force-restart
+  // of the caller's own session ends the caller's pane partway, so the node never
+  // prints the answer, exactly as for a forwarded open that replaces it; the daemon
+  // carries on and the console shows the outcome. A pane a node names is qualified
+  // with that node before it is sent (qualifyPaneArgs), since on the daemon a bare
+  // pane id is one of the daemon's own. `restore` is forwarded as its plan only
+  // (RESTORE_REFUSAL).
   'move', 'handoff', 'force-restart', 'restore',
 ]);
 
@@ -213,6 +216,15 @@ const IDEAS_REFUSAL = 'a node runs only keep ideas --dry: a real run asks a mode
 const REAP_REFUSAL = (command) => `a node's keep ${command} lists the daemon node's own processes; --reap stops them, so run it on the daemon node`;
 const DELEGATE_COMMAND_REFUSAL = 'keep delegate -- <command> would run the command on the daemon node; from a node, run keep delegate <card> --step <n> --prepare and have the worker run keep delegate --accept <id>, or register it with --session <sid> --agent <agent>';
 
+// A real restore opens every session its plan restores, one after another, up to three
+// minutes each, with no limit on how many: no bound a forwarded command has covers it,
+// and a node told of a timeout would rerun it while the daemon was still opening one.
+// Only the plan (`--dry`) is forwarded.
+const RESTORE_REFUSAL = 'a node runs only keep restore --dry: a real restore opens any number of sessions one after another, longer than a forwarded command may take; run it on the daemon node, or use the console';
+// A move's --recover and --abandon name a journal, not a session, so the route cannot
+// tell whose move it is: they stay with the daemon node and the console's buttons.
+const MOVE_JOURNAL_REFUSAL = "a node's keep move names the session it moves; recover or abandon a move journal on the daemon node or in the console";
+
 // The refusals a command's arguments alone decide, the same on both sides.
 function formRefusal(command, args) {
   const sub = subcommandOf(args);
@@ -224,6 +236,8 @@ function formRefusal(command, args) {
   if ((command === 'codex-jobs' || command === 'leftovers') && flagged('--reap')) return REAP_REFUSAL(command);
   // commands.delegate splits its argv at the first `--` wherever it stands.
   if (command === 'delegate' && args.includes('--')) return DELEGATE_COMMAND_REFUSAL;
+  if (command === 'restore' && !flagged('--dry')) return RESTORE_REFUSAL;
+  if (command === 'move' && (args.some((arg, i) => /^--(recover|abandon)(=|$)/.test(arg) && !args.slice(0, i).includes('--')))) return MOVE_JOURNAL_REFUSAL;
   return null;
 }
 
@@ -306,6 +320,42 @@ const PANE_FLAGS = Object.freeze({
   'force-restart': ['--pane'],
 });
 const PANE_UNQUALIFIED_REFUSAL = (flag) => `${flag} from a node must name its node: <pane-id>@<node>`;
+const PANE_OTHER_NODE_REFUSAL = (flag, node) => `${flag} must be a pane on the calling node (<pane-id>@${node || '<node>'}): a node stops, moves and restarts only its own sessions; tell and open are the ones that reach other nodes`;
+
+// The session a command that stops, moves, restarts or writes the state of a session
+// names, as the CLI will read it, or null when it names none (the caller's own, which
+// needs no check, or a form without a session). A node may name only its own session
+// or one the location record places on that node (the route's targetRefusal): with
+// any id it could otherwise interrupt, move or relabel a session it neither owns nor
+// hosts. `tell` and `open` are the deliberate exceptions, reaching any session.
+const TARGET_COMMANDS = Object.freeze(['move', 'handoff', 'force-restart', 'mark', 'rename', 'keep-running']);
+function sessionTargetOf(command, args) {
+  if (!TARGET_COMMANDS.includes(command) || !Array.isArray(args)) return null;
+  const positionals = positionalsOf(command, args);
+  const flags = args.slice(0, args.includes('--') ? args.indexOf('--') : args.length);
+  if (command === 'rename') return flags.includes('--clear') ? positionals[0] ?? null : positionals.length === 2 ? positionals[0] : null;
+  if (command === 'keep-running') return positionals.length === 2 ? positionals[0] : null;
+  return positionals[0] ?? null;
+}
+const NODE_OWN_REFUSAL = (target, node) => `a node acts only on its own sessions: ${target} is neither the calling session nor a session on node ${node}; tell and open are the ones that reach other nodes`;
+
+// The route's check of that target: `resolve` turns an id into { id }, or answers
+// { deferred: true } for a `#n` the daemon's CLI resolves and checks itself, and
+// `location` is the durable location record. Null or the refusal.
+function targetRefusal(command, args, identity, { resolve, location } = {}) {
+  const target = sessionTargetOf(command, args);
+  if (target === null || target === undefined) return null;
+  let resolved = null;
+  try { resolved = resolve ? resolve(String(target)) : null; } catch { resolved = null; }
+  // A `#n` the resolver leaves to the daemon's CLI, which checks the id it finds.
+  if (resolved && resolved.deferred === true) return null;
+  if (!resolved || !resolved.id) return NODE_OWN_REFUSAL(target, identity.node);
+  if (identity.session && resolved.id === identity.session) return null;
+  let where = null;
+  try { where = location ? location(resolved.id) : null; } catch { where = null; }
+  if (where && identity.node && where.node === identity.node) return null;
+  return NODE_OWN_REFUSAL(target, identity.node);
+}
 
 // `args` with each bare pane value qualified with `local`, the node the CLI runs on:
 // walked the way parseArgs reads it (a `--` ends the flags, -m's value is not one).
@@ -579,6 +629,9 @@ function argumentRefusal(command, args, identity = {}) {
     if (flag && paneFlags.includes(flag)) {
       const named = eq < 0 ? args[i + 1] : arg.slice(eq + 1);
       if (typeof named !== 'string' || !named.includes('@')) return PANE_UNQUALIFIED_REFUSAL(flag);
+      // A node stops or restarts only a pane on itself (NODE_OWN_REFUSAL).
+      const at = named.lastIndexOf('@');
+      if (at < 1 || !identity.node || named.slice(at + 1) !== identity.node) return PANE_OTHER_NODE_REFUSAL(flag, identity.node);
     }
     if (flag && eq >= 0 && projectFlags.includes(flag)) {
       const refusal = projectRefusal(arg.slice(eq + 1));
@@ -697,12 +750,10 @@ function openRequiredMs(env = {}) {
 // The commands that stop, move or restart sessions are bounded like an open too, and
 // for the same reason: each posts to a daemon route that carries on when the CLI is
 // killed. `handoff` waits up to three minutes for its transfer (/api/handoff-session),
-// `restore` opens every session its plan restores one after another (at most three
-// minutes each, so the open bound covers about four; past that the node is told of a
-// timeout and a rerun restores the rest, since a restored session is alive and its
-// plan skips it), and `force-restart` asks the daemon to restart a pane, which it
-// then owns. A `move` has its own, longer bound (MOVE_EXTRA_MS).
-const LONG_RUNNING = Object.freeze(['open', 'verify', 'move', 'handoff', 'force-restart', 'restore']);
+// and `force-restart` asks the daemon to restart a pane, which it then owns. A `move`
+// has its own, longer bound (MOVE_EXTRA_MS). (A node's `restore` is only its plan,
+// `--dry`, an ordinary read: RESTORE_REFUSAL.)
+const LONG_RUNNING = Object.freeze(['open', 'verify', 'move', 'handoff', 'force-restart']);
 function runsLikeOpen(command) {
   return LONG_RUNNING.includes(command);
 }
@@ -842,4 +893,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { DAEMON_ONLY, daemonOnlyReason, qualifyPaneArgs, PANE_FLAGS, BARE_SESSION_FORMS, MOVE_EXTRA_MS, PROBE_EXTRA_MS, WAIT_DEFAULT_MS, boundedLikeOpen, unboundedRefusal, isWaiting, REVIEW_QUEUE_HANDOFF_NAME_RE, REVIEW_QUEUE_REFUSAL, REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { NODE_OWN_REFUSAL, TARGET_COMMANDS, sessionTargetOf, targetRefusal, DAEMON_ONLY, daemonOnlyReason, qualifyPaneArgs, PANE_FLAGS, BARE_SESSION_FORMS, MOVE_EXTRA_MS, PROBE_EXTRA_MS, WAIT_DEFAULT_MS, boundedLikeOpen, unboundedRefusal, isWaiting, REVIEW_QUEUE_HANDOFF_NAME_RE, REVIEW_QUEUE_REFUSAL, REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

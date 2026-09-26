@@ -804,3 +804,53 @@ test('fetchArtifact reads one artifact\'s bytes from the daemon with the node to
   assert.equal(missing.code, 1);
   assert.match(missing.stderr, /no artifact "gone\.png" on card/);
 });
+
+// Every newly forwarded command as a node sends it: through the node's own CLI (so a
+// command dispatched locally by mistake fails), with the argv the daemon will run, a
+// bare pane qualified with this node, the session it runs in, and the bound its post
+// is given.
+{
+  const { MOVE_EXTRA_MS, OPEN_EXTRA_MS, PROBE_EXTRA_MS } = require('./registry-commands.js');
+  const SENT = [
+    // [argv typed on the node, argv the daemon is sent, in a session?, extra bound]
+    [['usage'], null, false, 0], [['lint', '--json'], null, false, 0], [['alerts', '--all'], null, false, 0],
+    [['brief', '--send'], null, false, 0], [['accounts', 'list'], null, false, 0], [['accounts'], null, false, 0],
+    [['incidents', 'close', 'inc-card', '-m', 'why'], null, true, 0], [['discord', 'status'], null, false, 0],
+    [['slack', 'status'], null, false, 0], [['ideas', '--dry'], null, false, 0], [['codex-jobs', '--json'], null, false, 0],
+    [['leftovers'], null, false, 0], [['quiet', '2h'], null, false, 0], [['restore', '--dry'], null, false, 0],
+    [['nodes', 'ls'], null, false, 0], [['probe', 'some-card'], null, false, PROBE_EXTRA_MS],
+    [['wait', '--card', 'x', '--for', '90s'], null, false, 90e3],
+    [['mark', '--emoji', 'x'], null, true, 0], [['rename', '#3', 'new title'], null, false, 0],
+    [['keep-running', 'on'], null, true, 0], [['delegate', 'card', '--step', '1', '--prepare'], null, true, 0],
+    [['move', '#3', '--node', 'main'], null, true, MOVE_EXTRA_MS],
+    [['handoff', 'sess-aws1', '--pane', 'p4', '--account', 'other'], ['handoff', 'sess-aws1', '--pane', 'p4@aws1', '--account', 'other'], true, OPEN_EXTRA_MS],
+    [['force-restart', 'sess-aws1', '--pane=p4', '--recover'], ['force-restart', 'sess-aws1', '--pane=p4@aws1', '--recover'], true, OPEN_EXTRA_MS],
+  ];
+  for (const [typed, expected, inSession, extra] of SENT) {
+    test(`a node sends keep ${typed.join(' ')} to the daemon as it will run`, async (t) => {
+      const { runRemote, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
+      const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'ran\n', stderr: '', replayed: false } }));
+      const { root, env } = nodeEnv(t, inSession ? { CLAUDE_CODE_SESSION_ID: 'sess-aws1' } : {});
+      env.KEEP_DAEMON_URL = daemon.url;
+      const result = await run(typed, { env, cwd: root });
+      assert.equal(result.status, 0, result.stderr);
+      assert.equal(result.stdout, 'ran\n');
+      assert.equal(daemon.requests.length, 1, 'posted once, not run here');
+      const [request] = daemon.requests;
+      assert.equal(request.url, '/api/registry');
+      assert.deepEqual([request.body.command, ...request.body.args], expected || typed);
+      assert.equal(request.body.session, inSession ? 'sess-aws1' : undefined);
+      // The bound the node gives its post.
+      const seen = [];
+      const request2 = async (url, pathname, options) => {
+        seen.push(options);
+        return { status: 200, data: JSON.stringify({ ok: true, status: 0, stdout: '', stderr: '' }) };
+      };
+      const where = { local: 'aws1', daemon: 'main', url: 'http://127.0.0.1:1' };
+      const sent = await runRemote(typed[0], typed.slice(1), { where, request: request2, token: 't', env: {}, cwd: root });
+      assert.equal(sent.code, 0, sent.stderr);
+      assert.equal(seen[0].timeoutMs, REQUEST_TIMEOUT_MS + extra);
+      assert.deepEqual(seen[0].payload.args, (expected || typed).slice(1));
+    });
+  }
+}

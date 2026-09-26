@@ -1902,12 +1902,22 @@ rules (`bin/registry-commands.js` holds them):
   delegation (`keep delegate <card> --step <n> --prepare`) and have the worker run
   `keep delegate --accept <id>`, or register it with `--session <sid> --agent <agent>`,
   which names the worker and may be any session.
-- **Long-running:** `move`, `handoff`, `force-restart` and `restore` run under an open's
+- **A node acts on its own sessions.** `move`, `handoff`, `force-restart`, and `mark`,
+  `rename` and `keep-running` with a session named, may name only the calling session
+  or one whose location record places it on the calling node, and a `--pane` must be
+  `<pane-id>@<calling node>`; anything else is refused by the daemon (the route checks
+  an id before it runs anything, and the daemon's CLI checks the id a `#n` names).
+  `tell` and `open` are the ones that reach other nodes.
+- **Long-running:** `move`, `handoff` and `force-restart` run under an open's
   bound on a queue of their own and hold a restart; `move` has its own bound, a minute
   past the thirty minutes its CLI gives the daemon, and its `--node` names where the
-  session goes. A `--pane` a node names for `handoff` or `force-restart` goes up as
-  `<pane-id>@<node>`, and the daemon refuses a bare one, which on the daemon would name
-  one of its own panes. A move, handoff or force-restart of the caller's own session
+  session goes. `move --recover` and `--abandon` name a journal, not a session, and stay
+  with the daemon node and the console. Only `restore --dry` is forwarded: a real
+  restore opens any number of sessions one after another, longer than any bound a
+  forwarded command has, so it runs on the daemon node or from the console. A `--pane`
+  a node names for `handoff` or `force-restart` goes up as `<pane-id>@<node>`, and the
+  daemon refuses a bare one, which on the daemon would name one of its own panes. A
+  move, handoff or force-restart of the caller's own session
   ends the caller's pane partway, so the node never prints the answer, as for a
   forwarded open that replaces it; the daemon carries on and the console shows the
   outcome.

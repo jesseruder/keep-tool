@@ -504,6 +504,23 @@ commands.retitle = (argv) => {
   });
 };
 
+// A command the daemon runs for another node (KEEP_REMOTE_CALLER, set only by its
+// /api/registry) acts only on that node's own sessions: the one it runs in, or one the
+// location record places on that node. The route checks a named id before it spawns
+// anything; a `#n` it cannot resolve off its event loop, so it is checked here, on the
+// id the number names (registry-commands targetRefusal is the route's half).
+function remoteTargetRefusal(sessionArg, sessionId, options = {}) {
+  const caller = (options.env || process.env).KEEP_REMOTE_CALLER;
+  if (!caller) return;
+  const self = (options.currentSession || currentSession)();
+  if (self && self.id === sessionId) return;
+  const locate = options.location || ((id) => require('./accounts.js').sessionLocation(id, { root: options.root || ROOT }));
+  let where = null;
+  try { where = locate(sessionId); } catch { where = null; }
+  if (where && where.node === caller) return;
+  die(require('./registry-commands.js').NODE_OWN_REFUSAL(sessionArg, caller));
+}
+
 // The session a per-session command acts on: `#n` or an id when one was named,
 // otherwise the session this command is running inside. Shared by `keep rename`
 // and `keep mark` so both resolve a target the same way.
@@ -511,13 +528,17 @@ function resolveSessionByNumberOrId(sessionArg, options = {}) {
   const root = options.root || ROOT;
   if (sessionArg != null) {
     const found = sessionNumbers.lookup(sessionArg, { root });
-    if (found) return { sessionId: found.id, num: found.num };
+    if (found) {
+      remoteTargetRefusal(sessionArg, found.id, { root, currentSession: options.currentSession });
+      return { sessionId: found.id, num: found.num };
+    }
     // A token that reads as a number and is not in the registry names nothing;
     // only an id-shaped token is taken at face value (the daemon may know a
     // session this checkout's registry has not numbered).
     const number = sessionNumbers.parseNumber(sessionArg);
     if (number) die(`no session ${sessionNumbers.label(number)}`);
     if (!/^[A-Za-z0-9_-]+$/.test(sessionArg)) die('bad session id');
+    remoteTargetRefusal(sessionArg, sessionArg, { root, currentSession: options.currentSession });
     return { sessionId: sessionArg, num: null };
   }
   const self = (options.currentSession || currentSession)();
@@ -4514,6 +4535,7 @@ async function artifactGetRemote(argv, where, deps = {}) {
 module.exports.artifactGetRemote = artifactGetRemote;
 module.exports.checkinRemote = checkinRemote;
 module.exports.paneOnlyRefusal = paneOnlyRefusal;
+module.exports.remoteTargetRefusal = remoteTargetRefusal;
 module.exports.PANE_ONLY_COMMANDS = PANE_ONLY_COMMANDS;
 module.exports.landRemote = landRemote;
 module.exports.allowRemote = allowRemote;

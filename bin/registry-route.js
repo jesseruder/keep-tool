@@ -32,7 +32,7 @@ const os = require('node:os');
 const path = require('node:path');
 const {
   isRegistryCommand, argumentRefusal, forwardedWaitMs, runsLikeOpen, boundedLikeOpen, isWaiting, openExtraMs, openRequiredMs,
-  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, unboundedRefusal, stdinRefusal,
+  MAX_FORWARDED_WAIT_MS, MAX_OPEN_EXTRA_MS, unboundedRefusal, stdinRefusal, targetRefusal,
 } = require('./registry-commands.js');
 
 const SESSION_RE = /^[A-Za-z0-9_-]{1,128}$/;
@@ -145,6 +145,15 @@ function validateRequest(body, caller, deps) {
   const bodyRefusal = stdinRefusal(command, args, body.stdin);
   if (bodyRefusal) refuse(400, bodyRefusal);
   const place = callerPlace(body, caller, deps, fields);
+  // A command that stops, moves, restarts or relabels a session a node names must name
+  // one of the node's own (registry-commands targetRefusal). The daemon's own callers
+  // (admin, local) act for the daemon node, as its CLI does; a deps without a resolver
+  // resolves nothing, so such a target is refused rather than let through.
+  if (caller !== deps.daemon) {
+    const target = targetRefusal(command, args, { session: place.session, node: caller },
+      { resolve: deps.resolveSessionArg, location: deps.location });
+    if (target) refuse(403, target);
+  }
   return { command, args: [...args], ...place, idempotencyKey, ...(typeof body.stdin === 'string' ? { stdin: body.stdin } : {}) };
 }
 
@@ -163,6 +172,15 @@ function createRegistryService(options = {}) {
   const nodes = options.nodes || require('./nodes.js');
   const daemonNode = options.daemonNode || (() => nodes.daemonNode());
   const location = options.location || ((sessionId) => require('./accounts.js').sessionLocation(sessionId, { root }));
+  // A session a node's command names as its target, as the daemon's CLI will resolve it
+  // (keep.js resolveSessionByNumberOrId): an id is taken as the id it is. A `#n` is
+  // resolved through the session-number registry, a file read the event loop must not
+  // make, so it is left to the daemon's CLI, which applies the same rule to the id it
+  // finds (keep.js remoteTargetRefusal) before it acts.
+  const resolveSessionArg = options.resolveSessionArg || ((arg) => {
+    if (require('./session-numbers.js').parseNumber(arg)) return { deferred: true };
+    return SESSION_RE.test(arg) ? { id: arg } : null;
+  });
   const spawn = options.spawn || childProcess.spawn;
   const now = options.now || Date.now;
   const timeoutMs = options.timeoutMs || TIMEOUT_MS;
@@ -364,7 +382,7 @@ function createRegistryService(options = {}) {
         refuse(409, unboundedRefusal(body.command));
       }
       const deps = {
-        io, location,
+        io, location, resolveSessionArg, daemon,
         parsePaneRef: (ref) => nodes.parsePaneRef(ref),
         formatPaneRef: (node, paneId) => nodes.formatPaneRef(node, paneId),
       };
