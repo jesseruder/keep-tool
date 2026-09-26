@@ -526,6 +526,25 @@ function copyProviderArtifacts(provider, agent, ...args) {
   return agent === 'codex' ? provider.copyCodexArtifacts(...args) : provider.copyClaudeArtifacts(...args);
 }
 
+// For a session on another node, the daemon's mirror of its transcript seeded from
+// the copy just made, before the target starts. The copy is a new file, which the
+// node's hook client takes for a new generation the daemon holds nothing of; without
+// the seed the target's session start would carry the whole transcript over the link
+// again and could not land inside its budget. Only a node's provider offers it (the
+// daemon keeps no mirror of its own sessions), and a seed that cannot be made costs
+// only that upload: it is logged, never a reason to stop the handoff.
+async function seedTargetMirror(provider, sessionId, source, target, transactionId, deps = {}) {
+  if (typeof provider?.seedMirror !== 'function') return;
+  let reason = '';
+  try {
+    const result = await provider.seedMirror(sessionId, source, target);
+    if (!result || result.ok !== true) reason = result?.reason || 'the seed did not say why';
+  } catch (error) { reason = error?.message || String(error); }
+  if (!reason) return;
+  const line = `keep serve: handoff ${transactionId}: mirror seed for ${sessionId} on ${deps.paneNode || 'its node'} skipped: ${reason}`;
+  try { (deps.log || ((text) => process.stderr.write(`${text}\n`)))(line); } catch {}
+}
+
 function resumeSpecFor(sessionId, agent, plan, deps = {}, source = null) {
   if (agent !== 'codex') return null;
   if (deps.resumeSpec) return deps.resumeSpec(sessionId, plan, source);
@@ -999,6 +1018,7 @@ async function run(body, deps = {}) {
           else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
           current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
           writeOne(root, current);
+          await seedTargetMirror(providerArtifacts, session.id, source, target, current.id, deps);
           await (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
             { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force: current.force === true });
           stageTargetAuthority(current, target, root, env);
@@ -1157,6 +1177,7 @@ async function run(body, deps = {}) {
       else if (agent === 'codex') verifyOwnedGraph(current, copiedPlan);
       current.targetTranscript = copiedPlan.artifacts?.find((entry) => entry.sessionId === session.id)?.target;
       writeOne(root, current);
+      await seedTargetMirror(providerArtifacts, session.id, source, target, current.id, deps);
       await verifyFrozenResumeSpec(current, artifactPlan, deps, source);
       await (deps.rebindLedger || providerArtifacts.rebindLedger)(session.id, source, target, current.id,
         { root, env, sourceStopVerifiedAt: current.sourceStopVerifiedAt, force });

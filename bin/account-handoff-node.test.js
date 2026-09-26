@@ -213,6 +213,58 @@ test('a Claude session on a node is transferred there: login, trust and artifact
   }
 });
 
+test('a transfer on a node seeds the daemon\'s mirror with the target\'s copy, so the target\'s first hook sends no bytes', async (t) => {
+  const f = fleet(t);
+  const sid = 'node-claude-seed';
+  const { projectName, transcript } = claudeSession(f, sid);
+  accounts.pinSession(sid, 'claude', 'one', { root: f.root, env: f.env, node: 'aws1' });
+  // The daemon holds the source's transcript, as the source's hooks uploaded it.
+  const mirror = require('./transcript-mirror');
+  const where = mirror.paths(f.root, 'aws1', sid);
+  fs.mkdirSync(where.dir, { recursive: true });
+  fs.copyFileSync(transcript, where.file);
+  const sourceGeneration = require('./hook-client').generationOf(fs.statSync(transcript));
+  fs.writeFileSync(where.sidecar, JSON.stringify({ generation: sourceGeneration, size: fs.statSync(transcript).size,
+    mtimeMs: fs.statSync(transcript).mtimeMs, sourcePath: transcript, updatedAt: Date.now() }));
+  const pane = paneFor(f, sid, 'claude', 'one', { model: 'claude-opus-4-1' });
+  const state = { stopped: false };
+  const host = nodeHost(f);
+  const restart = nodeRestart(pane, state, sid, 'claude');
+  const logged = [];
+  const deps = serveDeps(f, host, pane, tableFor(pane, sid, 'claude', () => state.stopped), {
+    restartSession: restart.restartSession, log: (text) => logged.push(text),
+    waitForAccountRecord: async (_sid, paneId, accountId, after) => ({ pane: paneId, accountId, agent: 'claude', startedAt: after + 1 }),
+    continueSession: async () => {},
+  });
+  const result = await require('./serve').handoffSession({ sessionId: sid, pane: 'p7@aws1', accountId: 'two', ownerForce: true }, deps);
+  assert.equal(result.status, 'done');
+  assert.deepEqual(logged, []);
+  const copy = path.join(f.node.two, 'projects', projectName, `${sid}.jsonl`);
+  const seeded = mirror.stat(f.root, 'aws1', sid);
+  assert.equal(seeded.generation, require('./hook-client').generationOf(fs.statSync(copy)), 'the target copy\'s generation');
+  assert.notEqual(seeded.generation, sourceGeneration);
+  assert.equal(seeded.size, fs.statSync(copy).size);
+  assert.equal(seeded.sourcePath, copy);
+  assert.equal(fs.readFileSync(where.file, 'utf8'), fs.readFileSync(copy, 'utf8'));
+
+  // With no mirror to seed from, the transfer still lands and says why it skipped.
+  const other = 'node-claude-unseeded';
+  claudeSession(f, other);
+  accounts.pinSession(other, 'claude', 'one', { root: f.root, env: f.env, node: 'aws1' });
+  const pane2 = paneFor(f, other, 'claude', 'one', { model: 'claude-opus-4-1' });
+  const state2 = { stopped: false };
+  const deps2 = serveDeps(f, nodeHost(f), pane2, tableFor(pane2, other, 'claude', () => state2.stopped), {
+    restartSession: nodeRestart(pane2, state2, other, 'claude').restartSession, log: (text) => logged.push(text),
+    waitForAccountRecord: async (_sid, paneId, accountId, after) => ({ pane: paneId, accountId, agent: 'claude', startedAt: after + 1 }),
+    continueSession: async () => {},
+  });
+  const second = await require('./serve').handoffSession({ sessionId: other, pane: 'p7@aws1', accountId: 'two', ownerForce: true }, deps2);
+  assert.equal(second.status, 'done');
+  assert.equal(logged.length, 1);
+  assert.match(logged[0], new RegExp(`^keep serve: handoff ${second.id}: mirror seed for ${other} on aws1 skipped: `));
+  assert.equal(mirror.stat(f.root, 'aws1', other), null);
+});
+
 test('a target logged in on the daemon but not on the node is refused with the source left running', async (t) => {
   const f = fleet(t);
   const sid = 'node-claude-2';

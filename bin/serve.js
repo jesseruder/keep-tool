@@ -15138,6 +15138,16 @@ function nodeHandoffUnreachable(node, what, error) {
     { status: 409 });
 }
 
+// Whether a listed artifact is the session's own transcript: a Claude session's
+// top-level `projects/<project>/<sid>.jsonl`, or a Codex session's root rollout (never
+// a child thread's, which names its own id). The same test a move's seed makes.
+function ownTranscriptEntry(file, sessionId, kind) {
+  const relPath = file && typeof file.relPath === 'string' ? file.relPath : '';
+  const parts = relPath.split('/');
+  if (kind === 'codex') return parts[0] === 'sessions' && /^rollout-.*\.jsonl$/.test(parts.at(-1)) && parts.at(-1).endsWith(`-${sessionId}.jsonl`);
+  return parts.length === 3 && parts[0] === 'projects' && parts[2] === `${sessionId}.jsonl`;
+}
+
 // The node's answers to every question account-handoff.run asks about the machine the
 // session runs on, for a pane on another node: the node's copies of both accounts
 // (login, shared setup, compatibility, project trust, the Codex resume policy), the
@@ -15227,6 +15237,27 @@ function nodeHandoffDeps(node, deps = {}) {
     // The job ledger is verified against a transcript on this machine; a node session
     // has none here to verify or rebind. A transfer of one is Owner-forced (run()).
     rebindLedger: () => ({ rebound: [], node }),
+    // The daemon's mirror of the session on this node, seeded after the copy with the
+    // target's own listing (its size, digest, generation and time) from the mirror the
+    // daemon already holds of the source's copy, as a move seeds it (sessionMoveDeps).
+    // Same node, same session id: the one mirror file is read and replaced, and only
+    // when its bytes are exactly what the target listed (transcript-mirror.seed).
+    seedMirror: async (sessionId, source, target) => {
+      const kind = source && source.agent === 'codex' ? 'codex' : 'claude';
+      const listed = await ends(target).list(sessionId);
+      const files = listed && Array.isArray(listed.files) ? listed.files : [];
+      const own = files.find((file) => ownTranscriptEntry(file, sessionId, kind));
+      if (!own) return { ok: false, reason: `${node} listed no transcript for ${sessionId}` };
+      if (typeof own.generation !== 'string') return { ok: false, reason: 'the target listed no file generation' };
+      const parts = require('./session-artifacts').scopedParts(own.relPath, sessionId, kind);
+      const mirror = require('./transcript-mirror');
+      const root = deps.root || keep.ROOT;
+      return mirror.seed({
+        root, node, sessionId, fromFile: mirror.paths(root, node, sessionId).file, size: own.size, sha256: own.sha256,
+        generation: own.generation, mtimeMs: own.mtimeMs,
+        sourcePath: path.join(moveNodeAccount(node, target, deps).configDir, ...parts),
+      });
+    },
   };
   const resumeSpecFrom = async (account, sessionId, file) => {
     const relPath = within(account.configDir, file);

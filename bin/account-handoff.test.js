@@ -1755,6 +1755,32 @@ test('a Claude session on a node is transferred with every proof taken on that n
   } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
 });
 
+test('a node session\'s mirror is seeded after the copy and before the target starts, and a seed that fails is only logged', async () => {
+  for (const failure of [null, 'throws', 'refuses']) {
+    const f = fixture();
+    try {
+      const logged = [];
+      const d = nodeDeps(f, { log: (text) => logged.push(text) });
+      const seeded = [];
+      d.artifactProvider.seedMirror = async (sid, source, target) => {
+        d.events.push('seed'); seeded.push([sid, source.id, target.id]);
+        if (failure === 'throws') throw new Error('host request timed out asking aws1 to list');
+        return failure === 'refuses' ? { ok: false, reason: 'the daemon\'s copy does not match the digest the target listed' } : { ok: true, size: 10 };
+      };
+      const result = await handoff.run({ sessionId: f.sid, pane: 'pane-1@aws1', accountId: 'two', ownerForce: true }, d);
+      assert.equal(result.status, 'done', String(failure));
+      assert.deepEqual(d.events, ['preflight', 'trust', 'stop', 'copy', 'seed', 'launch', 'continue']);
+      assert.deepEqual(seeded, [[f.sid, 'one', 'two']]);
+      if (!failure) assert.deepEqual(logged, []);
+      else {
+        assert.equal(logged.length, 1);
+        assert.equal(logged[0], `keep serve: handoff ${result.id}: mirror seed for ${f.sid} on aws1 skipped: ${failure === 'throws'
+          ? 'host request timed out asking aws1 to list' : 'the daemon\'s copy does not match the digest the target listed'}`);
+      }
+    } finally { fs.rmSync(f.base, { recursive: true, force: true }); }
+  }
+});
+
 test('a transfer of a node session that is not Owner-forced is refused before anything is asked or written', async () => {
   const f = fixture();
   try {

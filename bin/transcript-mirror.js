@@ -334,7 +334,7 @@ async function seed(options = {}) {
   if (typeof fromFile !== 'string' || !path.isAbsolute(fromFile)) refuse(400, 'the seed needs an absolute file to read');
   if (size > MIRROR_CAP_BYTES) return { ok: false, reason: `a mirror holds at most ${MIRROR_CAP_BYTES} bytes; this transcript is past it` };
 
-  checkedDirectory(root, node, true);
+  await checkedDirectoryAsync(root, node, true);
   // Named so neither prune nor a session id can ever match it.
   const temp = path.join(where.dir, `.seed.${sessionId}.${process.pid}.${crypto.randomBytes(4).toString('hex')}.tmp`);
   let source = null;
@@ -362,15 +362,15 @@ async function seed(options = {}) {
     await target.utimes(now() / 1000, mtimeMs / 1000);
     await target.close();
     target = null;
-    fs.renameSync(temp, where.file);
+    await fs.promises.rename(temp, where.file);
     placed = true;
   } finally {
     if (source) await source.close().catch(() => {});
     if (target) await target.close().catch(() => {});
-    if (!placed) { try { fs.unlinkSync(temp); } catch {} }
+    if (!placed) await fs.promises.unlink(temp).catch(() => {});
   }
   const at = now();
-  writeSidecar(where.sidecar, { generation, size, mtimeMs, sourcePath, updatedAt: at, seededAt: at });
+  await writeSidecarAsync(where.sidecar, { generation, size, mtimeMs, sourcePath, updatedAt: at, seededAt: at });
   return { ok: true, size };
 }
 
