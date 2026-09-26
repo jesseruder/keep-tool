@@ -70,7 +70,7 @@ async function check(entry, deps) {
 function renderNodes(rows) {
   const headings = ['name', 'transport', 'endpoint', 'capabilities', 'home', 'status'];
   const table = rows.map((row) => [
-    row.name + (row.daemon ? ' (daemon)' : ''),
+    row.name + (row.daemon ? ' (daemon)' : row.thisNode ? ' (this node)' : ''),
     row.transport || '-',
     ((row.transport === 'tcp' ? row.address : row.sock) || '-') + (row.nodeApi ? ` (node api ${row.nodeApi})` : ''),
     row.capabilities.join(',') || '-',
@@ -97,7 +97,25 @@ async function listNodes(argv, deps) {
   // single-node install never does, and its rows are what they always were.
   const nodeApi = (deps.nodeApiListen || registry.nodeApiListen)();
   if (nodeApi.enabled) for (const row of rows) if (row.daemon && !row.invalid) row.nodeApi = nodeApi.listen;
-  console.log(o.json ? JSON.stringify(rows) : renderNodes(rows));
+  // On a pane-only node this list is the machine's own configuration, whose one row
+  // carries the daemon's name over this machine's own socket and status: a session
+  // there read it as "this is the daemon". The row is this node's, so it is named so,
+  // and a line says where the daemon is. `keep nodes ls` on a node with the daemon's
+  // address is forwarded and prints the daemon's fleet table instead (keep.js).
+  const where = nodes.paneOnlyNode(deps.env || process.env);
+  if (where) {
+    for (const row of rows) {
+      if (!row.daemon) continue;
+      row.name = where.local;
+      row.daemon = false;
+      row.thisNode = true;
+    }
+  }
+  if (o.json) { console.log(JSON.stringify(rows)); return; }
+  console.log(renderNodes(rows));
+  if (where) {
+    console.log(`this is node ${where.local}'s own view; the daemon runs on node ${where.daemon}, and keep nodes ls asks it for the fleet`);
+  }
 }
 
 function addNode(argv, deps) {

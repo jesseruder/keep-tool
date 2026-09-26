@@ -1882,12 +1882,25 @@ test('on a pane-only node the registry commands name the daemon node and exit 2'
   try {
     const before = registrySnapshot(f.root);
     for (const argv of [['list'], [], ['checkin', 'unread-card', '-m', 'state'], ['add', 'A card'], ['show', 'unread-card'],
-      ['tell', 'unread-card', 'hello'], ['open', 'unread-card'], ['land', 'unread-card'], ['sync'], ['serve'],
-      ['nodes', 'add', 'x'], ['node', 'ls'], ['init'], ['usage'], ['move', 'sess-a', '--node', 'main']]) {
+      ['tell', 'unread-card', 'hello'], ['open', 'unread-card'], ['land', 'unread-card'], ['usage'],
+      ['move', 'sess-a', '--node', 'main'], ['accounts', 'list']]) {
       const result = await keep(argv);
       const cmd = argv[0] || 'list';
       assert.equal(result.status, 2, `${argv.join(' ')}: ${result.stderr}`);
       assert.equal(result.stderr, `keep ${cmd}: the registry lives on node main; this is node aws1\n`);
+      assert.equal(result.stdout, '');
+    }
+    // The commands no node forwards say why they run only on the daemon node.
+    for (const [argv, why] of [
+      [['sync'], 'it pulls and pushes the registry checkout the daemon owns'], [['serve'], 'it is the daemon itself'],
+      [['nodes', 'add', 'x'], 'the node list and the tokens that reach each node live on the daemon'],
+      [['node', 'ls'], 'only keep node init runs on a node; the audit compares the daemon node with the node it names'],
+      [['init'], 'it creates a registry, and the registry lives with the daemon'],
+      [['accounts', 'add', 'x'], "it writes the daemon's account configuration and credentials"],
+    ]) {
+      const result = await keep(argv);
+      assert.equal(result.status, 2, `${argv.join(' ')}: ${result.stderr}`);
+      assert.equal(result.stderr, `keep ${argv[0]} runs only on the daemon node, main (${why}); this is node aws1\n`);
       assert.equal(result.stdout, '');
     }
     assert.deepEqual(registrySnapshot(f.root), before, 'nothing under the registry was written');
@@ -1911,6 +1924,18 @@ test('on a pane-only node the registry commands name the daemon node and exit 2'
     }
     // A name inherited from Object.prototype is not an entry in the table.
     assert.match(paneOnlyRefusal('constructor', [], node), /registry lives on node main/);
+    for (const [cmd, args] of [['restart-daemon', []], ['self-repair', ['status']], ['archive', []], ['service', ['status']],
+      ['transfer', ['sess-a']], ['nodes', ['rm', 'aws1']]]) {
+      assert.match(paneOnlyRefusal(cmd, args, node), new RegExp(`^keep ${cmd} runs only on the daemon node, main \\(.+\\); this is node aws1$`), cmd);
+    }
+
+    // The bare `keep nodes` answers for this machine, and says so: its one row is this
+    // node's, not a daemon's, and a line says where the daemon is.
+    const own = await keep(['nodes']);
+    assert.equal(own.status, 0, own.stderr);
+    assert.match(own.stdout, /^aws1 \(this node\)/m);
+    assert.doesNotMatch(own.stdout, /\(daemon\)/);
+    assert.match(own.stdout, /this is node aws1's own view; the daemon runs on node main, and keep nodes ls asks it for the fleet/);
 
     // On the daemon node, nothing changes.
     for (const env of [{}, { KEEP_NODE_NAME: 'main', KEEP_DAEMON_NODE: 'main' }]) {

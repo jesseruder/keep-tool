@@ -4438,6 +4438,11 @@ function paneOnlyRefusal(cmd, args, env = process.env) {
   if (!where) return null;
   const rule = Object.prototype.hasOwnProperty.call(PANE_ONLY_COMMANDS, cmd) ? PANE_ONLY_COMMANDS[cmd] : null;
   if (rule === true || (typeof rule === 'function' && rule(args))) return null;
+  // A command that is deliberately not forwarded says why it runs only on the daemon
+  // node (registry-commands DAEMON_ONLY); the registry line would read as a missing
+  // registry when the command is one that belongs to the daemon's machine.
+  const why = require('./registry-commands.js').daemonOnlyReason(cmd, args);
+  if (why) return `keep ${cmd} runs only on the daemon node, ${where.daemon} (${why}); this is node ${where.local}`;
   return `keep ${cmd}: the registry lives on node ${where.daemon}; this is node ${where.local}`;
 }
 // `keep review-land --file <path>` or `keep review-land -` on a pane-only node: the
@@ -4524,9 +4529,10 @@ if (require.main === module) {
         await allowRemote(rest, remote);
         return;
       }
-      // `keep nodes` answers for this machine (ls, usage) except `update`, which
-      // only the daemon can run: it holds the node list and their tokens.
-      const localNodes = cmd === 'nodes' && rest[0] !== 'update';
+      // `keep nodes` answers for this machine (the bare list and usage) except `update`,
+      // which only the daemon can run: it holds the node list and their tokens, and
+      // `ls`, the fleet table, which only the daemon can draw for the same reason.
+      const localNodes = cmd === 'nodes' && !['update', 'ls'].includes(rest[0]);
       if (remote && cmd === 'checkin' && rest.some((arg) => arg === '--attach')) {
         const result = await checkinRemote(rest, remote);
         if (result.stdout) process.stdout.write(result.stdout);

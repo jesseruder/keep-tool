@@ -358,12 +358,21 @@ test('a command that is not registry-class still refuses, and without a daemon U
   const { root, env } = nodeEnv(t);
   // keep artifact is not registry-class either, but a node with a URL posts its files
   // to /api/artifact (see the tests at the end); without a URL it refuses as these do.
-  // handoff is forwarded now (with its --pane qualified); these are not.
-  for (const argv of [['transfer', 'sess-a'], ['sync'], ['serve']]) {
+  // The commands a node deliberately does not forward say why they run only on the
+  // daemon node; one in neither table keeps the registry line.
+  for (const [argv, why] of [
+    [['transfer', 'sess-a', '--account', 'x', '--context', 'h.md'], "it reads the source session's transcript, the working tree and the --context file from its own disk"],
+    [['sync'], 'it pulls and pushes the registry checkout the daemon owns'],
+    [['serve'], 'it is the daemon itself'],
+    [['nodes', 'add', 'aws2', '--address', '10.0.0.2:7777'], 'the node list and the tokens that reach each node live on the daemon'],
+    [['node', 'audit', 'aws1'], 'only keep node init runs on a node; the audit compares the daemon node with the node it names'],
+  ]) {
     const result = await run(argv, { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
     assert.equal(result.status, 2, argv.join(' '));
-    assert.equal(result.stderr, `keep ${argv[0]}: the registry lives on node main; this is node aws1\n`);
+    assert.equal(result.stderr, `keep ${argv[0]} runs only on the daemon node, main (${why}); this is node aws1\n`);
   }
+  const unknown = await run(['review-eval'], { env: { ...env, KEEP_DAEMON_URL: daemon.url }, cwd: root });
+  assert.equal(unknown.stderr, 'keep review-eval: the registry lives on node main; this is node aws1\n');
   const plain = await run(['show', 'card'], { env, cwd: root });
   assert.equal(plain.status, 2);
   assert.equal(plain.stderr, 'keep show: the registry lives on node main; this is node aws1\n');
@@ -569,6 +578,22 @@ test('a tell naming a file on the node, or waiting past a day, is refused on the
 
 // The rest of the node CLI: what a node sends for the newly forwarded commands, and
 // what it refuses before sending.
+test('keep nodes ls from a node is the daemon\'s fleet table; nodes add is refused as daemon-only, and nothing is posted for it', async (t) => {
+  const daemon = await stubDaemon(t, () => ({ status: 200, body: { ok: true, status: 0, stdout: 'name  transport\nmain (daemon)  unix\naws1  tcp\n', stderr: '', replayed: false } }));
+  const { root, env } = nodeEnv(t);
+  env.KEEP_DAEMON_URL = daemon.url;
+  const listed = await run(['nodes', 'ls'], { env, cwd: root });
+  assert.equal(listed.status, 0, listed.stderr);
+  assert.match(listed.stdout, /main \(daemon\)/);
+  assert.equal(daemon.requests.length, 1);
+  assert.equal(daemon.requests[0].body.command, 'nodes');
+  assert.deepEqual(daemon.requests[0].body.args, ['ls']);
+  const added = await run(['nodes', 'add', 'aws2', '--address', '10.0.0.2:7777'], { env, cwd: root });
+  assert.equal(added.status, 2);
+  assert.match(added.stderr, /^keep nodes runs only on the daemon node, main \(/);
+  assert.equal(daemon.requests.length, 1);
+});
+
 test('a node qualifies a bare pane it names for handoff and force-restart, and its request outlasts a move', async (t) => {
   const { runRemote, requestTimeoutMs, REQUEST_TIMEOUT_MS } = require('./remote-cli.js');
   const { MOVE_EXTRA_MS, OPEN_EXTRA_MS, PROBE_EXTRA_MS, WAIT_DEFAULT_MS } = require('./registry-commands.js');
