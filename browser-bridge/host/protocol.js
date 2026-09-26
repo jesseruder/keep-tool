@@ -2,6 +2,7 @@
 //
 // Pure Node: no `chrome` global, no side effects on import, so the tests can load it.
 
+import { execFileSync } from "node:child_process";
 import { createHash } from "node:crypto";
 import fs from "node:fs";
 import { endianness, homedir } from "node:os";
@@ -375,21 +376,53 @@ export function edgeLogPath(env = process.env, platform = process.platform) {
 /**
  * A name `keep browser show` left for the session in a Keep pane that had none from its
  * launch; bin/headers.js sends it. Keyed by KEEP_PANE, which the session's own process
- * and every command it runs share. Null for anything that is not a plain pane id.
+ * and every command it runs share, and bound to the agent's process (CLAUDE_PID), since
+ * Keep reuses a pane id for a later process. Null for anything that is not a plain pane id.
  */
 export function paneNamePath(pane, env = process.env, platform = process.platform) {
   if (typeof pane !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(pane)) return null;
   return path.join(runtimeDir(env, platform), "pane-names", pane);
 }
 
-/** That name, or undefined: bin/headers.js calls this on every request and it never throws. */
-export function readPaneName(pane, env = process.env) {
+/**
+ * That name, or undefined when there is none or it belongs to another process in this pane.
+ * bin/headers.js calls this on every request and it never throws. `ancestors` is only a
+ * seam for the tests.
+ */
+export function readPaneName(pane, env = process.env, ancestors = ancestorPids) {
   const file = paneNamePath(pane, env);
   if (!file) return undefined;
   try {
-    return fs.readFileSync(file, "utf8").trim() || undefined;
+    const { name, pid } = JSON.parse(fs.readFileSync(file, "utf8"));
+    if (typeof name !== "string" || !name || !Number.isInteger(pid) || pid <= 1) return undefined;
+    return ancestors().includes(pid) ? name : undefined;
   } catch {
     return undefined;
+  }
+}
+
+/** This process's parent, grandparent and so on, a few levels up. */
+function ancestorPids(levels = 8) {
+  const pids = [];
+  let pid = process.ppid;
+  for (let i = 0; i < levels && pid > 1; i++) {
+    pids.push(pid);
+    pid = parentOf(pid);
+  }
+  return pids;
+}
+
+function parentOf(pid) {
+  try {
+    if (process.platform === "linux") {
+      // `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
+      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+      return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) || 0;
+    }
+    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
+    return Number(out.trim()) || 0;
+  } catch {
+    return 0;
   }
 }
 

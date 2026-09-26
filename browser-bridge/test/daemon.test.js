@@ -174,6 +174,33 @@ test("a session that starts unnamed takes the name its header carries later, and
   assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
 });
 
+test("a rename the host refuses is tried again on the next request", async (t) => {
+  const dir = tempDir(t);
+  let refuse = true;
+  const host = await fakeHost(t, dir, (message) => {
+    if (message.method === "rename" && refuse) return { ok: false, error: { message: "Unknown method: rename" } };
+    return defaultHandler(message);
+  });
+  const { port, logs } = await startDaemon(t, dir);
+  const headers = { Authorization: `Bearer ${TOKEN}` };
+  const client = new Client({ name: "daemon-test", version: "0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
+  t.after(() => client.close().catch(() => {}));
+  await client.callTool({ name: "browser_status", arguments: {} });
+
+  headers["X-Browser-Bridge-Session"] = "#405";
+  // The tool call still runs, and the client carries the name into its next hello.
+  const refused = await client.callTool({ name: "browser_status", arguments: {} });
+  assert.match(refused.content[0].text, /Session: #405/);
+  assert.ok(logs.some((line) => line.includes("could not be renamed")), logs.join("\n"));
+
+  refuse = false;
+  await client.callTool({ name: "browser_status", arguments: {} });
+  const renames = host.received.filter((m) => m.method === "rename");
+  assert.equal(renames.length, 2);
+  assert.ok(logs.some((line) => line.includes("session renamed")), logs.join("\n"));
+});
+
 test("without the header the session is named after the client, numbered", async (t) => {
   const dir = tempDir(t);
   const host = await fakeHost(t, dir);

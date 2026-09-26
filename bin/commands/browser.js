@@ -60,6 +60,11 @@ async function show(argv) {
   const api = transport();
   const pane = paneRef(api);
   if (!pane) die('keep browser show: this session is not running in a Keep pane (no KEEP_PANE)');
+  // A session Keep could not name at launch is named through its pane, which only a
+  // Claude session's headers helper can see: Codex runs it without the session's env.
+  if (!process.env.BROWSER_BRIDGE_SESSION_NAME && !claudePid()) {
+    die('keep browser show: this session\'s browser has no Keep name (BROWSER_BRIDGE_SESSION_NAME), and only a Claude session can be named after launch; restart it from Keep');
+  }
   const body = await call(() => api.post('/api/browser-view/open', {
     sessionId: session.id,
     pane,
@@ -86,7 +91,12 @@ async function leavePaneName(pane, name) {
   const file = paneNamePath(pane, process.env);
   if (!file) die(`keep browser show: cannot name the browser of pane ${pane}`);
   await fs.promises.mkdir(path.dirname(file), { recursive: true });
-  await fs.promises.writeFile(file, `${name}\n`, { mode: 0o600 });
+  await fs.promises.writeFile(file, `${JSON.stringify({ name, pid: claudePid() })}\n`, { mode: 0o600 });
+}
+
+function claudePid() {
+  const pid = Number(process.env.CLAUDE_PID);
+  return Number.isInteger(pid) && pid > 1 ? pid : null;
 }
 
 async function hide(argv) {

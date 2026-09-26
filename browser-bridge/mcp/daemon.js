@@ -318,13 +318,15 @@ export function createDaemon({
         // sessionKey it had, which is what makes the extension hand back the same tab group.
         entry = await adoptOnce(req, sessionId);
       }
-      await renameFromRequest(sessionId, entry, req);
       // Any request at all means the client is still there; the sweep reads this.
       entry.lastSeenAt = now();
       known.touch(registryKey(sessionId), entry.lastSeenAt);
       if (req.method === "GET") trackStream(entry, res);
       else entry.inFlight += 1;
       try {
+        // Only once the request counts as live: the rename waits on the host, and the
+        // sweep must not end the session under it.
+        if (req.method !== "GET") await renameFromRequest(sessionId, entry, req);
         await entry.transport.handleRequest(req, res, body);
       } finally {
         // A session is never ended out from under a tool call, so the count has to come back
@@ -397,15 +399,20 @@ export function createDaemon({
    */
   async function renameFromRequest(id, entry, req) {
     const name = readHeaderValue(req.headers["x-browser-bridge-session"]);
-    if (!name || name === entry.name) return;
+    if (!name || name === entry.name || !entry.client.rename) return;
+    // Recorded only once the host has it, so a refusal (a host from before rename, or one
+    // that is restarting) is tried again on the next request instead of being forgotten.
+    try {
+      await entry.client.rename(name);
+    } catch (error) {
+      if (entry.renameFailed !== name) log(`session ${tag(id)} could not be renamed ${JSON.stringify(name)}: ${error?.message ?? error}`);
+      entry.renameFailed = name;
+      return;
+    }
     log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
     entry.name = name;
+    entry.renameFailed = null;
     known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
-    try {
-      await entry.client.rename?.(name);
-    } catch (error) {
-      log(`could not tell the host about the rename: ${error?.message ?? error}`);
-    }
   }
 
   function newEntry(identity, client) {
