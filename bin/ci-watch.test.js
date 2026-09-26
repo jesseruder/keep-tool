@@ -249,6 +249,39 @@ test('a pass out of budget stops starting lookups and saves what it read', async
   assert.equal(result.lookups, 0);
 });
 
+test('a second pass while one runs is skipped, and a dead pass\'s lock is taken over', async () => {
+  reset();
+  const lock = path.join(ROOT, '.keep', 'ci-watch', 'pass.lock');
+  fs.mkdirSync(path.dirname(lock), { recursive: true });
+  fs.writeFileSync(lock, '1');
+  const now = Date.now();
+  assert.equal((await ciWatch.tick({ now, fetch: fakeFetch({}) })).skipped, 'another pass is running');
+  assert.equal((await ciWatch.tick({ now: now + 7 * 60e3, fetch: fakeFetch({}) })).skipped, undefined);
+  assert.equal(fs.existsSync(lock), false);
+});
+
+test('a note already on the card is not written again', async () => {
+  reset();
+  writeCard('ci-once-card', 'done');
+  const { dir, shas } = repo();
+  const at = Date.now();
+  ciWatch.register({ repo: dir, sha: shas[2], branch: 'main', card: 'ci-once-card', now: at });
+  const table = {
+    [shas[1]]: status(['ci/circleci: test', 'success']),
+    [shas[2]]: status(['ci/circleci: test', 'failure']),
+  };
+  // The check-in lands, and then the pass dies before it records that.
+  let calls = 0;
+  const checkin = (id, options) => { calls += 1; keep.checkinTask(id, options); throw new Error('killed'); };
+  await ciWatch.tick({ now: at + 60e3, fetch: fakeFetch(table), checkin });
+  await ciWatch.tick({ now: at + 120e3, fetch: fakeFetch(table) });
+  assert.equal(calls, 1);
+  const body = keep.loadTask('ci-once-card').body;
+  assert.equal(body.split('ci (daemon)').length - 1, 1);
+  const note = ciWatch.loadWatches()[`${SLUG}@${shas[2]}`].outbox.find((item) => item.type === 'note');
+  assert.ok(note.doneAt && note.reopened);
+});
+
 test('an intermediate commit is judged by the build of the push that carried it', async () => {
   reset();
   const { dir, shas } = repo({ count: 4 });

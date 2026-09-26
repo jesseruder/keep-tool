@@ -39,6 +39,10 @@ const RED_POLL_MS = 24 * 3600e3;
 const RED_SLOW_POLL_MS = 30 * 60e3;
 // A pass stops starting lookups after this, well inside the scheduler's timeout.
 const TICK_BUDGET_MS = 3 * 60e3;
+// Notes and messages get another minute; a message tries at most three sessions.
+const OUTBOX_BUDGET_MS = 60e3;
+const TELL_CANDIDATES = 3;
+const PASS_LOCK_STALE_MS = 6 * 60e3;
 const DELIVER_GIVE_UP_MS = 30 * 60e3;
 const KEEP_RESOLVED_MS = 7 * 86400e3;
 const COVER_SCAN = 30;
@@ -433,14 +437,18 @@ function sessionCandidates(watch) {
   return ids;
 }
 
-// Through the daemon's /api/send, the route the console's own send uses. Tries each
-// candidate in turn; null when none took it.
+// Through the daemon's /api/send, the route the console's own send uses. Tries the
+// next candidate only on a definite refusal: a request that timed out may still have
+// been delivered, and the same alert in two sessions is worse than one uncertain send.
 async function postSend(ids, text) {
   for (const sessionId of ids) {
-    try {
-      const response = await keep.postKeepApi('/api/send', { sessionId, text }, 30e3);
-      if (response.status === 200) return { sessionId };
-    } catch {}
+    let response;
+    try { response = await keep.postKeepApi('/api/send', { sessionId, text }, 30e3); }
+    catch (error) {
+      if (/timed out/.test(String(error && error.message))) return { sessionId, uncertain: true };
+      continue;
+    }
+    if (response.status === 200) return { sessionId };
   }
   return null;
 }
@@ -449,19 +457,23 @@ function workNote(watch, item, checkin, now) {
   let task;
   try { task = keep.loadTask(item.card); }
   catch { return { ...item, gaveUp: 'card not open' }; }
+  // The note carries its event's tag, so a pass that saved it and then died before
+  // recording that (or whose registry commit failed after the save) finds it on the
+  // card instead of writing it twice.
+  const tag = `[ci ${short(watch.sha)} ${item.event}]`;
+  if (String(task.body || '').includes(tag)) {
+    return { ...item, doneAt: now, reopened: Boolean(item.reopen && task.fm.status === 'active') };
+  }
   const status = item.reopen && ['done', 'landing', 'review'].includes(task.fm.status) ? 'active' : undefined;
   try {
-    // Saved without the registry commit: a check-in that saved and then failed to
-    // commit would otherwise be retried and written twice. The commit is best-effort.
     checkin(item.card, {
-      heading: 'ci (daemon)', message: cardNote(watch, item.kind), status,
-      linkSession: false, commitLabel: 'ci', commit: false,
+      heading: 'ci (daemon)', message: `${cardNote(watch, item.kind)} ${tag}`, status,
+      linkSession: false, commitLabel: 'ci',
     });
   } catch (error) {
     const retry = { ...item, attempts: Number(item.attempts || 0) + 1, error: String(error && error.message || error).slice(0, 200) };
     return now - Number(item.at) > DELIVER_GIVE_UP_MS ? { ...retry, gaveUp: 'check-in kept failing' } : retry;
   }
-  try { keep.commitAndPush(`keep: ci ${item.card}${status ? ` (${status})` : ''}`); } catch {}
   return { ...item, doneAt: now, reopened: Boolean(status) };
 }
 
@@ -471,7 +483,7 @@ async function workTell(watch, item, deliver, now) {
   if (notes.some((note) => !note.doneAt && !note.gaveUp)) return item;
   const reopened = notes.filter((note) => note.reopened).map((note) => note.card);
   const text = item.kind === 'stuck' ? stuckMessage(watch) : redMessage(watch, reopened);
-  const ids = sessionCandidates(watch);
+  const ids = sessionCandidates(watch).slice(0, TELL_CANDIDATES);
   let result = null;
   if (ids.length) {
     try { result = await deliver(ids, text); } catch {}
@@ -537,6 +549,35 @@ async function tick({
   root = keep.ROOT, now = Date.now(), fetch = fetchAsync, deliver = postSend, checkin = keep.checkinTask,
   budgetMs = TICK_BUDGET_MS, clock = Date.now,
 } = {}) {
+  const release = passLock(root, now);
+  if (!release) return { watched: 0, lookups: 0, failures: 0, changed: 0, skipped: 'another pass is running' };
+  try { return await pass({ root, now, fetch, deliver, checkin, budgetMs, clock }); }
+  finally { release(); }
+}
+
+// One pass at a time, whoever starts it (the daemon's minute tick or `keep ci-watch`
+// by hand): two passes would both see a pending watch go red and both enqueue it.
+function passLock(root, now) {
+  const file = path.join(dir(root), 'pass.lock');
+  fs.mkdirSync(dir(root), { recursive: true });
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      fs.writeFileSync(file, String(process.pid), { flag: 'wx' });
+      return () => { try { fs.unlinkSync(file); } catch {} };
+    } catch (error) {
+      if (error.code !== 'EEXIST') throw error;
+      // A pass is killed at the scheduler's five-minute timeout; a lock older than
+      // that belongs to a dead one.
+      let age = 0;
+      try { age = now - fs.statSync(file).mtimeMs; } catch { continue; }
+      if (age < PASS_LOCK_STALE_MS) return null;
+      try { fs.unlinkSync(file); } catch {}
+    }
+  }
+  return null;
+}
+
+async function pass({ root, now, fetch, deliver, checkin, budgetMs, clock }) {
   const started = clock();
   const config = loadConfig(root);
   const snapshot = loadWatches(root);
@@ -568,6 +609,7 @@ async function tick({
       for (let index = 0; index < watch.outbox.length; index += 1) {
         const item = watch.outbox[index];
         if (item.doneAt || item.gaveUp || item.type !== type) continue;
+        if (clock() - started > budgetMs + OUTBOX_BUDGET_MS) return { watched: Object.keys(snapshot).length, lookups, failures, changed };
         const worked = type === 'note' ? workNote(watch, item, checkin, now) : await workTell(watch, item, deliver, now);
         watch.outbox[index] = worked;
         if (JSON.stringify(worked) !== JSON.stringify(item)) {
