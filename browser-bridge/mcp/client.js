@@ -174,12 +174,19 @@ export class BridgeClient {
 
   /**
    * A new name for this session, which the host passes to the extension with every request
-   * from now on. A disconnected client only keeps it: its next hello carries it.
+   * from now on. A disconnected client only keeps it: its next hello carries it, and so
+   * does the reconnect a host from before rename is given.
    */
   async rename(name) {
     this.name = name;
     if (!this.connected) return;
-    await this.#send("rename", { name });
+    try {
+      await this.#send("rename", { name });
+    } catch (error) {
+      // A host from before rename: start again, and the next hello carries the name.
+      if (!/Unknown method: rename/.test(error?.message ?? "")) throw error;
+      this.#teardown(new BridgeUnavailableError("reconnecting with a new name"));
+    }
   }
 
   /**

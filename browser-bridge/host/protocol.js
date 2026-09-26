@@ -386,44 +386,77 @@ export function paneNamePath(pane, env = process.env, platform = process.platfor
 
 /**
  * That name, or undefined when there is none or it belongs to another process in this pane.
- * bin/headers.js calls this on every request and it never throws. `ancestors` is only a
- * seam for the tests.
+ * The record names the agent's process by pid and start time, so neither a later process
+ * in a reused pane nor a recycled pid inherits it. bin/headers.js calls this on every
+ * request and it never throws. `ancestors` is only a seam for the tests.
  */
-export function readPaneName(pane, env = process.env, ancestors = ancestorPids) {
+export function readPaneName(pane, env = process.env, ancestors = ancestorProcesses) {
   const file = paneNamePath(pane, env);
   if (!file) return undefined;
   try {
-    const { name, pid } = JSON.parse(fs.readFileSync(file, "utf8"));
+    const { name, pid, started } = JSON.parse(fs.readFileSync(file, "utf8"));
     if (typeof name !== "string" || !name || !Number.isInteger(pid) || pid <= 1) return undefined;
-    return ancestors().includes(pid) ? name : undefined;
+    if (typeof started !== "string" || !started) return undefined;
+    return ancestors().some((p) => p.pid === pid && p.started === started) ? name : undefined;
   } catch {
     return undefined;
   }
 }
 
-/** This process's parent, grandparent and so on, a few levels up. */
-function ancestorPids(levels = 8) {
-  const pids = [];
-  let pid = process.ppid;
-  for (let i = 0; i < levels && pid > 1; i++) {
-    pids.push(pid);
-    pid = parentOf(pid);
-  }
-  return pids;
+/** When a process started, as a string only comparable to another answer from here. */
+export function processStarted(pid) {
+  if (!Number.isInteger(pid) || pid <= 1) return null;
+  if (process.platform === "linux") return linuxStat(pid)?.started ?? null;
+  return psTable([pid]).get(pid)?.started ?? null;
 }
 
-function parentOf(pid) {
-  try {
-    if (process.platform === "linux") {
-      // `pid (comm) state ppid ...`; comm may hold spaces and parentheses.
-      const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
-      return Number(stat.slice(stat.lastIndexOf(")") + 2).split(" ")[1]) || 0;
-    }
-    const out = execFileSync("ps", ["-o", "ppid=", "-p", String(pid)], { encoding: "utf8", timeout: 2000 });
-    return Number(out.trim()) || 0;
-  } catch {
-    return 0;
+/** This process's parent, grandparent and so on, a few levels up: `[{pid, started}]`. */
+function ancestorProcesses(levels = 8) {
+  // One read of the process table off Linux: a ps per level would cost a process each.
+  let lookup = linuxStat;
+  if (process.platform !== "linux") {
+    const table = psTable();
+    lookup = (pid) => table.get(pid) ?? null;
   }
+  const chain = [];
+  let pid = process.ppid;
+  for (let i = 0; i < levels && pid > 1; i++) {
+    const entry = lookup(pid);
+    if (!entry) break;
+    chain.push({ pid, started: entry.started });
+    pid = entry.ppid;
+  }
+  return chain;
+}
+
+function linuxStat(pid) {
+  try {
+    // `pid (comm) state ppid ... starttime ...`; comm may hold spaces and parentheses.
+    const stat = fs.readFileSync(`/proc/${pid}/stat`, "utf8");
+    const fields = stat.slice(stat.lastIndexOf(")") + 2).split(" ");
+    return { ppid: Number(fields[1]) || 0, started: fields[19] || null };
+  } catch {
+    return null;
+  }
+}
+
+/** `ps` rows as pid -> {ppid, started}, for the given pids or for every process. */
+function psTable(pids = null) {
+  try {
+    const args = pids ? ["-o", "pid=,ppid=,lstart=", "-p", pids.join(",")] : ["-A", "-o", "pid=,ppid=,lstart="];
+    return parsePsTable(execFileSync("ps", args, { encoding: "utf8", timeout: 3000 }));
+  } catch {
+    return new Map();
+  }
+}
+
+export function parsePsTable(text) {
+  const table = new Map();
+  for (const line of String(text).split("\n")) {
+    const match = /^\s*(\d+)\s+(\d+)\s+(\S.*?)\s*$/.exec(line);
+    if (match) table.set(Number(match[1]), { ppid: Number(match[2]), started: match[3] });
+  }
+  return table;
 }
 
 // --- the shared MCP daemon ------------------------------------------------

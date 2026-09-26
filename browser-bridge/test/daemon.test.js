@@ -174,11 +174,33 @@ test("a session that starts unnamed takes the name its header carries later, and
   assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
 });
 
+test("a host from before rename is reconnected, and its new hello carries the name", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir, (message) => {
+    if (message.method === "rename") return { ok: false, error: { message: "Unknown method: rename" } };
+    return defaultHandler(message);
+  });
+  const { port } = await startDaemon(t, dir);
+  const headers = { Authorization: `Bearer ${TOKEN}` };
+  const client = new Client({ name: "daemon-test", version: "0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
+  t.after(() => client.close().catch(() => {}));
+  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.equal(host.hellos().length, 1);
+
+  headers["X-Browser-Bridge-Session"] = "#405";
+  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.equal(host.hellos().at(-1).params.name, "#405");
+  // Settled: the same name is not sent again.
+  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
+});
+
 test("a rename the host refuses is tried again on the next request", async (t) => {
   const dir = tempDir(t);
   let refuse = true;
   const host = await fakeHost(t, dir, (message) => {
-    if (message.method === "rename" && refuse) return { ok: false, error: { message: "Unknown method: rename" } };
+    if (message.method === "rename" && refuse) return { ok: false, error: { message: "the host is busy" } };
     return defaultHandler(message);
   });
   const { port, logs } = await startDaemon(t, dir);

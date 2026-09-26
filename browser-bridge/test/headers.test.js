@@ -10,6 +10,7 @@ import test from "node:test";
 import { fileURLToPath } from "node:url";
 
 import { buildHeaders } from "../bin/headers.js";
+import { parsePsTable, processStarted } from "../host/protocol.js";
 
 const HELPER = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "bin", "headers.js");
 const TOKEN = "a1b2c3d4".repeat(8);
@@ -31,8 +32,8 @@ test("a pane Keep could not name at launch sends the name keep browser show left
   const dir = runtime(t);
   fs.mkdirSync(path.join(dir, "pane-names"));
   // Left by a command the agent ran: bound to the agent process, one of ours here.
-  const leave = (pane, pid) =>
-    fs.writeFileSync(path.join(dir, "pane-names", pane), `${JSON.stringify({ name: "#405", pid })}\n`);
+  const leave = (pane, pid, started = processStarted(pid)) =>
+    fs.writeFileSync(path.join(dir, "pane-names", pane), `${JSON.stringify({ name: "#405", pid, started })}\n`);
   leave("54738c1e", process.ppid);
   const named = (env) => buildHeaders({ BROWSER_BRIDGE_RUNTIME_DIR: dir, ...env })["X-Browser-Bridge-Session"];
   assert.equal(named({ KEEP_PANE: "54738c1e" }), "#405");
@@ -41,8 +42,11 @@ test("a pane Keep could not name at launch sends the name keep browser show left
   assert.equal(named({ KEEP_PANE: "0000aaaa" }), undefined);
   assert.equal(named({ KEEP_PANE: "../pane-names/54738c1e" }), undefined);
 
-  // A name left by an earlier process in a reused pane is not this session's.
-  leave("54738c1e", 2 ** 30);
+  // A name left by an earlier process in a reused pane is not this session's, and nor is
+  // one left by a process whose pid has since been handed to ours.
+  leave("54738c1e", 2 ** 30, "1");
+  assert.equal(named({ KEEP_PANE: "54738c1e" }), undefined);
+  leave("54738c1e", process.ppid, "0");
   assert.equal(named({ KEEP_PANE: "54738c1e" }), undefined);
   fs.writeFileSync(path.join(dir, "pane-names", "54738c1e"), "#405\n");
   assert.equal(named({ KEEP_PANE: "54738c1e" }), undefined);
@@ -207,4 +211,11 @@ test("the helper's import graph never reaches the MCP SDK", () => {
       assert.ok(dependency.startsWith("node:"), `${leaf} pulls in ${dependency}`);
     }
   }
+});
+
+test("ps rows parse into parent and start time, the way macOS prints them", () => {
+  const table = parsePsTable("  812   1 Fri Sep 25 09:47:43 2026\n 4051  812 Fri Sep 25 10:02:11 2026\nnoise\n");
+  assert.deepEqual(table.get(4051), { ppid: 812, started: "Fri Sep 25 10:02:11 2026" });
+  assert.equal(table.get(812).ppid, 1);
+  assert.equal(table.size, 2);
 });
