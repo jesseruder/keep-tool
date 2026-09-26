@@ -352,3 +352,78 @@ test('a seed replaces the mirror only with bytes that match the digest, and appe
     { ok: true, size: held.length + next.length, reset: false });
   assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), `${held}${next}`);
 });
+
+function seedFixture(t) {
+  const root = tempRoot(t);
+  const crypto = require('node:crypto');
+  const held = Buffer.from('{"n":1}\n{"n":2}\n');
+  const fromFile = path.join(root, 'held.jsonl');
+  fs.writeFileSync(fromFile, held);
+  const seedOf = (extra = {}) => mirror.seed({
+    root, node: 'aws1', sessionId: 'sess-1', fromFile, size: held.length,
+    sha256: crypto.createHash('sha256').update(held).digest('hex'),
+    generation: '7:8:9', mtimeMs: 1_700_000_000_000, sourcePath: SOURCE, now: () => 1_750_000_000_000, ...extra,
+  });
+  return { root, held, seedOf, dir: path.join(root, '.keep', 'transcript-mirrors', 'aws1') };
+}
+
+test('an append issued while a seed is in flight runs after it and sees the seeded generation', async (t) => {
+  const { root, held, seedOf, dir } = seedFixture(t);
+  const old = Buffer.from('old\n');
+  await postAsync(root, { bytes: old });
+  const more = Buffer.from('more\n');
+  const next = Buffer.from('{"n":3}\n');
+  // All three are issued before any of them has run: the seed first, then a post of the
+  // old generation continuing the old mirror, then a post of the seeded generation.
+  const seeding = seedOf();
+  const stale = postAsync(root, { bytes: more, fromOffset: old.length, size: old.length + more.length });
+  const fresh = postAsync(root, { generation: '7:8:9', bytes: next, fromOffset: held.length, size: held.length + next.length });
+  assert.deepEqual(await seeding, { ok: true, size: held.length });
+  // The old generation's post finds the seeded sidecar, so it is told to start again from 0
+  // and writes nothing; the seeded generation's post continues the seed.
+  assert.deepEqual(await stale, { ok: false, needFrom: 0 });
+  assert.deepEqual(await fresh, { ok: true, size: held.length + next.length, reset: false });
+  assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), `${held}${next}`);
+  const side = mirror.stat(root, 'aws1', 'sess-1');
+  assert.equal(side.generation, '7:8:9');
+  assert.equal(JSON.parse(fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8')).size, held.length + next.length,
+    'the sidecar agrees with the file');
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl']);
+});
+
+test('a seed whose sidecar cannot be written leaves the old mirror and sidecar as they were', async (t) => {
+  const { root, seedOf, dir } = seedFixture(t);
+  await postAsync(root, { bytes: Buffer.from('old\n') });
+  const file = mirror.paths(root, 'aws1', 'sess-1').file;
+  const before = { ino: fs.statSync(file).ino, file: fs.readFileSync(file, 'utf8'),
+    side: fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8') };
+  const writeFile = fs.promises.writeFile;
+  fs.promises.writeFile = async (target, ...rest) => {
+    if (/\.seedside\./.test(String(target))) throw Object.assign(new Error('simulated sidecar failure'), { code: 'ENOSPC' });
+    return writeFile(target, ...rest);
+  };
+  let result;
+  try { result = await seedOf(); } finally { fs.promises.writeFile = writeFile; }
+  assert.equal(result.ok, false);
+  assert.match(result.reason, /sidecar could not be written \(ENOSPC\)/);
+  assert.equal(fs.statSync(file).ino, before.ino);
+  assert.equal(fs.readFileSync(file, 'utf8'), before.file);
+  assert.equal(fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8'), before.side);
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl'], 'both temporary files are gone');
+  // And the seed still works once the sidecar can be written.
+  assert.equal((await seedOf()).ok, true);
+});
+
+test('prune takes a seed\'s temporary sidecar after the hour and never as a session', async (t) => {
+  const root = tempRoot(t);
+  await postAsync(root);
+  const dir = path.join(root, '.keep', 'transcript-mirrors', 'aws1');
+  const dead = path.join(dir, '.seedside.sess-1.4242.0badf00d.tmp');
+  fs.writeFileSync(dead, '{"generation":"x"}\n');
+  const now = Date.now();
+  assert.deepEqual(await mirror.pruneAsync(root, { now: () => now + 30 * 60e3 }), []);
+  assert.ok(fs.existsSync(dead));
+  assert.deepEqual(await mirror.pruneAsync(root, { now: () => now + 61 * 60e3 }), []);
+  assert.equal(fs.existsSync(dead), false);
+  assert.ok(mirror.stat(root, 'aws1', 'sess-1'));
+});
