@@ -169,6 +169,8 @@ export function createViewerHandlers() {
   // A detach in flight, per tab: a start waits for it rather than attaching into it.
   const releasing = new Map(); // tabId -> promise
   function detachTracked(tabId) {
+    // Two releases that overlap share the one detach, so a start waits for all of it.
+    if (releasing.has(tabId)) return releasing.get(tabId);
     const done = detach(tabId).finally(() => {
       if (releasing.get(tabId) === done) releasing.delete(tabId);
     });
