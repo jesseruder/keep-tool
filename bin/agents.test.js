@@ -75,6 +75,31 @@ function fakeRegistry(root) {
 
 // ---------- records ----------
 
+test('an idle agent keeps its last session, and its row publishes it', () => {
+  const root = makeRoot();
+  try {
+    agents.writeRecord('ci-health', { role: 'scheduled check', lifecycle: 'working', card: 'ci-card',
+      session: { id: 'sid-run', pane: 'p1', startedAt: 1000 } }, { root, now: 2000 });
+    const idle = agents.writeRecord('ci-health', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }, { root, now: 3000 });
+    assert.equal(idle.session.id, '');
+    assert.deepEqual(idle.lastSession, { id: 'sid-run', card: 'ci-card', at: 2000 }, 'kept from when it was set');
+    const row = agents.dashboardAgents({ root }).find((entry) => entry.name === 'ci-health');
+    assert.equal(row.session, null);
+    assert.deepEqual(row.lastSession, { id: 'sid-run', card: 'ci-card', at: 2000 });
+
+    // A record written before lastSession existed learns it as its session is cleared.
+    fs.writeFileSync(agents.recordFile('ci-health', root), JSON.stringify({ name: 'ci-health', role: 'scheduled check',
+      lifecycle: 'working', card: 'ci-card', session: { id: 'sid-old', pane: 'p0', startedAt: 500 } }));
+    const learned = agents.writeRecord('ci-health', { lifecycle: 'idle', card: '', session: { id: '', pane: '', startedAt: 0 } }, { root, now: 4000 });
+    assert.deepEqual(learned.lastSession, { id: 'sid-old', card: 'ci-card', at: 4000 });
+
+    // Nothing published for a malformed id.
+    fs.writeFileSync(agents.recordFile('ci-health', root), JSON.stringify({ name: 'ci-health', role: 'scheduled check',
+      session: {}, lastSession: { id: '../x' } }));
+    assert.equal(agents.dashboardAgents({ root }).find((entry) => entry.name === 'ci-health').lastSession, undefined);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('a record round-trips through the lock, and a second write merges rather than replaces', () => {
   const root = makeRoot();
   try {

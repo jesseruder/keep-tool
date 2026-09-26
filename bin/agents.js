@@ -230,8 +230,19 @@ function writeRecord(name, patch = {}, options = {}) {
     const current = readRecord(name, root);
     const session = patch.session && typeof patch.session === 'object'
       ? { ...(current ? current.session : {}), ...patch.session } : (current ? current.session : {});
+    // `lastSession` is the last session that carried the agent, kept when `session`
+    // is cleared: an idle scheduled-check agent has no session, and its row still
+    // opens the last run (its transcript) rather than nothing.
+    // A record written before this existed learns it from the session being cleared.
+    const carried = current && current.session && current.session.id
+      ? { id: String(current.session.id), card: String(current.card || ''), at: now } : null;
+    const lastSession = session && session.id
+      ? { id: String(session.id), card: String(patch.card !== undefined ? patch.card : (current && current.card) || ''), at: now }
+      : (current && current.session && current.session.id && current.lastSession && current.lastSession.id === current.session.id
+        ? current.lastSession : carried) || (current && current.lastSession) || patch.lastSession;
     const merged = normalizeRecord(name, {
       ...(current || {}), ...patch, session,
+      ...(lastSession ? { lastSession } : {}),
       createdAt: (current && current.createdAt) || Number(patch.createdAt || 0) || now,
     });
     writeJsonAtomic(recordFile(name, root), merged);
@@ -913,6 +924,14 @@ function sessionForAgent(name, sessions, record = null, panes = null) {
 // is carrying. A dashboard build runs on every state refresh, so it must not open a
 // feed: an agent months into its life would then cost a full parse of its whole
 // history on every poll.
+// The session an idle agent's row opens: the last one that carried it. Only a
+// well-formed id is published; the console opens it as a session (its transcript).
+function lastSessionView(record) {
+  const last = record && record.lastSession;
+  const id = last && typeof last.id === 'string' ? last.id : '';
+  return /^[A-Za-z0-9_-]+$/.test(id) ? { id, card: oneLine(last.card || '', 120), at: Number(last.at) || 0 } : null;
+}
+
 function agentView(record, options = {}) {
   const last = record.lastEvent;
   const session = record.session.id || record.session.pane
@@ -933,6 +952,7 @@ function agentView(record, options = {}) {
     ...(needsInput ? { needsInput: true } : {}),
     card: record.card || (record.lifecycle === 'working' && last ? last.card : '') || '',
     session,
+    ...(lastSessionView(record) ? { lastSession: lastSessionView(record) } : {}),
     lastEvent: last,
     unseen: { ...record.unseen },
   };

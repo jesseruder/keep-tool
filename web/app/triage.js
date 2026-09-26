@@ -397,7 +397,8 @@ function ensureAgentFeed(ctx, agent) {
 // Clicking an Agents row is "show me this agent": its live pane goes on the
 // stage, in the one slot the stage terminal already owns, so there is never a
 // second view of the same PTY. An agent whose pane is gone opens as its session
-// instead, where the stage shows the transcript tail.
+// instead, where the stage shows the transcript tail. An idle agent with no
+// session (a scheduled check between runs) opens its last run's session.
 function openAgent(ctx, name) {
   const agent = (ctx.data.agents || []).find((candidate) => candidate.name === name);
   if (!agent) return;
@@ -412,7 +413,8 @@ function openAgent(ctx, name) {
     return;
   }
   const session = agentSession(ctx, agent);
-  if (session?.id || agent.session?.id) { ctx.openReviewSession?.(session?.id || agent.session.id); return; }
+  const id = session?.id || agent.session?.id || agent.lastSession?.id;
+  if (id) { ctx.openReviewSession?.(id); return; }
   ctx.toast?.(`${name} has no session to open`);
 }
 
