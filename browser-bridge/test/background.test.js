@@ -542,6 +542,17 @@ test("a tab claimed by its new session during cleanup keeps that session's state
   assert.equal(stateAfter.console[0].text, "H's own");
 });
 
+test("a session renamed after it started retitles its group, by hello or by request", async () => {
+  const session = await makeSession("unnamed", "claude-code #46");
+  deliver({ method: "session_hello", params: { sessionKey: "unnamed", name: "#405" } });
+  await waitFor(() => state.groups.get(session.group.groupId).title === "#405", "the hello's name");
+
+  deliver({ id: "w9_c1", sessionKey: "unnamed", session: { name: "#405 fix" }, method: "tabs_context_mcp", params: {} });
+  assert.equal((await waitFor(() => replyFor("w9_c1"), "the reply")).ok, true);
+  assert.equal(state.groups.get(session.group.groupId).title, "#405 fix");
+  assert.equal((await sessions.getSession("unnamed")).name, "#405 fix");
+});
+
 test("an ended session that comes back takes its group out of (ended)", async () => {
   const session = await makeSession("returning", "returning");
   state.tabs.get(session.tab.id).url = "https://example.com/a";

@@ -45,11 +45,23 @@ test('a node may not ask for another machine\'s pane, or a pane its session is n
   assert.equal((await service.open(node, ask())).status, 403);
 });
 
-test('a session without a Keep-named browser is told why, not shown an empty view', async (t) => {
+test('a session Keep could not name at launch is named by its number, and told so', async (t) => {
+  const { service } = setup(t, { sessionNumber: (id) => (id === SESSION ? 405 : null) });
+  const named = await service.open(node, ask({ browserSession: '' }));
+  assert.equal(named.status, 200);
+  assert.equal(named.body.request.num, 405);
+  assert.equal(named.body.browserName, '#405');
+  // A Keep-named browser keeps its own number, and nothing is renamed.
+  const keepNamed = await service.open(node, ask());
+  assert.equal(keepNamed.body.request.num, 42);
+  assert.equal(keepNamed.body.browserName, undefined);
+});
+
+test('a session Keep has not numbered yet is told why, not shown an empty view', async (t) => {
   const { service } = setup(t);
-  const result = await service.open(node, ask({ browserSession: 'claude-main #1234' }));
+  const result = await service.open(node, ask({ browserSession: 'claude-code #46' }));
   assert.equal(result.status, 400);
-  assert.match(result.body.error, /BROWSER_BRIDGE_SESSION_NAME/);
+  assert.match(result.body.error, /not numbered this session/);
   assert.equal((await service.open(node, ask({ tabId: 'first' }))).status, 400);
 });
 

@@ -68,9 +68,25 @@ async function show(argv) {
     note: o.m || null,
   }), 'open the view');
   const record = body.request;
+  // Keep could not name this session's browser at launch: leave the name for the Browser
+  // Bridge, which renames the session's tab group on its next call.
+  if (body.browserName) await leavePaneName(process.env.KEEP_PANE, body.browserName);
   console.log(`browser view opened for #${record.num} on ${record.node}${record.tabId != null ? `, starting on tab ${record.tabId}` : ''}`);
   console.log('Owner sees it over this session\'s terminal in the Keep console. Nothing arrives here when they close it:');
   console.log('read the page (screenshot, read_page) to see whether they are done, or run keep browser status.');
+  if (body.browserName) {
+    console.log(`This session's tab group is named ${body.browserName} on its next browser call: make one now (tabs_context_mcp) so the view finds your tabs.`);
+  }
+}
+
+async function leavePaneName(pane, name) {
+  const path = require('node:path');
+  const fs = require('node:fs');
+  const { paneNamePath } = await import(path.join(__dirname, '..', '..', 'browser-bridge', 'host', 'protocol.js'));
+  const file = paneNamePath(pane, process.env);
+  if (!file) die(`keep browser show: cannot name the browser of pane ${pane}`);
+  await fs.promises.mkdir(path.dirname(file), { recursive: true });
+  await fs.promises.writeFile(file, `${name}\n`, { mode: 0o600 });
 }
 
 async function hide(argv) {

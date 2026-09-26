@@ -394,6 +394,20 @@ function onClientMessage(client, message) {
     forwardViewer(client, message);
     return;
   }
+  // A session renames only itself: the name travels with its own requests, and the
+  // extension retitles its own group when it changes.
+  if (message.method === "rename") {
+    const name = typeof message.params?.name === "string" ? message.params.name.slice(0, 200) : "";
+    if (!name) {
+      replyToClient(client, message.id, false, { message: "rename needs a name" });
+      return;
+    }
+    log("rename", describeClient(client), "->", JSON.stringify(name));
+    client.name = name;
+    replyToClient(client, message.id, true, { ok: true });
+    announceSession(client);
+    return;
+  }
   // session_hello, session_closed and ping are ours to send, never a client's: a client
   // that could name them could rename or evict another session's tab group.
   if (!FORWARDABLE.has(message.method)) {

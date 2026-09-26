@@ -17677,6 +17677,10 @@ function start(deps = {}) {
       const row = (sessionSnapshot || []).find((session) => session && session.id === sessionId);
       return row && row.pane ? String(row.pane) : null;
     },
+    sessionNumber: (sessionId) => {
+      const row = (sessionSnapshot || []).find((session) => session && session.id === sessionId);
+      return row && row.num ? row.num : null;
+    },
     samePane: (a, b) => {
       const left = nodes.parsePaneRef(a);
       const right = nodes.parsePaneRef(b);

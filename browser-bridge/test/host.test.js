@@ -168,6 +168,34 @@ test("two sessions are multiplexed onto one extension port", async (t) => {
   assert.equal(one.replies.some((message) => message.id === "b1"), false);
 });
 
+test("a session renames only itself, and its requests carry the new name", async (t) => {
+  const { socketFile, extension } = await startHost(t);
+  const one = await connect(socketFile);
+  const two = await connect(socketFile);
+  one.send({ id: "h1", method: "hello", params: { sessionKey: "session-one", name: "claude-code #46" } });
+  two.send({ id: "h2", method: "hello", params: { sessionKey: "session-two", name: "#7" } });
+  await one.reply("h1");
+  await two.reply("h2");
+
+  one.send({ id: "r1", method: "rename", params: { name: "#405" } });
+  assert.equal((await one.reply("r1")).ok, true);
+  const announced = await extension.waitFor(
+    (message) => message.method === "session_hello" && message.params.name === "#405",
+    "session_hello with the new name",
+  );
+  assert.equal(announced.params.sessionKey, "session-one");
+
+  one.send({ id: "a1", method: "tabs_context_mcp", params: {} });
+  two.send({ id: "b1", method: "tabs_context_mcp", params: {} });
+  const forwardedOne = await extension.waitFor((m) => m.sessionKey === "session-one" && m.method === "tabs_context_mcp", "one's call");
+  const forwardedTwo = await extension.waitFor((m) => m.sessionKey === "session-two" && m.method === "tabs_context_mcp", "two's call");
+  assert.equal(forwardedOne.session.name, "#405");
+  assert.equal(forwardedTwo.session.name, "#7");
+
+  one.send({ id: "r2", method: "rename", params: { name: "" } });
+  assert.equal((await one.reply("r2")).ok, false);
+});
+
 test("a request before hello is rejected and the connection closed", async (t) => {
   const { socketFile } = await startHost(t);
   const client = await connect(socketFile);

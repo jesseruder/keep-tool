@@ -71,6 +71,7 @@ function createBrowserViewService(options = {}) {
     now = Date.now,
     onChange = () => {},
     sessionPane = () => null,
+    sessionNumber = () => null,
     samePane = (a, b) => a === b,
   } = options;
 
@@ -106,9 +107,13 @@ function createBrowserViewService(options = {}) {
     if (!PANE_RE.test(pane)) return refusal(400, 'a browser view needs the pane the session runs in');
     const denied = callerDenied(node, principal, sessionId, pane);
     if (denied) return denied;
+    // The view finds the session's tabs by its group's `#<n>` title. A session Keep
+    // could not name at launch (its number was not ready yet) is named now: the answer
+    // says so, and keep browser show leaves that name for the Browser Bridge to pick up.
     const match = BROWSER_SESSION_RE.exec(text(body.browserSession, 200));
-    if (!match) {
-      return refusal(400, 'this session has no Keep-named browser (BROWSER_BRIDGE_SESSION_NAME is not "#<n> ..."); a session Keep opened has one');
+    const num = match ? Number(match[1]) : Number(sessionNumber(sessionId)) || null;
+    if (!num) {
+      return refusal(400, 'Keep has not numbered this session yet, so its browser tabs cannot be found; try again in a minute');
     }
     const tabId = body.tabId == null || body.tabId === '' ? null : Number(body.tabId);
     if (tabId !== null && !Number.isInteger(tabId)) return refusal(400, 'tab must be a tab id from tabs_context_mcp');
@@ -127,7 +132,7 @@ function createBrowserViewService(options = {}) {
     const record = {
       id,
       sessionId,
-      num: Number(match[1]),
+      num,
       pane,
       node,
       tabId,
@@ -138,7 +143,7 @@ function createBrowserViewService(options = {}) {
     requests.push(record);
     await writeStore(root, requests);
     onChange();
-    return { status: 200, body: { request: publicRecord(record) } };
+    return { status: 200, body: { request: publicRecord(record), ...(match ? {} : { browserName: `#${num}` }) } };
   }
 
   /** Owner closed the view, or the session took its request back. */

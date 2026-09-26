@@ -13,6 +13,7 @@ import {
   getSession,
   noteActivity,
   putSession,
+  retitleGroup,
   reviveSession,
   tabsInGroup,
   withSessionLock,
@@ -58,7 +59,7 @@ const bridge = new NativeBridge({
 async function handleRequest(message, generation) {
   if (message.method === "session_hello") {
     const { sessionKey, name, agent, account } = message.params ?? {};
-    if (sessionKey) await putSession(sessionKey, { name, agent, account });
+    if (sessionKey) await storeSession(sessionKey, { name, agent, account });
     return;
   }
   if (message.method === "session_closed") {
@@ -139,6 +140,19 @@ const VIEWER_METHODS = new Set([
 ]);
 
 /**
+ * Store what the host says about a session. A live group whose session has a new name
+ * (keep browser show in a session Keep could not name at launch) takes that name.
+ */
+async function storeSession(sessionKey, update, before) {
+  const was = before === undefined ? await getSession(sessionKey) : before;
+  const session = await putSession(sessionKey, update);
+  if (update.name && was?.name !== update.name && was?.groupId != null && !was.ended) {
+    await retitleGroup(was.groupId, update.name);
+  }
+  return session;
+}
+
+/**
  * The session's stored record, refreshed from what the host told us and taken back out
  * of "(ended)" if this session key has returned. Runs under the session's lock; it must
  * not call anything that takes that lock again.
@@ -146,7 +160,7 @@ const VIEWER_METHODS = new Set([
 async function lookUpSession(message) {
   let session = await getSession(message.sessionKey);
   if (message.session?.name && session?.name !== message.session.name) {
-    session = await putSession(message.sessionKey, message.session);
+    session = await storeSession(message.sessionKey, message.session, session);
   }
   if (session?.ended && session.groupId != null) {
     await reviveSession(message.sessionKey, session.groupId, message.session?.name ?? session.name);

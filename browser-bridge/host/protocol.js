@@ -372,6 +372,27 @@ export function edgeLogPath(env = process.env, platform = process.platform) {
   return path.join(runtimeDir(env, platform), "edge.log");
 }
 
+/**
+ * A name `keep browser show` left for the session in a Keep pane that had none from its
+ * launch; bin/headers.js sends it. Keyed by KEEP_PANE, which the session's own process
+ * and every command it runs share. Null for anything that is not a plain pane id.
+ */
+export function paneNamePath(pane, env = process.env, platform = process.platform) {
+  if (typeof pane !== "string" || !/^[A-Za-z0-9_-]{1,64}$/.test(pane)) return null;
+  return path.join(runtimeDir(env, platform), "pane-names", pane);
+}
+
+/** That name, or undefined: bin/headers.js calls this on every request and it never throws. */
+export function readPaneName(pane, env = process.env) {
+  const file = paneNamePath(pane, env);
+  if (!file) return undefined;
+  try {
+    return fs.readFileSync(file, "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
 // --- the shared MCP daemon ------------------------------------------------
 
 /**

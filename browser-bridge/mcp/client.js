@@ -173,6 +173,16 @@ export class BridgeClient {
   }
 
   /**
+   * A new name for this session, which the host passes to the extension with every request
+   * from now on. A disconnected client only keeps it: its next hello carries it.
+   */
+  async rename(name) {
+    this.name = name;
+    if (!this.connected) return;
+    await this.#send("rename", { name });
+  }
+
+  /**
    * One retry, and only when the request never reached the socket: the host dies with
    * the service worker, so a stale connection is routine, but a request that was already
    * sent may have clicked something and must not be replayed.

@@ -150,6 +150,12 @@ background-terminal wake-up is not yet verified.
   agent's session to get past such a gate. A secret this session needs now is asked for
   with `keep secret request` (the `keep-secrets` skill), never pasted into chat or fetched
   with a one-off command Owner has to run.
+- **A page in this session's browser needs Owner** (a sign-in, a 2FA prompt, a captcha,
+  something he should see): open the page in your Browser Bridge tab, then run `keep
+  browser show --tab <id> -m "what to do there"`. The console shows a live, clickable view
+  of your tabs over your terminal. Poll `keep browser status` (exit 1 once he closes it)
+  and carry on in the same tab; `keep browser hide` takes it back. Never ask him for the
+  password or cookie instead.
 
 ## Landing and closing
 

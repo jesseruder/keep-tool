@@ -318,6 +318,7 @@ export function createDaemon({
         // sessionKey it had, which is what makes the extension hand back the same tab group.
         entry = await adoptOnce(req, sessionId);
       }
+      await renameFromRequest(sessionId, entry, req);
       // Any request at all means the client is still there; the sweep reads this.
       entry.lastSeenAt = now();
       known.touch(registryKey(sessionId), entry.lastSeenAt);
@@ -385,6 +386,26 @@ export function createDaemon({
       name = `${client} #${++fallbackCounter}`;
     }
     return { name, agent, account };
+  }
+
+  /**
+   * A session is named when it starts, but a session Keep could not name at launch (its
+   * number was not ready) is named later: \`keep browser show\` leaves a name for its pane
+   * that bin/headers.js sends from then on. The new name reaches the host, and the
+   * extension retitles the group on the next call, so the tab group reads \`#405\` and the
+   * console's browser view can find it.
+   */
+  async function renameFromRequest(id, entry, req) {
+    const name = readHeaderValue(req.headers["x-browser-bridge-session"]);
+    if (!name || name === entry.name) return;
+    log(`session renamed ${tag(id)} ${JSON.stringify(entry.name)} -> ${JSON.stringify(name)}`);
+    entry.name = name;
+    known.put(registryKey(id), { name, agent: entry.agent, account: entry.account });
+    try {
+      await entry.client.rename?.(name);
+    } catch (error) {
+      log(`could not tell the host about the rename: ${error?.message ?? error}`);
+    }
   }
 
   function newEntry(identity, client) {

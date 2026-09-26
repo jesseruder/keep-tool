@@ -21,7 +21,7 @@
 // Nothing here may import the MCP SDK: this runs on every request, and loading the SDK and
 // zod cost ~60 ms a time. `test/headers.test.js` holds that line.
 
-import { isMainModule, readDaemonConfig } from "../host/protocol.js";
+import { isMainModule, readDaemonConfig, readPaneName } from "../host/protocol.js";
 import { encodeHeaderValue, guessAgent, guessAccount, sanitizeHeaderValue } from "../mcp/identity.js";
 
 export function buildHeaders(env = process.env) {
@@ -40,7 +40,7 @@ export function buildHeaders(env = process.env) {
       if (clean !== null) headers[name] = encodeHeaderValue(clean);
     };
 
-    add("X-Browser-Bridge-Session", env.BROWSER_BRIDGE_SESSION_NAME);
+    add("X-Browser-Bridge-Session", env.BROWSER_BRIDGE_SESSION_NAME || readPaneName(env.KEEP_PANE, env));
     const agent = guessAgent(env);
     add("X-Browser-Bridge-Agent", agent, 40);
     add("X-Browser-Bridge-Account", guessAccount(env, agent));

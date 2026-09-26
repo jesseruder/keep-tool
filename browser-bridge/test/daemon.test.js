@@ -148,6 +148,32 @@ test("a header names the session, and the host's hello carries that name", async
   );
 });
 
+test("a session that starts unnamed takes the name its header carries later, and the host hears it", async (t) => {
+  const dir = tempDir(t);
+  const host = await fakeHost(t, dir);
+  const { port, logs } = await startDaemon(t, dir);
+
+  // Read on every request, as the helper is run on every request.
+  const headers = { Authorization: `Bearer ${TOKEN}` };
+  const client = new Client({ name: "daemon-test", version: "0" });
+  await client.connect(new StreamableHTTPClientTransport(new URL(`http://127.0.0.1:${port}/mcp`), { requestInit: { headers } }));
+  t.after(() => client.close().catch(() => {}));
+  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.match(host.hellos().at(-1).params.name, /^daemon-test #\d+$/);
+
+  // keep browser show left a name for the pane; the helper sends it from now on.
+  headers["X-Browser-Bridge-Session"] = "#405";
+  const status = await client.callTool({ name: "browser_status", arguments: {} });
+  assert.match(status.content[0].text, /Session: #405/);
+  const renames = host.received.filter((m) => m.method === "rename");
+  assert.deepEqual(renames.map((m) => m.params.name), ["#405"]);
+  assert.ok(logs.some((line) => line.includes("session renamed") && line.includes("#405")), logs.join("\n"));
+
+  // The same name again is not another rename.
+  await client.callTool({ name: "browser_status", arguments: {} });
+  assert.equal(host.received.filter((m) => m.method === "rename").length, 1);
+});
+
 test("without the header the session is named after the client, numbered", async (t) => {
   const dir = tempDir(t);
   const host = await fakeHost(t, dir);

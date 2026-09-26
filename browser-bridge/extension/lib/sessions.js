@@ -124,6 +124,15 @@ async function pickWindowId(newWindow) {
   return { windowId: created.id, seedTabId: created.tabs?.[0]?.id ?? null };
 }
 
+/** Give a live group its session's new name. */
+export async function retitleGroup(groupId, name) {
+  try {
+    await chrome.tabGroups.update(groupId, { title: name });
+  } catch {
+    // the group may have gone in the meantime
+  }
+}
+
 /** Undo what closeSession did to a group whose owner came back. */
 export async function reviveSession(sessionKey, groupId, name) {
   await putSession(sessionKey, { ended: false });
