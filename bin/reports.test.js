@@ -43,6 +43,8 @@ function fixture() {
     incidentConfig: () => INCIDENT_CFG,
     openIncidents: () => open,
     checkinTask: (card, message) => checkins.push({ card, message }),
+    feedHas: () => false,
+    cardHas: () => false,
     write() {},
   };
   const run = (units, extra = {}) => reports.ingest({ units, slackNames: extra.slackNames || [] }, {
@@ -325,7 +327,7 @@ test('a wake the feed refused is retried on the next poll, not acknowledged', as
   const run = (units) => reports.ingest({ units }, {
     root: f.root, config: CFG, withLock: (fn) => fn(), wait: true,
     deps: { classify: async (prompt) => JSON.stringify(allInto('Login broken')(prompt)), emit, flushAgents() {},
-      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {}, write() {} },
+      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {}, feedHas: () => false, cardHas: () => false, write() {} },
   });
   await run([discord('w', 'alice', { starter: true, id: 'w', tags: ['Major bug'] })]);
   assert.equal(realEmit.length, 0);
@@ -376,6 +378,93 @@ test('a Major bug tag added after the first poll still wakes the responder', asy
   await f.run([discord('late', 'alice', { tags: ['Major bug'] })]);
   assert.equal(f.emitted.length, 1);
   assert.match(f.emitted[0].text, /major bug/);
+});
+
+test('a poll that arrives while a settle is classifying gets its own pass', async () => {
+  const f = fixture();
+  let release;
+  const gate = new Promise((resolve) => { release = resolve; });
+  let calls = 0;
+  f.setVerdicts(allInto('Crash'));
+  const deps = {
+    classify: async (prompt) => { calls += 1; if (calls === 1) await gate; return JSON.stringify(allInto('Crash')(prompt)); },
+    emit: (name, event) => event, flushAgents() {}, incidentConfig: () => INCIDENT_CFG, openIncidents: () => [],
+    checkinTask() {}, feedHas: () => false, cardHas: () => false, write() {},
+  };
+  const opts = { root: f.root, config: CFG, withLock: (fn) => fn(), deps, wait: true };
+  const first = reports.ingest({ units: [discord('ra', 'alice', { starter: true, id: 'ra' })] }, opts);
+  await new Promise((resolve) => setTimeout(resolve, 20));
+  const second = reports.ingest({ units: [discord('rb', 'bob', { starter: true, id: 'rb' })] }, opts);
+  release();
+  await Promise.all([first, second]);
+  const state = f.state();
+  assert.equal(state.reports['discord:ra'].state, 'report');
+  assert.equal(state.reports['discord:rb'].state, 'report', 'the second poll is settled by the rerun');
+  assert.equal(calls, 2);
+});
+
+test('a retry after a crash finds its wake already on the feed and does not send it again', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Login broken'));
+  await f.run([discord('cr', 'alice', { starter: true, id: 'cr' })]);
+  // As if a daemon had claimed and sent this wake, then died before acknowledging it.
+  const state = reports.loadState(f.root);
+  const group = state.groups['login-broken'];
+  group.wakeClaim = { at: 1, token: 'tok123', seq: group.dirtySeq || 0, state: 'open', card: '' };
+  group.dirtySeq = (group.dirtySeq || 0) + 1;
+  state.reports['discord:cr'].tags = ['Major bug'];
+  state.reports['discord:cr'].major = true;
+  fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
+  const seen = [];
+  await reports.ingest({ units: [] }, {
+    root: f.root, config: CFG, withLock: (fn) => fn(), wait: true,
+    deps: { classify: async () => '[]', emit: (name, event) => { seen.push(event); return event; }, flushAgents() {},
+      incidentConfig: () => INCIDENT_CFG, openIncidents: () => [], checkinTask() {},
+      feedHas: (name, token) => token === 'tok123', cardHas: () => false, write() {} },
+  });
+  assert.equal(seen.length, 0, 'the expired claim kept its token and the feed already had it');
+  const after = f.state().groups['login-broken'];
+  assert.ok(after.wokeAt);
+  assert.equal(after.wakeClaim, undefined);
+});
+
+test('a verdict recorded while a wake is in flight stands, and a report landing meanwhile keeps the group dirty', async () => {
+  const f = fixture();
+  f.setVerdicts(allInto('Login broken'));
+  await f.run([discord('v1', 'alice', { starter: true, id: 'v1' })]);
+  const opts = { root: f.root, withLock: (fn) => fn() };
+  await reports.ingest({ units: [] }, {
+    ...opts, config: CFG, wait: true,
+    deps: {
+      classify: async () => '[]', flushAgents() {}, incidentConfig: () => INCIDENT_CFG, openIncidents: () => [],
+      checkinTask() {}, feedHas: () => false, cardHas: () => false, write() {},
+      emit: (name, event) => {
+        reports.mark('login-broken', 'noise', { reason: 'chatter', ...opts });
+        reports.record({ units: [discord('v1', 'bob')] }, { ...opts, config: CFG });
+        return event;
+      },
+    },
+  });
+  // Nothing woke above: the group had one reporter and no tag. Force the path with a tag.
+  const state = reports.loadState(f.root);
+  state.reports['discord:v1'].major = true;
+  state.groups['login-broken'].dirtySeq = (state.groups['login-broken'].dirtySeq || 0) + 1;
+  fs.writeFileSync(reports.stateFile(f.root), JSON.stringify(state));
+  await reports.ingest({ units: [] }, {
+    ...opts, config: CFG, wait: true,
+    deps: {
+      classify: async () => '[]', flushAgents() {}, incidentConfig: () => INCIDENT_CFG, openIncidents: () => [],
+      checkinTask() {}, feedHas: () => false, cardHas: () => false, write() {},
+      emit: (name, event) => {
+        reports.mark('login-broken', 'noise', { reason: 'chatter', ...opts });
+        reports.record({ units: [discord('v1', 'carol')] }, { ...opts, config: CFG });
+        return event;
+      },
+    },
+  });
+  const group = f.state().groups['login-broken'];
+  assert.equal(group.state, 'noise', 'the wake did not reopen a group marked noise meanwhile');
+  assert.ok((group.dirtySeq || 0) > (group.cleanSeq || 0), 'the report that landed meanwhile keeps it dirty');
 });
 
 test('authors with no Latin letters stay distinct reporters', async () => {

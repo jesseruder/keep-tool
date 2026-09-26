@@ -383,6 +383,13 @@ function defaultDeps() {
     incidentConfig: () => require('./incidents.js').config(),
     openIncidents: () => require('./incidents.js').openIncidents(),
     checkinTask: (id, message) => keep.checkinTask(id, { message, linkSession: false }),
+    feedHas: (name, token) => require('./agents.js').readTail(name, { limit: 200 }).events.some((event) => event.token === token),
+    cardHas: (id, marker) => {
+      for (const dir of ['tasks', 'archive']) {
+        try { if (fs.readFileSync(path.join(keep.ROOT, dir, `${id}.md`), 'utf8').includes(marker)) return true; } catch {}
+      }
+      return false;
+    },
     write: (line) => process.stderr.write(line),
   };
 }
@@ -397,7 +404,7 @@ function prune(state, now) {
     if (record.state === 'not-report' && now - (Number(record.lastAt) || 0) > PRUNE_NOT_REPORT_MS) delete state.reports[key];
   }
   for (const [id, group] of Object.entries(state.groups)) {
-    if (group.dirty) continue;
+    if (isDirty(group) || group.wakeClaim || group.noteClaim) continue;
     const keepFor = group.state === 'known' || group.state === 'real' ? PRUNE_OWNED_MS : PRUNE_NOISE_MS;
     if (now - (Number(group.lastAt) || 0) <= keepFor) continue;
     for (const [key, record] of Object.entries(state.reports)) if (record.group === id) delete state.reports[key];
@@ -426,13 +433,25 @@ function openAreasNow(deps, cfg, now) {
 // those messages has not lost them.
 //
 // `settle` does the slow part: the classifier, the verdicts, the wake decisions and
-// the card notes. One runs at a time per process; a poll that arrives while one is
-// running leaves its reports `new` and its groups dirty for the next. A wake or card
-// note is claimed before it is sent and acknowledged only once it landed, so a failed
-// emit is retried and two overlapping settles cannot both send it.
+// the card notes, on a later turn of the event loop than the poll that asked for it.
+// One runs at a time per registry; a poll that asks while one is running makes it run
+// again once it finishes, so nothing recorded meanwhile waits for a later poll. The
+// watchers ask on every poll, quiet ones included, which is also what retries a wake
+// whose claim expired.
+//
+// A group is dirty while `dirtySeq` is ahead of `cleanSeq`: every message recorded on
+// it moves `dirtySeq`, and a settle that has fully dealt with it moves `cleanSeq` up to
+// the `dirtySeq` it saw — never further, so a report that lands while a wake is in
+// flight keeps the group dirty. A wake or card note is claimed with a token before it
+// is sent and acknowledged only by the settle holding that token, and only once it
+// landed. The token rides on the event and on the card note, and a retry looks for it
+// there first, so a daemon that died between sending and acknowledging does not send
+// it twice.
 
 function spoolFile(root) { return path.join(stateDir(root), 'spool.jsonl'); }
 
+// Only the daemon records, so there is one writer: the append and the rename below are
+// both synchronous calls in one process and cannot interleave.
 function spool(root, batch) {
   fs.mkdirSync(stateDir(root), { recursive: true });
   fs.appendFileSync(spoolFile(root), JSON.stringify(batch) + '\n');
@@ -441,7 +460,9 @@ function spool(root, batch) {
 // Inside the lock: move the spool aside and read it, together with any earlier
 // taking that never got to delete its file. The caller deletes the files once the
 // state that includes them is written; a crash in between re-reads them, and the
-// per-report message ids make that harmless.
+// per-report message ids make that harmless for any batch a watcher poll can hold.
+// A line that does not parse is kept in spool.bad for a person to look at, not
+// dropped with the file.
 function takeSpool(root) {
   const dir = stateDir(root);
   const taken = path.join(dir, `spool.${process.pid}.${Date.now()}.taking`);
@@ -454,11 +475,17 @@ function takeSpool(root) {
     try { text = fs.readFileSync(file, 'utf8'); } catch { continue; }
     for (const line of text.split('\n')) {
       if (!line.trim()) continue;
-      try { batches.push(JSON.parse(line)); } catch {}
+      try { batches.push(JSON.parse(line)); } catch {
+        try { fs.appendFileSync(path.join(dir, 'spool.bad'), line + '\n'); } catch {}
+      }
     }
   }
   return { files, batches };
 }
+
+function markDirty(group) { group.dirtySeq = (Number(group.dirtySeq) || 0) + 1; }
+function isDirty(group) { return (Number(group.dirtySeq) || 0) > (Number(group.cleanSeq) || 0); }
+function markClean(group, seq) { group.cleanSeq = Math.max(Number(group.cleanSeq) || 0, Number(seq) || 0); }
 
 function landUnits(state, cfg, units, slackNames, now, summary) {
   for (const name of slackNames || []) {
@@ -485,7 +512,7 @@ function landUnits(state, cfg, units, slackNames, now, summary) {
     if (unit.starter && !record.starter) record.starter = unit.from;
     // A thread tagged Major bug after its first message is major from then on.
     record.major = (record.tags || []).some((tag) => cfg.majorTags.includes(String(tag).toLowerCase()));
-    if (record.group && state.groups[record.group]) state.groups[record.group].dirty = true;
+    if (record.group && state.groups[record.group]) markDirty(state.groups[record.group]);
   }
 }
 
@@ -504,8 +531,10 @@ function record({ units = [], slackNames = [] } = {}, options = {}) {
       landUnits(state, cfg, units, slackNames, now, summary);
     }, { root, withLock: options.withLock });
   } catch (error) {
-    spool(root, { units, slackNames });
-    summary.spooled = true;
+    if (units.length || slackNames.length) {
+      spool(root, { units, slackNames });
+      summary.spooled = true;
+    }
     summary.error = oneLine(error && error.message || error, 200);
     return summary;
   }
@@ -516,9 +545,23 @@ function record({ units = [], slackNames = [] } = {}, options = {}) {
 const CLAIM_MS = 10 * 60e3;
 const settling = new Map();
 
-function claimed(claim, now) { return Boolean(claim && now - (Number(claim.at) || 0) < CLAIM_MS); }
+function claimLive(claim, now) { return Boolean(claim && now - (Number(claim.at) || 0) < CLAIM_MS); }
+
+// A fresh claim, or the expired one again: its token is what a retry looks for on the
+// feed or the card, so a retry after a crash must carry the same one.
+function claimFor(previous, group, now) {
+  return {
+    at: now, token: (previous && previous.token) || crypto.randomBytes(8).toString('hex'),
+    seq: Number(group.dirtySeq) || 0, state: group.state, card: group.card || '',
+  };
+}
+
+function noteMarker(token) { return `(report note ${token})`; }
 
 async function settleOnce(options) {
+  // Off the caller's turn: a watcher awaiting `ingest` must not pay for the account
+  // selection and process spawn the classifier starts with.
+  await new Promise((resolve) => setImmediate(resolve));
   const root = options.root || keep.ROOT;
   const cfg = options.config || config(root);
   const deps = { ...defaultDeps(), ...(options.deps || {}) };
@@ -576,12 +619,12 @@ async function settleOnce(options) {
         };
       }
       item.group = id;
-      state.groups[id].dirty = true;
+      markDirty(state.groups[id]);
     }
     const wakes = [];
     const notes = [];
     for (const group of Object.values(state.groups)) {
-      if (!group.dirty) continue;
+      if (!isDirty(group)) continue;
       const stats = groupStats(state, group);
       group.reporters = stats.reporters;
       group.reports = stats.reports.length;
@@ -591,45 +634,52 @@ async function settleOnce(options) {
         const since = Number(group.cardNotedAt) || Number(group.markedAt) || 0;
         const fresh = stats.reports.filter((item) => (Number(item.firstAt) || 0) > since);
         const noted = Number(group.reportersNoted ?? group.reportersAtMark) || 0;
-        if (!fresh.length && stats.reporters <= noted) { group.dirty = false; continue; }
-        if (claimed(group.noteClaim, now)) continue;
-        group.noteClaim = { at: now };
+        if (!fresh.length && stats.reporters <= noted) { markClean(group, group.dirtySeq); continue; }
+        if (claimLive(group.noteClaim, now)) continue;
+        const claim = claimFor(group.noteClaim, group, now);
+        group.noteClaim = claim;
         notes.push({
-          card: group.card, group: group.id, reporters: stats.reporters,
+          card: group.card, group: group.id, reporters: stats.reporters, token: claim.token,
           message: `User reports: ${stats.reporters} reporter(s) across ${stats.reports.length} report(s) in group ${group.id}`
-            + (fresh.length ? `; new: ${fresh.map((item) => item.permalink || item.key).join(' ')}` : ''),
+            + (fresh.length ? `; new: ${fresh.map((item) => item.permalink || item.key).join(' ')}` : '')
+            + ` ${noteMarker(claim.token)}`,
         });
         continue;
       }
       const reason = wakeReason(group, stats, cfg, openAreas);
       const agent = reason ? areaAgent(group.area, incidentCfg) : '';
-      if (!agent) { group.dirty = false; continue; }
-      if (claimed(group.wakeClaim, now)) continue;
-      group.wakeClaim = { at: now };
+      if (!agent) { markClean(group, group.dirtySeq); continue; }
+      if (claimLive(group.wakeClaim, now)) continue;
+      const claim = claimFor(group.wakeClaim, group, now);
+      group.wakeClaim = claim;
       wakes.push({
         agent, group: group.id, area: group.area, reason, reporters: stats.reporters,
-        security: stats.security, title: group.title,
+        security: stats.security, title: group.title, token: claim.token,
       });
     }
     return { wakes, notes };
   }, lockOpts);
 
   // 3. Send, outside the lock, then acknowledge only what landed.
-  const sent = [];
+  const sent = new Set();
   for (const wake of plan.wakes) {
-    let event = null;
+    let landed = false;
     try {
-      event = deps.emit(wake.agent, {
-        kind: 'user-reports', area: wake.area, severity: wake.security ? 'high' : 'low', at: now,
+      landed = Boolean(deps.feedHas(wake.agent, wake.token)) || Boolean(deps.emit(wake.agent, {
+        kind: 'user-reports', area: wake.area, severity: wake.security ? 'high' : 'low', at: now, token: wake.token,
         text: `user reports: ${wake.title} — ${wake.reason}; keep reports show ${wake.group}`,
-      });
+      }));
     } catch (error) { say(`could not wake ${wake.agent}: ${oneLine(error && error.message || error, 200)}`); }
-    if (event) { sent.push(wake); summary.woke.push(wake); } else say(`wake for ${wake.group} not delivered to ${wake.agent}; retrying next poll`);
+    if (landed) { sent.add(wake.token); summary.woke.push(wake); } else say(`wake for ${wake.group} not delivered to ${wake.agent}; retrying next poll`);
   }
-  if (sent.length) deps.flushAgents();
-  const noted = [];
+  if (sent.size) deps.flushAgents();
+  const noted = new Set();
   for (const note of plan.notes) {
-    try { deps.checkinTask(note.card, note.message); noted.push(note); summary.cardNotes.push(note); } catch (error) {
+    try {
+      if (!deps.cardHas(note.card, noteMarker(note.token))) deps.checkinTask(note.card, note.message);
+      noted.add(note.token);
+      summary.cardNotes.push(note);
+    } catch (error) {
       say(`could not check in on ${note.card}: ${oneLine(error && error.message || error, 200)}`);
     }
   }
@@ -637,22 +687,29 @@ async function settleOnce(options) {
     mutateState((state) => {
       for (const wake of plan.wakes) {
         const group = state.groups[wake.group];
-        if (!group) continue;
+        const claim = group && group.wakeClaim;
+        if (!claim || claim.token !== wake.token) continue;
+        if (!sent.has(wake.token)) { claim.at = 0; continue; }
         delete group.wakeClaim;
-        if (!sent.includes(wake)) continue;
         group.wokeAt = now;
         group.wokeReason = wake.reason;
-        if (group.state === 'noise') { group.state = 'open'; group.reportersAtMark = 0; }
-        group.dirty = false;
+        // A verdict recorded while the wake was in flight stands: only a group still
+        // in the state the wake was decided on moves on from it.
+        if (group.state === claim.state) {
+          if (group.state === 'noise') { group.state = 'open'; group.reportersAtMark = 0; }
+          markClean(group, claim.seq);
+        }
       }
       for (const note of plan.notes) {
         const group = state.groups[note.group];
-        if (!group) continue;
+        const claim = group && group.noteClaim;
+        if (!claim || claim.token !== note.token) continue;
+        if (!noted.has(note.token)) { claim.at = 0; continue; }
         delete group.noteClaim;
-        if (!noted.includes(note)) continue;
+        if (group.card !== claim.card) continue;
         group.cardNotedAt = now;
         group.reportersNoted = note.reporters;
-        group.dirty = false;
+        markClean(group, claim.seq);
       }
     }, lockOpts);
   }
@@ -661,15 +718,24 @@ async function settleOnce(options) {
 
 function settle(options = {}) {
   const root = options.root || keep.ROOT;
-  if (settling.has(root)) return settling.get(root);
-  const run = settleOnce(options).finally(() => settling.delete(root));
-  settling.set(root, run);
-  return run;
+  const running = settling.get(root);
+  if (running) { running.again = true; return running.run; }
+  const entry = { again: false, run: null };
+  entry.run = (async () => {
+    let summary;
+    do {
+      entry.again = false;
+      summary = await settleOnce(options);
+    } while (entry.again);
+    return summary;
+  })().finally(() => settling.delete(root));
+  settling.set(root, entry);
+  return entry.run;
 }
 
-// What the watchers call with one poll's messages. It lands them and starts a settle
-// without waiting for it, unless `wait` is set (the tests).
-// Returns { recorded, spooled, classified, woke, cardNotes }.
+// What the watchers call on every poll with that poll's messages, none on a quiet one.
+// It lands them and starts a settle without waiting for it, unless `wait` is set (the
+// tests). Returns { recorded, spooled, classified, woke, cardNotes }.
 async function ingest(batch = {}, options = {}) {
   const recorded = record(batch, options);
   const cfg = options.config || config(options.root || keep.ROOT);
@@ -708,12 +774,14 @@ function mark(id, verdict, options = {}) {
     group.reason = oneLine(options.reason || '', 400);
     group.markedBy = oneLine(options.by || '', 80);
     group.card = card || '';
-    group.reportersAtMark = Number(group.reporters) || 0;
+    // Counted now, not from the last settle: the verdict covers every report the
+    // group holds as it is recorded, which is what `keep reports show` printed.
+    group.reportersAtMark = groupStats(state, group).reporters;
     // A new verdict starts its card's notes and its wake over from here.
     delete group.reportersNoted;
     delete group.cardNotedAt;
     delete group.noteClaim;
-    group.dirty = false;
+    markClean(group, group.dirtySeq);
     return { ...group };
   }, options);
 }

@@ -509,17 +509,16 @@ async function poll(options = {}) {
     seen[entry.ts] = { state: 'done', classifiedAt: entry.at };
   }
   writeJsonAtomic(SEEN_FILE, seen);
-  // User reports ride on the same poll. A failure there is logged and retried by
-  // the report store itself; it never holds this watcher's cursor back.
-  if (selected.length) {
-    const decisionById = new Map(decisions.map((decision) => [decision.ts, decision]));
-    try {
-      await (deps.ingestReports || require('./reports.js').ingest)({
-        units: selected.map((message) => reportUnit(message, decisionById.get(message.id))),
-      });
-    } catch (error) {
-      process.stderr.write(`keep discord: user reports not recorded: ${String(error && error.message || error).split('\n')[0]}\n`);
-    }
+  // User reports ride on the same poll, a quiet one included: that is what lets the
+  // report store retry what it could not finish last time. It lands the messages and
+  // returns; the classifier runs after, and never holds this watcher's cursor back.
+  const decisionById = new Map(decisions.map((decision) => [decision.ts, decision]));
+  try {
+    await (deps.ingestReports || require('./reports.js').ingest)({
+      units: selected.map((message) => reportUnit(message, decisionById.get(message.id))),
+    });
+  } catch (error) {
+    process.stderr.write(`keep discord: user reports not recorded: ${String(error && error.message || error).split('\n')[0]}\n`);
   }
   // Last, after the decisions and the seen set are on disk: a crash before this line
   // re-reads rows the seen set already skips, never loses one.

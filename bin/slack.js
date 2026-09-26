@@ -1303,6 +1303,9 @@ async function poll(options = {}) {
     writeJsonAtomic(SEEN_FILE, seen);
     writeJsonAtomic(THREADS_FILE, threads);
   }
+  // Once more with nothing, so a quiet poll still lets the report store settle what
+  // an earlier one left (bin/reports.js).
+  if (!dry) await ingestReports('', [], new Map(), domain, deps);
   if (!dry) incidents.recordPoll({ now, failed: incidentFailures.count, error: incidentFailures.error });
   // Carried on the result so the scheduler can fail this tick's health row;
   // the array itself is still just the landed decisions.
