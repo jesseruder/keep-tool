@@ -513,7 +513,33 @@ test('a prune and a seed of the same expired session leave the seeded mirror, in
     await expired(root);
     const [seeded, removed] = await Promise.all([seedOf(), prune(root)]);
     assert.deepEqual(seeded, { ok: true, size: held.length });
-    assert.deepEqual(removed, [], 'prune reads the seeded sidecar and keeps the mirror');
+    assert.deepEqual(removed, [], 'prune skips the mirror whose seed is in flight and keeps it');
+    seededInPlace(root, held, dir);
+  });
+
+  await t.test('prune does not wait behind the seed', async (t) => {
+    const { root, held, seedOf, dir } = seedFixture(t);
+    await expired(root);
+    const fromFile = path.join(root, 'held.jsonl');
+    // The seed's read of its source is held until prune has answered: the hook route
+    // holds its own chain around a prune, so a prune waiting on one seed would hold
+    // every other session's posts too.
+    let release;
+    const gate = new Promise((resolve) => { release = resolve; });
+    const open = fs.promises.open;
+    fs.promises.open = async (target, ...rest) => {
+      if (String(target) === fromFile) await gate;
+      return open(target, ...rest);
+    };
+    t.after(() => { fs.promises.open = open; release(); });
+    const seeding = seedOf();
+    const first = await Promise.race([
+      prune(root).then((removed) => ({ removed })), seeding.then(() => 'seed'),
+      new Promise((resolve) => setTimeout(() => resolve('timeout'), 5000)),
+    ]);
+    assert.deepEqual(first, { removed: [] }, 'prune answered while the seed was still held');
+    release();
+    assert.deepEqual(await seeding, { ok: true, size: held.length });
     seededInPlace(root, held, dir);
   });
 

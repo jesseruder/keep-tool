@@ -582,6 +582,11 @@ async function pruneAsync(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now }
     }
     const sessions = new Set(names.map((name) => name.replace(/\.(jsonl|json)$/, '')).filter((name) => SESSION_RE.test(name)));
     for (const sid of sessions) {
+      // A mirror with a write in flight (an append, a seed) is being used now, so it
+      // is not expired: it is skipped rather than waited for. The hook route holds its
+      // own chain around this prune, so a wait here behind one large seed would hold
+      // every other session's posts behind it too.
+      if (writeTails.has(`${entry.name}/${sid}`)) continue;
       if (await serialized(entry.name, sid, () => pruneSessionAsync(dir, sid, cutoff))) removed.push(`${entry.name}/${sid}`);
     }
   }
