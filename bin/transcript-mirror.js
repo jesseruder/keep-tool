@@ -64,7 +64,7 @@ function refuse(status, message) { throw new MirrorError(status, message); }
 // so no caller can forget it. Per mirror, so a large seed holds back only that
 // session's posts while it hashes (they then see the seeded mirror), never another
 // session's. A chain's entry is dropped once its tail settles with nothing queued
-// behind it. pruneAsync is not on it (see there). The synchronous append and prune do
+// behind it. pruneAsync takes it for each session it removes (see there). The synchronous append and prune do
 // not take it either; they are for the CLI and tests, never the daemon's path.
 const writeTails = new Map();
 function serialized(node, sessionId, fn) {
@@ -153,10 +153,18 @@ function readSidecar(file) {
   } catch { return null; }
 }
 
+// A failed write or rename takes its temporary file with it: a write that fails part
+// way (ENOSPC) leaves a partial one, and nothing else would ever remove it (prune takes
+// only a seed's or a reset's). EEXIST is left alone: that file is not this write's.
 function writeSidecar(file, value) {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-  fs.renameSync(temp, file);
+  try {
+    fs.writeFileSync(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    fs.renameSync(temp, file);
+  } catch (error) {
+    if (error.code !== 'EEXIST') { try { fs.unlinkSync(temp); } catch {} }
+    throw error;
+  }
 }
 
 async function readSidecarAsync(file) {
@@ -170,9 +178,13 @@ async function readSidecarAsync(file) {
 
 async function writeSidecarAsync(file, value) {
   const temp = `${file}.${process.pid}.${Date.now()}.tmp`;
-  await fs.promises.writeFile(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
-  try { await fs.promises.rename(temp, file); }
-  catch (error) { await fs.promises.unlink(temp).catch(() => {}); throw error; }
+  try {
+    await fs.promises.writeFile(temp, `${JSON.stringify(value)}\n`, { mode: 0o600, flag: 'wx' });
+    await fs.promises.rename(temp, file);
+  } catch (error) {
+    if (error.code !== 'EEXIST') await fs.promises.unlink(temp).catch(() => {});
+    throw error;
+  }
 }
 
 function checkedSourcePath(sourcePath) {
@@ -542,12 +554,14 @@ function prune(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   return removed;
 }
 
-// Not on the per-mirror chain. The hook route runs it on its own chain with its posts,
-// which orders it against every append. A seed from serve.js cannot collide with it:
-// prune unlinks a session's mirror only once nothing has written it for PRUNE_AFTER_MS
-// (30 days), and a temporary file only once it is an hour old, while a seed reads its
-// source through a handle it already holds open and its own temporary files are seconds
-// old, and its rename then writes a fresh sidecar.
+// Each session's decide-and-unlink runs on that mirror's chain (see `serialized`), and
+// reads the sidecar there: a seed of a session idle past PRUNE_AFTER_MS (a handoff of an
+// old session) can otherwise land between prune reading the old sidecar and unlinking,
+// and prune would delete the mirror the seed had just installed. On the chain the seed
+// either ran first, so prune reads its fresh sidecar and keeps the mirror, or runs after
+// the unlink and installs its mirror anew. The hook route also runs prune on its own
+// chain with its posts. The directory walk and the temporary files stay off the chain:
+// a temporary file goes only once it is an hour old, while a seed's own are seconds old.
 async function pruneAsync(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now } = {}) {
   const removed = [];
   const cutoff = now() - olderThanMs;
@@ -568,19 +582,24 @@ async function pruneAsync(root, { olderThanMs = PRUNE_AFTER_MS, now = Date.now }
     }
     const sessions = new Set(names.map((name) => name.replace(/\.(jsonl|json)$/, '')).filter((name) => SESSION_RE.test(name)));
     for (const sid of sessions) {
-      const sidecar = path.join(dir, `${sid}.json`);
-      const file = path.join(dir, `${sid}.jsonl`);
-      let at = null;
-      const value = await readSidecarAsync(sidecar);
-      if (value && Number.isFinite(value.updatedAt)) at = value.updatedAt;
-      if (at === null) { try { at = (await fs.promises.lstat(sidecar)).mtimeMs; } catch {} }
-      if (at === null) { try { at = (await fs.promises.lstat(file)).mtimeMs; } catch {} }
-      if (at === null || at >= cutoff) continue;
-      for (const target of [file, sidecar]) { try { await fs.promises.unlink(target); } catch {} }
-      removed.push(`${entry.name}/${sid}`);
+      if (await serialized(entry.name, sid, () => pruneSessionAsync(dir, sid, cutoff))) removed.push(`${entry.name}/${sid}`);
     }
   }
   return removed;
+}
+
+// One session's expiry decision and unlink, run on its mirror's chain; true when removed.
+async function pruneSessionAsync(dir, sid, cutoff) {
+  const sidecar = path.join(dir, `${sid}.json`);
+  const file = path.join(dir, `${sid}.jsonl`);
+  let at = null;
+  const value = await readSidecarAsync(sidecar);
+  if (value && Number.isFinite(value.updatedAt)) at = value.updatedAt;
+  if (at === null) { try { at = (await fs.promises.lstat(sidecar)).mtimeMs; } catch {} }
+  if (at === null) { try { at = (await fs.promises.lstat(file)).mtimeMs; } catch {} }
+  if (at === null || at >= cutoff) return false;
+  for (const target of [file, sidecar]) { try { await fs.promises.unlink(target); } catch {} }
+  return true;
 }
 
 module.exports = {

@@ -492,3 +492,93 @@ test('prune takes a seed\'s temporary sidecar after the hour and never as a sess
   assert.equal(fs.existsSync(dead), false);
   assert.ok(mirror.stat(root, 'aws1', 'sess-1'));
 });
+
+test('a prune and a seed of the same expired session leave the seeded mirror, in either order', async (t) => {
+  const DAY = 24 * 60 * 60e3;
+  const SEEDED_AT = 1_750_000_000_000;
+  const expired = async (root) => {
+    // The old mirror's last append is 40 days before the seed; prune looks a day after it.
+    await postAsync(root, { bytes: Buffer.from('old\n'), now: () => SEEDED_AT - 40 * DAY });
+  };
+  const prune = (root) => mirror.pruneAsync(root, { now: () => SEEDED_AT + DAY });
+  const seededInPlace = (root, held, dir) => {
+    assert.equal(mirror.read(root, 'aws1', 'sess-1').toString(), held.toString());
+    const side = JSON.parse(fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8'));
+    assert.deepEqual([side.generation, side.seededAt], ['7:8:9', SEEDED_AT]);
+    assert.deepEqual(fs.readdirSync(dir).sort(), ['sess-1.json', 'sess-1.jsonl']);
+  };
+
+  await t.test('the seed arrives first', async (t) => {
+    const { root, held, seedOf, dir } = seedFixture(t);
+    await expired(root);
+    const [seeded, removed] = await Promise.all([seedOf(), prune(root)]);
+    assert.deepEqual(seeded, { ok: true, size: held.length });
+    assert.deepEqual(removed, [], 'prune reads the seeded sidecar and keeps the mirror');
+    seededInPlace(root, held, dir);
+  });
+
+  await t.test('prune has read the old sidecar when the seed arrives', async (t) => {
+    const { root, held, seedOf, dir } = seedFixture(t);
+    await expired(root);
+    const sidecar = path.join(dir, 'sess-1.json');
+    // Prune's read of the old sidecar is held; the seed is issued while it is, and has
+    // time to land before the read answers if nothing orders the two.
+    let reading;
+    const reached = new Promise((resolve) => { reading = resolve; });
+    const readFile = fs.promises.readFile;
+    t.after(() => { fs.promises.readFile = readFile; });
+    let holdRead = true;
+    fs.promises.readFile = async (target, ...rest) => {
+      const result = await readFile(target, ...rest);
+      if (holdRead && String(target) === sidecar) {
+        holdRead = false;
+        reading();
+        await new Promise((resolve) => setTimeout(resolve, 100));
+      }
+      return result;
+    };
+    const pruning = prune(root);
+    await reached;
+    const seeding = seedOf();
+    assert.deepEqual(await pruning, ['aws1/sess-1'], 'prune removed the old mirror before the seed ran');
+    assert.deepEqual(await seeding, { ok: true, size: held.length });
+    seededInPlace(root, held, dir);
+  });
+});
+
+test('a sidecar write that fails part way leaves no temporary file', async (t) => {
+  const root = tempRoot(t);
+  const dir = path.join(root, '.keep', 'transcript-mirrors', 'aws1');
+  await postAsync(root);
+  const before = fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8');
+  const simulated = () => Object.assign(new Error('simulated partial write'), { code: 'ENOSPC' });
+  const isSidecarTemp = (target) => /sess-1\.json\.\d+\.\d+\.tmp$/.test(String(target));
+
+  // Async: the temporary file is created with part of the sidecar, then the write fails.
+  const writeFile = fs.promises.writeFile;
+  fs.promises.writeFile = async (target, ...rest) => {
+    if (isSidecarTemp(target)) { await writeFile(target, '{"gener'); throw simulated(); }
+    return writeFile(target, ...rest);
+  };
+  let result;
+  try {
+    result = await postAsync(root, { bytes: Buffer.from('more\n'), fromOffset: 8, size: 13 }).catch((error) => error);
+  } finally { fs.promises.writeFile = writeFile; }
+  assert.equal(result.code, 'ENOSPC');
+  assert.deepEqual(fs.readdirSync(dir).filter((name) => name.endsWith('.tmp')), []);
+  assert.equal(fs.readFileSync(path.join(dir, 'sess-1.json'), 'utf8'), before);
+
+  // Sync: the same failure through the synchronous append, on a mirror of its own.
+  const syncRoot = tempRoot(t);
+  const syncDir = path.join(syncRoot, '.keep', 'transcript-mirrors', 'aws1');
+  post(syncRoot);
+  const writeFileSync = fs.writeFileSync;
+  fs.writeFileSync = (target, ...rest) => {
+    if (isSidecarTemp(target)) { writeFileSync(target, '{"gener'); throw simulated(); }
+    return writeFileSync(target, ...rest);
+  };
+  try {
+    assert.throws(() => post(syncRoot, { bytes: Buffer.from('more\n'), fromOffset: 8, size: 13 }), { code: 'ENOSPC' });
+  } finally { fs.writeFileSync = writeFileSync; }
+  assert.deepEqual(fs.readdirSync(syncDir).filter((name) => name.endsWith('.tmp')), []);
+});
