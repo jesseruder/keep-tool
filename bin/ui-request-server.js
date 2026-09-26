@@ -401,7 +401,7 @@ function createUiRequestServer(options = {}) {
         if (!Number.isInteger(num) || num < 1) return json(res, 400, { error: 'num must be a session number' });
         const own = (current.state?.sessions || []).find((session) => session?.num === num);
         const lookup = require('./terminal-ref-lookup.js');
-        const cards = lookup.cardMentions(current.state?.tasks || [], lookup.sessionMentionPattern(num),
+        const cards = lookup.cardMentions(current.state?.tasks || [], lookup.sessionMention(num),
           { exclude: (task) => Boolean(own?.taskId) && task.id === own.taskId });
         try {
           const sessions = await mentionSearch().mentions(num, own?.id || '');

@@ -4,7 +4,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
-const { createCommitLookup, cardMentions, readHolds, sessionMentionPattern } = require('./terminal-ref-lookup.js');
+const { createCommitLookup, cardMentions, readHolds, sessionMention } = require('./terminal-ref-lookup.js');
 
 const tmp = () => fs.mkdtempSync(path.join(os.tmpdir(), 'ref-lookup-'));
 
@@ -15,10 +15,11 @@ const tasks = [
 ];
 
 test('card mentions match the literal, newest first, with the line that names it', () => {
-  const found = cardMentions(tasks, sessionMentionPattern(453));
+  const found = cardMentions(tasks, sessionMention(453));
   assert.deepEqual(found.map((card) => [card.id, card.line]), [['new-card', 'asked #453 and #4530'], ['old-card', 'Waiting on #453.']]);
-  assert.deepEqual(cardMentions(tasks, sessionMentionPattern(453), { exclude: (task) => task.id === 'new-card' }).map((card) => card.id), ['old-card']);
-  assert.deepEqual(cardMentions(tasks, sessionMentionPattern(45)), []);
+  assert.deepEqual(cardMentions(tasks, sessionMention(453), { exclude: (task) => task.id === 'new-card' }).map((card) => card.id), ['old-card']);
+  assert.deepEqual(cardMentions(tasks, sessionMention(45)), []);
+  assert.deepEqual(cardMentions([{ id: 'pr', fm: {}, body: 'see PR #453 and color: #453' }], sessionMention(453)), [], 'what the terminal would not link is not a mention');
 });
 
 test('holds: live ones only, with an absolute expiry and the holder number, nothing deleted', async () => {

@@ -13,24 +13,13 @@
 // arrives.
 
 import { numLabel } from './session-number.js';
+import './shared/session-mentions.js';
 
-// `#` then digits, standing alone: not `repo#12`, `&#39;`, `a/#3` or `##4`, and not
-// a hex colour or anchor like `#123abc`. A GitHub reference reads the same, so a
-// number right after PR/issue/pull request/MR (`PR #12`, `PR: #12`, `issue (#12)`)
-// is left alone even when a session has it, and so is an all-digit colour after
-// color/fill/background (`color: #123456`).
-const SESSION_REF = /#(\d{1,6})(?![\w-])/g;
-const NOT_SESSION = /(?:\b(?:prs?|pull(?:\s+requests?)?|pulls|issues?|mrs?|bugs?|tickets?|colou?r|fill|stroke|background|bg)[\s:=("'`]*$|[\w#&/=]$)/i;
-
+// `#453`, by the rule the UI worker also counts mentions with
+// (web/app/shared/session-mentions.js): not `repo#12`, `PR #12` or `color: #123`.
 export function findSessionRefs(text) {
-  const refs = [];
-  for (const match of String(text || '').matchAll(SESSION_REF)) {
-    const before = text.slice(Math.max(0, match.index - 24), match.index);
-    if (NOT_SESSION.test(before)) continue;
-    const num = Number(match[1]);
-    if (num >= 1) refs.push({ key: num, start: match.index, end: match.index + match[0].length });
-  }
-  return refs;
+  return globalThis.KeepSessionMentions.findSessionMentions(text)
+    .map((mention) => ({ key: mention.num, start: mention.start, end: mention.end }));
 }
 
 // A card id is a slug (bin/keep-core.js slugify): lowercase words joined by single
@@ -73,7 +62,7 @@ export function findShaRefs(text) {
 // Lookups a hover card waits on, kept for `ttlMs` so moving the pointer back over
 // the same reference does not ask again. `get` answers the entry as it stands and
 // starts the load once; `update` runs when it lands.
-export function createRefCache({ ttlMs = 60e3, now = () => Date.now() } = {}) {
+export function createRefCache({ ttlMs = 60e3, retryMs = 2000, now = () => Date.now() } = {}) {
   const entries = new Map();
   return {
     peek: (key) => entries.get(key) || null,
@@ -85,12 +74,19 @@ export function createRefCache({ ttlMs = 60e3, now = () => Date.now() } = {}) {
       }
       const fresh = { status: 'loading', value: entry?.value ?? null, at: now(), waiters: new Set([update]) };
       entries.set(key, fresh);
+      const wake = () => { for (const waiter of fresh.waiters) waiter(); fresh.waiters.clear(); };
       Promise.resolve().then(load).then((value) => {
-        // A superseded lookup answers null-with-no-verdict: forget it, ask again next hover.
-        if (value === undefined) { entries.delete(key); return; }
+        // A lookup a newer one replaced (undefined) is forgotten, and its hover asks
+        // again only after a pause: waking it at once would supersede whichever
+        // lookup replaced it, and two hovers would take turns forever.
+        if (value === undefined) {
+          if (entries.get(key) === fresh) entries.delete(key);
+          setTimeout(wake, retryMs);
+          return;
+        }
         Object.assign(fresh, { status: 'ready', value, at: now() });
-      }, () => Object.assign(fresh, { status: 'error', at: now() }))
-        .finally(() => { for (const waiter of fresh.waiters) waiter(); fresh.waiters.clear(); });
+        wake();
+      }, () => { Object.assign(fresh, { status: 'error', at: now() }); wake(); });
       if (entries.size > 300) entries.delete(entries.keys().next().value);
       return fresh;
     },

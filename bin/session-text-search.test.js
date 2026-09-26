@@ -97,6 +97,15 @@ test('mentions of #n: the literal standing alone, newest first, never the sessio
   assert.deepEqual(searchMentions(handle, 0), []);
 });
 
+test('mentions page past near-misses rather than stopping at the first page', () => {
+  const { searchMentions } = require('./session-text-search.js');
+  const handle = database();
+  const message = handle.prepare('INSERT INTO messages (session_id, ts, role, kind, text) VALUES (?, ?, ?, ?, ?)');
+  message.run('other', 10, 'assistant', 'text', 'Earlier: waiting on #7 for the hold.');
+  for (let i = 0; i < 5; i += 1) message.run('live', 20 + i, 'assistant', 'text', `see PR #7 and castle#7 and #7-top (${i})`);
+  assert.deepEqual(searchMentions(handle, 7, { pageSize: 2 }).map((hit) => hit.sessionId), ['other']);
+});
+
 test('a mentions query rides the same worker queue and posts its number', async () => {
   FakeWorker.made = [];
   const search = createSessionTextSearch({ Worker: FakeWorker, workerFile: 'x' });

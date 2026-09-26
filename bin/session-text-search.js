@@ -11,6 +11,7 @@
 // The query runs in a worker thread: the UI worker that serves it also streams
 // every terminal, and node:sqlite is synchronous.
 const path = require('node:path');
+const { mentionIndex } = require('../web/app/shared/session-mentions.js');
 
 const MIN_QUERY = 3;
 const MIN_PREFIX = 3;
@@ -69,39 +70,51 @@ function searchDatabase(handle, query, options = {}) {
 function searchMentions(handle, num, options = {}) {
   const number = Number(num);
   if (!Number.isInteger(number) || number < 1) return [];
-  const literal = new RegExp(`(?<![\\w#&/=])#${number}(?![\\w-])`);
   const sessionLimit = options.sessionLimit || MENTION_LIMIT;
+  const pageSize = options.pageSize || MENTION_PAGE;
   const bySession = new Map();
   for (const source of hasArchive(handle) ? [LIVE, ARCHIVE] : [LIVE]) {
-    const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role, m.kind, m.text,
+    const query = handle.prepare(`SELECT ${source.fts}.rowid AS rowid, m.session_id AS sessionId, m.ts, m.role, m.kind, m.text,
         ${source.title} AS title, s.card_id AS card, s.project, s.agent
       FROM ${source.fts}
       JOIN ${source.messages} m ON m.id = ${source.fts}.rowid
       JOIN ${source.sessions} s ON s.id = m.session_id
-      WHERE ${source.fts} MATCH ? AND instr(m.text, ?) > 0 AND m.session_id <> ?
+      WHERE ${source.fts} MATCH ? AND ${source.fts}.rowid < ? AND instr(m.text, ?) > 0 AND m.session_id <> ?
         ${source.archive ? '' : "AND m.kind IN ('human', 'text') AND s.kind = 'interactive'"}
-      ORDER BY ${source.fts}.rowid DESC LIMIT ?`).all(`"${number}"`, `#${number}`, String(options.exclude || ''), MENTION_HIT_LIMIT);
-    for (const row of rows) {
-      const text = String(row.text || '');
-      const at = text.search(literal);
-      if (at < 0) continue;
-      const hit = bySession.get(row.sessionId);
-      if (hit) { hit.hits += 1; continue; }
-      if (bySession.size >= sessionLimit) continue;
-      const from = Math.max(0, at - 60);
-      bySession.set(row.sessionId, {
-        sessionId: row.sessionId, ts: row.ts, role: row.role, kind: row.kind, hits: 1,
-        title: row.title || '', card: row.card || '', project: row.project || '', agent: row.agent || '',
-        snippet: `${from ? '…' : ''}${text.slice(from, at + 100).replace(/\s+/g, ' ').trim()}${at + 100 < text.length ? '…' : ''}`,
-        ...(source.archive ? { archived: true } : {}),
-      });
-    }
+      ORDER BY ${source.fts}.rowid DESC LIMIT ?`);
+    // Pages newest first until enough sessions, the rows run out, or MENTION_SCAN
+    // rows are read: near-misses (`repo#7`, `PR #7`) pass the literal check but not
+    // the mention rule, and must not use up the budget real mentions need.
+    let cursor = Number.MAX_SAFE_INTEGER;
+    let scanned = 0;
+    let rows;
+    do {
+      rows = query.all(`"${number}"`, cursor, `#${number}`, String(options.exclude || ''), pageSize);
+      scanned += rows.length;
+      if (rows.length) cursor = rows[rows.length - 1].rowid;
+      for (const row of rows) {
+        const text = String(row.text || '');
+        const at = mentionIndex(text, number);
+        if (at < 0) continue;
+        const hit = bySession.get(row.sessionId);
+        if (hit) { hit.hits += 1; continue; }
+        if (bySession.size >= sessionLimit) continue;
+        const from = Math.max(0, at - 60);
+        bySession.set(row.sessionId, {
+          sessionId: row.sessionId, ts: row.ts, role: row.role, kind: row.kind, hits: 1,
+          title: row.title || '', card: row.card || '', project: row.project || '', agent: row.agent || '',
+          snippet: `${from ? '…' : ''}${text.slice(from, at + 100).replace(/\s+/g, ' ').trim()}${at + 100 < text.length ? '…' : ''}`,
+          ...(source.archive ? { archived: true } : {}),
+        });
+      }
+    } while (rows.length === pageSize && bySession.size < sessionLimit && scanned < MENTION_SCAN);
     if (bySession.size >= sessionLimit) break;
   }
   return [...bySession.values()];
 }
 const MENTION_LIMIT = 8;
-const MENTION_HIT_LIMIT = 400;
+const MENTION_PAGE = 400;
+const MENTION_SCAN = 4000;
 
 const LIVE = { fts: 'messages_fts', messages: 'messages', sessions: 'sessions', title: 's.title', archive: false };
 const ARCHIVE = { fts: 'archive_fts', messages: 'archive_messages', sessions: 'archive_sessions', title: "''", archive: true };

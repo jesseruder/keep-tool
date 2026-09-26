@@ -9,6 +9,7 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const { execFile } = require('node:child_process');
+const { mentionIndex } = require('../web/app/shared/session-mentions.js');
 
 const SHA = /^[0-9a-f]{7,40}$/;
 const GIT_TIMEOUT_MS = 2000;
@@ -30,18 +31,18 @@ function lineAround(body, index) {
   return line.length > 200 ? `${line.slice(0, 199)}…` : line;
 }
 
-// Cards whose body matches `pattern` (a global regex), newest update first.
-function cardMentions(tasks, pattern, { limit = CARD_LIMIT, exclude = () => false } = {}) {
+// Cards whose body `find` locates something in (it answers an index or -1), newest
+// update first.
+function cardMentions(tasks, find, { limit = CARD_LIMIT, exclude = () => false } = {}) {
   const found = [];
   for (const task of tasks || []) {
     if (!task?.id || typeof task.body !== 'string' || exclude(task)) continue;
-    pattern.lastIndex = 0;
-    const match = pattern.exec(task.body);
-    if (!match) continue;
+    const index = find(task.body);
+    if (index < 0) continue;
     found.push({
       id: task.id, title: task.fm?.title || task.id, status: task.fm?.status || '',
       updated: Date.parse(task.fm?.updated || task.fm?.created || '') || 0,
-      line: lineAround(task.body, match.index),
+      line: lineAround(task.body, index),
     });
   }
   return found.sort((a, b) => b.updated - a.updated).slice(0, limit);
@@ -75,7 +76,8 @@ function createCommitLookup({ root, runGit = git, now = () => Date.now() } = {})
     const cached = cache.get(cacheKey);
     if (cached && now() - cached.at < CACHE_MS) return cached.value;
 
-    const cards = cardMentions(tasks, new RegExp(`(?<![0-9a-f])${wanted}`, 'g'));
+    const cited = new RegExp(`(?<![0-9a-f])${wanted}`);
+    const cards = cardMentions(tasks, (body) => body.search(cited));
     const repos = [...new Set([project, ...cards.map((card) => tasks.find((task) => task.id === card.id)?.fm?.project)]
       .map(expandHome).filter((repo) => path.isAbsolute(repo)))];
     let commit = null;
@@ -135,10 +137,10 @@ async function readHolds(root, { now = Date.now(), numberOf = () => null } = {})
   return holds.sort((a, b) => a.untilMs - b.untilMs);
 }
 
-// A session number as prose writes it, by the same rule the console's link uses: not
-// `repo#12`, `&#12;`, or the `#12` inside `#123`.
-function sessionMentionPattern(num) {
-  return new RegExp(`(?<![\\w#&/=])#${Number(num)}(?![\\w-])`, 'g');
+// Where a body mentions session `num`, by the rule the console's links use
+// (web/app/shared/session-mentions.js).
+function sessionMention(num) {
+  return (body) => mentionIndex(body, num);
 }
 
-module.exports = { createCommitLookup, cardMentions, readHolds, sessionMentionPattern, lineAround, git };
+module.exports = { createCommitLookup, cardMentions, readHolds, sessionMention, lineAround, git };

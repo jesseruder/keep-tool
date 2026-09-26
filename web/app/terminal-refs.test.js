@@ -206,9 +206,36 @@ test('the ref cache loads once, wakes every waiter, keeps answers for its ttl an
   cache.get('k', () => { loads += 1; return 'y'; });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(cache.peek('k').value, 'y');
-  cache.get('gone', () => undefined);
+});
+
+test('a superseded lookup is forgotten and its hover asks again only after a pause', async () => {
+  const cache = createRefCache({ retryMs: 20 });
+  let woke = 0;
+  cache.get('gone', () => undefined, () => { woke += 1; });
   await new Promise((resolve) => setTimeout(resolve, 0));
   assert.equal(cache.peek('gone'), null);
+  assert.equal(woke, 0, 'not at once: that would supersede whatever replaced it');
+  await new Promise((resolve) => setTimeout(resolve, 30));
+  assert.equal(woke, 1);
+});
+
+test('a superseded answer never deletes the entry that replaced it', async () => {
+  const cache = createRefCache({ ttlMs: 0, retryMs: 1 });
+  let answerFirst;
+  cache.get('k', () => new Promise((resolve) => { answerFirst = resolve; }));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  // An evicted or expired in-flight entry: another hover installs a replacement.
+  cache.peek('k').status = 'ready';
+  const second = cache.get('k', () => 'fresh');
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  answerFirst(undefined);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(cache.peek('k'), second);
+  assert.equal(cache.peek('k').value, 'fresh');
+});
+
+test('the session rule is shared with the worker: what is not linked is not a mention', () => {
+  assert.deepEqual(findSessionRefs('PR #12, castle#12, #12').map((ref) => [ref.key, ref.start]), [[12, 19]]);
 });
 
 test('the commit card says where the commit is and which card and review name it', () => {
