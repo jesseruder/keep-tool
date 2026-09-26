@@ -11900,7 +11900,7 @@ test('buildState judges a session on a node pane by that node\'s own companion l
     const local = { known: true, complete: true, discovery: 'ok', jobs: [] };
     const answered = run({ ...local, byNode: {
       main: { ...local },
-      'cj-pane': { known: true, complete: true, discovery: 'ok', jobs: [
+      'cj-pane': { known: true, complete: true, discovery: 'ok', readAt: 200000, staleMs: 0, jobs: [
         { id: 'task-on-node', sessionId: 'cj-node-session', state: 'running', node: 'cj-pane' },
         { id: 'task-for-local', sessionId: 'cj-local-session', state: 'running', node: 'cj-pane' },
       ] },
@@ -11923,10 +11923,11 @@ test('buildState judges a session on a node pane by that node\'s own companion l
 test('a session is judged by the companion list of the node its pane is on', () => {
   const byNode = {
     main: { known: true, complete: true, discovery: 'ok', jobs: [] },
-    'cj-ok': { known: true, complete: true, discovery: 'ok', jobs: [] },
-    'cj-unknown': { known: false, complete: false, discovery: 'unknown', jobs: [] },
-    'cj-partial': { known: true, complete: false, discovery: 'partial', jobs: [] },
+    'cj-ok': { known: true, complete: true, discovery: 'ok', jobs: [], readAt: 5000, staleMs: 0 },
+    'cj-unknown': { known: false, complete: false, discovery: 'unknown', jobs: [], readAt: 5000, staleMs: 0 },
+    'cj-partial': { known: true, complete: false, discovery: 'partial', jobs: [], readAt: 5000, staleMs: 0 },
   };
+  const ended = { mtime: 4000 };
   const complete = { known: true, complete: true, discovery: 'ok', jobs: [], byNode };
   const local = { id: 'p1' };
   const onNode = (node) => ({ id: `p1@${node}`, node, hostPaneId: 'p1' });
@@ -11935,34 +11936,45 @@ test('a session is judged by the companion list of the node its pane is on', () 
   assert.equal(paneCompanionComplete(local, { ...complete, known: false, discovery: 'unknown' }), false,
     'this machine\'s own panes keep exactly the answer they had');
   assert.equal(paneCompanionComplete(local, { ...complete, discovery: 'partial' }), false);
-  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete), true);
-  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, known: false, discovery: 'unknown' }), true,
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, ended), true);
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, known: false, discovery: 'unknown' }, ended), true,
     'a node session is judged by its own node, not by this machine');
-  assert.equal(paneCompanionComplete(onNode('cj-unknown'), complete), false);
-  assert.equal(paneCompanionComplete(onNode('cj-partial'), complete), false);
-  assert.equal(paneCompanionComplete(onNode('cj-missing'), complete), false, 'a node that gave no answer');
-  assert.equal(paneCompanionComplete(onNode('cj-ok'), { known: true, discovery: 'ok', jobs: [] }), false,
+  assert.equal(paneCompanionComplete(onNode('cj-unknown'), complete, ended), false);
+  assert.equal(paneCompanionComplete(onNode('cj-partial'), complete, ended), false);
+  assert.equal(paneCompanionComplete(onNode('cj-missing'), complete, ended), false, 'a node that gave no answer');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { known: true, discovery: 'ok', jobs: [] }, ended), false,
     'a snapshot with no node answers at all');
-  assert.equal(paneCompanionComplete(onNode('__proto__'), complete), false);
+  assert.equal(paneCompanionComplete(onNode('__proto__'), complete, ended), false);
+  // A node's answer proves nothing about a turn that ended after it was read, nor when
+  // it is old, nor for a session with no activity time.
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, { mtime: 5001 }), false, 'read before the turn ended');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, { mtime: 5000 }), true, 'read as the turn ended');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], staleMs: 10e3 } } }, ended), true);
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], staleMs: 10001 } } }, ended), false,
+    'an answer older than two publications');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), { ...complete, byNode: { ...byNode, 'cj-ok': { ...byNode['cj-ok'], readAt: undefined } } }, ended), false,
+    'an answer with no read time');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete), false, 'no session to compare with');
+  assert.equal(paneCompanionComplete(onNode('cj-ok'), complete, { mtime: 0 }), false);
 });
 
 test('a node session drops RUNNING when its own node lists no job for it, and keeps it otherwise', () => {
   const { activity } = require('./session-status');
   const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
-  const idle = (id) => ({ id, kind: 'claude', pane: `p-${id}@cj-status`, node: 'cj-status', endedTurn: true, attentionAt: 1000,
+  const idle = (id) => ({ id, kind: 'claude', pane: `p-${id}@cj-status`, node: 'cj-status', endedTurn: true, attentionAt: 1000, mtime: 1000,
     lastAssistantFull: 'The Codex review is running; I will land once it comes back.',
     stopVerdict: { verdict: 'running', reason: 'waiting on the review' },
     footer, footerTrusted: true, agentShells: 0, backgroundJobs: { caughtUp: true, pending: false, jobs: [] } });
   const nodeAnswer = (discovery, jobs = []) => ({ known: true, complete: true, discovery: 'ok', jobs: [], byNode: {
     main: { known: true, complete: true, discovery: 'ok', jobs: [] },
-    'cj-status': { known: discovery !== 'unknown', complete: discovery === 'ok', discovery, jobs },
+    'cj-status': { known: discovery !== 'unknown', complete: discovery === 'ok', discovery, jobs, readAt: 2000, staleMs: 0 },
   } });
   // What buildState does for each session: the node's jobs for a session on that
   // node, then whether that node's list is complete.
   const judge = (session, companion) => {
     const pane = { id: session.pane, node: 'cj-status', hostPaneId: `p-${session.id}` };
     applyCompanionJobs([session], companion, { daemonNode: 'main', nodeOf: () => pane.node });
-    session.companionComplete = paneCompanionComplete(pane, companion);
+    session.companionComplete = paneCompanionComplete(pane, companion, session);
     return activity(session);
   };
   const empty = judge(idle('cj-empty'), nodeAnswer('ok'));
@@ -11980,6 +11992,69 @@ test('a node session drops RUNNING when its own node lists no job for it, and ke
   companion.byNode['cj-other'] = { known: true, complete: true, discovery: 'ok', jobs: [{ id: 'task-other', sessionId: 'cj-stranger', state: 'running' }] };
   assert.equal(judge(stranger, companion).decision.rule, 'conversation-ready');
   assert.deepEqual(stranger.backgroundJobs.jobs, []);
+});
+
+test('a node session keeps RUNNING until its node is read after the turn that started a job ended', async () => {
+  const { activity } = require('./session-status');
+  const t0 = 3_000_000;
+  let now = t0;
+  let nodeJobs = [];
+  let hang = false;
+  const hostRequest = async (type, params, deps) => {
+    if (type === 'hello') return { node: deps.node, companionJobs: 1 };
+    if (hang) return new Promise(() => {});
+    return { node: deps.node, codexJobs: { discovery: 'ok', jobs: nodeJobs.map((job) => ({ ...job })) },
+      piJobs: { known: true, discovery: 'ok', jobs: [] } };
+  };
+  const deps = { ...localCompanion, hostNodes: ['main', 'cj-race'], hostRequest, now: () => now };
+  const settle = () => new Promise((resolve) => setImmediate(resolve));
+  const footer = { recognized: true, shells: 0, agents: 0, turnRunning: false, running: false };
+  // What buildState does per session, each publication, from a fresh row.
+  const publish = async (mtime) => {
+    const companion = await companionSnapshot(deps);
+    await settle();
+    const session = { id: 'cj-race-session', kind: 'claude', pane: 'p1@cj-race', node: 'cj-race', endedTurn: true, attentionAt: 1000, mtime,
+      lastAssistantFull: 'The Codex review is running; I will land once it comes back.',
+      stopVerdict: { verdict: 'running', reason: 'waiting on the review' },
+      footer, footerTrusted: true, agentShells: 0, backgroundJobs: { caughtUp: true, pending: false, jobs: [] } };
+    const pane = { id: 'p1@cj-race', node: 'cj-race', hostPaneId: 'p1' };
+    applyCompanionJobs([session], companion, { daemonNode: 'main', nodeOf: () => pane.node });
+    session.companionComplete = paneCompanionComplete(pane, companion, session);
+    return { rule: activity(session).decision.rule, state: activity(session).state, complete: session.companionComplete };
+  };
+  // The node is read once, with nothing running.
+  await publish(t0 - 60e3);
+  // The session starts a job on its node and ends its turn two seconds later.
+  nodeJobs = [{ id: 'task-race', sessionId: 'cj-race-session', state: 'running' }];
+  const turnEnd = t0 + 2000;
+  now = t0 + 3000;
+  const first = await publish(turnEnd);
+  assert.equal(first.complete, false, 'the answer served was read before the turn ended');
+  assert.equal(first.rule, 'model-running', 'so the session keeps RUNNING rather than dropping to ready');
+  now = t0 + 4000;
+  const next = await publish(turnEnd);
+  assert.equal(next.state, 'waiting', 'the read after the turn lists the job');
+  // The job finishes: the next served answer is still the one listing it, then a read
+  // after the turn with no jobs lets the verdict fall to the rules.
+  nodeJobs = [];
+  now = t0 + 6000;
+  assert.equal((await publish(turnEnd)).state, 'waiting');
+  now = t0 + 7000;
+  const done = await publish(turnEnd);
+  assert.equal(done.complete, true);
+  assert.equal(done.rule, 'conversation-ready');
+  // A node whose refresh hangs: its last ok answer, read after the turn, stops proving
+  // anything once it is older than two publications, and never drops the session.
+  hang = true;
+  for (const age of [9e3, 12e3, 20e3, 29e3]) {
+    now = t0 + 6000 + age;
+    const held = await publish(turnEnd);
+    if (age <= 10e3) assert.equal(held.rule, 'conversation-ready', `${age} ms old`);
+    else {
+      assert.equal(held.complete, false, `${age} ms old`);
+      assert.equal(held.rule, 'model-running', `${age} ms old`);
+    }
+  }
 });
 
 test('buildState includes companion ownership in normal session classification', () => {

@@ -646,15 +646,30 @@ function nodeCompanionEntry(companion, node) {
   return node && byNode && typeof byNode === 'object' && Object.hasOwn(byNode, node) ? byNode[node] : null;
 }
 
+// How old a node's answer may be and still prove a session has no job there: about two
+// dashboard publications. An older answer still attaches the jobs it lists.
+const NODE_COMPANION_PROOF_MS = 10e3;
+
 // Whether the companion job list a session's pane is judged against is complete. A
 // pane on this machine carries no `hostPaneId` (qualifyNodePanes) and is judged by this
-// machine's own discovery, exactly as before nodes answered for theirs. A pane on
-// another node is judged by that node's own answer, and by nothing when the node gave
-// none: a job this daemon cannot see may be what the session is waiting on.
-function paneCompanionComplete(pane, companion) {
+// machine's own discovery, exactly as before nodes answered for theirs; that read is
+// fresh for every publication. A pane on another node is judged by that node's own
+// answer, which a snapshot serves from its last read while the next one runs, so it
+// proves "nothing will wake this session" only when it is recent (NODE_COMPANION_PROOF_MS)
+// and was read at or after the session's last activity: `session.mtime`, the activity
+// time the row carries (transcriptActivityMs of the node's own read of the transcript,
+// remoteSessionFreshness, as a local Claude row has it). A job started during the turn
+// is in any read taken after the turn's last write; a read from before it may not list
+// it. By nothing at all when the node gave no answer.
+function paneCompanionComplete(pane, companion, session = null) {
   if (!pane?.hostPaneId) return companionListComplete(companion);
   const entry = nodeCompanionEntry(companion, pane.node);
-  return entry ? companionListComplete(entry) : false;
+  if (!entry || !companionListComplete(entry)) return false;
+  const readAt = Number(entry.readAt);
+  const staleMs = Number(entry.staleMs ?? 0);
+  const activityAt = Number(session?.mtime);
+  if (!Number.isFinite(readAt) || !(staleMs <= NODE_COMPANION_PROOF_MS)) return false;
+  return Number.isFinite(activityAt) && activityAt > 0 && readAt >= activityAt;
 }
 
 // `options.nodeOf` names the node a session's pane is on (null for this machine);
@@ -6725,13 +6740,14 @@ async function fetchNodeCompanionJobs(node, deps = {}) {
   }
 }
 
-// The node's last answer as a snapshot reads it now: with its age, or 'stale' once it
+// The node's last answer as a snapshot reads it now: when it was read (`readAt`, this
+// daemon's clock) and its age, or 'stale' once it
 // is older than NODE_COMPANION_KEEP_MS. Null before the node has answered at all.
 function nodeCompanionView(node, cache, now) {
   if (!cache.value) return null;
   const staleMs = Math.max(0, now - cache.at);
-  if (staleMs >= NODE_COMPANION_KEEP_MS) return { ...unknownNodeCompanion(node, 'stale'), staleMs };
-  return { ...cache.value, staleMs };
+  if (staleMs >= NODE_COMPANION_KEEP_MS) return { ...unknownNodeCompanion(node, 'stale'), readAt: cache.at, staleMs };
+  return { ...cache.value, readAt: cache.at, staleMs };
 }
 
 // Never rejects, and never waits on a node it has an answer from: a refresh that is
@@ -13989,7 +14005,7 @@ function buildState(options = {}) {
       // cannot see. Jobs are discovered where they run, so a session on another node
       // is judged by that node's own answer (the `companion-jobs` host verb) and
       // keeps its RUNNING when that node gave none (paneCompanionComplete).
-      session.companionComplete = paneCompanionComplete(pane, options.companion);
+      session.companionComplete = paneCompanionComplete(pane, options.companion, session);
     }
   }
   // What the classifier reads off the card: whether this session is its latest linked
