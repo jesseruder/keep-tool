@@ -224,6 +224,7 @@ commands['review-tick'] = async (argv) => {
 };
 
 commands['review-queue'] = async (argv) => {
+  if (argv[0] === 'handoff') return reviewQueueHandoff(argv.slice(1));
   const o = parseArgs(argv, { limit: 'str', 'min-score': 'str', json: 'bool' });
   const review = require('../review.js');
   const out = await review.reviewQueue({
@@ -240,6 +241,24 @@ commands['review-queue'] = async (argv) => {
   if (skipped.length) process.stderr.write(`skipped: ${skipped.join(', ')}\n`);
   if (!out.ranked.length) process.exit(3);
 };
+
+// `keep review-queue handoff <name>`: the instructions a console review queue launch
+// wrote for its session (bin/review-queue.js writeHandoff), whose opening message
+// names this command. A session on a pane-only node reaches it forwarded to the
+// daemon, whose registry holds the file.
+function reviewQueueHandoff(argv) {
+  const { REVIEW_QUEUE_HANDOFF_NAME_RE } = require('../registry-commands.js');
+  if (argv.length !== 1 || !REVIEW_QUEUE_HANDOFF_NAME_RE.test(argv[0])) {
+    die('usage: keep review-queue handoff <name>   (the 24 hex digits the opening message gave)');
+  }
+  let text;
+  try { text = require('../review-queue.js').readHandoff(ROOT, argv[0]); }
+  catch (error) {
+    if (error.status === 404) die(`${error.message}; it was written on the daemon node for one launch`);
+    throw error;
+  }
+  process.stdout.write(text);
+}
 
 commands['review-note'] = async (argv) => {
   requireReviewerFromNode('review-note');

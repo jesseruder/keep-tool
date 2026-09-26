@@ -58,6 +58,11 @@ const REGISTRY_COMMANDS = Object.freeze([
   // `verify <card>` delivers the card's check recipe into a session now (/api/run), as
   // a scheduled check would; nothing in the request is run as a command.
   'verify',
+  // Only `review-queue handoff <name>` (reviewQueueRefusal below): a console review
+  // queue launch on a node opens with a pointer to its instructions, which the daemon
+  // wrote into its own registry (bin/review-queue.js writeHandoff). Read-only, and
+  // nothing about the caller matters: the text is what the daemon would have typed.
+  'review-queue',
   // An agent's own feed (AGENTS_ALLOWED): a card agent or responder on a node says
   // what it found with `emit`, and reads its feed with `events` or the bare list.
   // The daemon's CLI runs an emit under the caller's verified session and writes it
@@ -89,6 +94,15 @@ function agentsRefusal(args, identity = null) {
   if (sub !== undefined && !String(sub).startsWith('-') && !AGENTS_ALLOWED.includes(sub)) return AGENTS_REFUSAL;
   if (identity && sub === 'emit' && !identity.session) return AGENTS_EMIT_REFUSAL;
   return null;
+}
+
+// The name of a review queue handoff file: the first 24 hex digits of a sha256
+// (bin/review-queue.js writeHandoff), and so never a path.
+const REVIEW_QUEUE_HANDOFF_NAME_RE = /^[0-9a-f]{24}$/;
+const REVIEW_QUEUE_REFUSAL = 'a node runs only keep review-queue handoff <name>; the rest runs on the daemon node';
+function reviewQueueRefusal(args) {
+  if (args.length === 2 && args[0] === 'handoff' && REVIEW_QUEUE_HANDOFF_NAME_RE.test(args[1])) return null;
+  return REVIEW_QUEUE_REFUSAL;
 }
 
 const TURNS_READS = Object.freeze(['search', 'show', 'stats']);
@@ -246,6 +260,7 @@ const BOOLEAN_FLAGS = Object.freeze({
   'review-outcome': ['json'],
   alert: ['dry', 'force'],
   compact: ['when-idle'],
+  'review-queue': ['json'],
 });
 
 // The arguments each registry command resolves as a project (keep-core
@@ -304,6 +319,7 @@ function argumentRefusal(command, args, identity = {}) {
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   if (command === 'agents' && agentsRefusal(args, identity)) return agentsRefusal(args, identity);
   if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
+  if (command === 'review-queue' && reviewQueueRefusal(args)) return reviewQueueRefusal(args);
   if (Object.prototype.hasOwnProperty.call(SESSION_REFUSALS, command) && !identity.session) return SESSION_REFUSALS[command];
   if (requestedWaitMs(command, args) > MAX_FORWARDED_WAIT_MS) return WAIT_CAP_REFUSAL;
   const newline = (arg) => /[\r\n]/.test(arg);
@@ -469,6 +485,7 @@ function nodeSideRefusal(command, args) {
   if (command === 'nodes' && !NODES_ALLOWED.includes(args[0])) return NODES_REFUSAL;
   if (command === 'agents' && agentsRefusal(args)) return agentsRefusal(args);
   if (command === 'compact' && compactRefusal(args)) return compactRefusal(args);
+  if (command === 'review-queue' && reviewQueueRefusal(args)) return reviewQueueRefusal(args);
   const fileFlags = Object.prototype.hasOwnProperty.call(NODE_FILE_FLAGS, command) ? NODE_FILE_FLAGS[command] : [];
   for (let i = 0; i < args.length; i += 1) {
     const arg = args[i];
@@ -547,4 +564,4 @@ function artifactNameRefusal(name) {
   return null;
 }
 
-module.exports = { REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };
+module.exports = { REVIEW_QUEUE_HANDOFF_NAME_RE, REVIEW_QUEUE_REFUSAL, REVIEW_LAND_STDIN_MAX, stdinRefusal, ARTIFACT_STORE_MAX_FILES, ARTIFACT_NODE_DAILY_BYTES, ARTIFACT_NODE_DAILY_FILES, ARTIFACT_QUOTA_WINDOW_MS, ARTIFACT_STORE_MAX_BYTES, ARTIFACT_FILE_MAX_BYTES, ARTIFACT_COMMAND_MAX_BYTES, ARTIFACT_MAX_FILES, ARTIFACT_BODY_MAX_BYTES, ARTIFACT_NAME_MAX_BYTES, artifactNameRefusal, REGISTRY_COMMANDS, COMMAND_FLAGS, NODE_FILE_FLAGS, PLACEMENT_FLAGS, SESSION_REFUSALS, BOOLEAN_FLAGS, MAX_FORWARDED_WAIT_MS, OPEN_EXTRA_MS, MAX_OPEN_EXTRA_MS, OPEN_UNBOUNDED_REFUSAL, openExtraMs, openRequiredMs, forwardedWaitMs, runsLikeOpen, isWaitingTell, nodeSideRefusal, PROJECT_FLAGS, PROJECT_POSITIONS, MAX_ARG_BYTES, MAX_ARGS_BYTES, isRegistryCommand, argumentRefusal };

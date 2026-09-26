@@ -6,6 +6,7 @@ const crypto = require('crypto');
 const keep = require('./keep.js');
 const review = require('./review.js');
 const related = require('./review-related.js');
+const { REVIEW_QUEUE_HANDOFF_NAME_RE } = require('./registry-commands.js');
 
 const VERSION = 1;
 const RESOLVED_FINDING_OUTCOMES = new Set(['fixed', 'incorrect', 'superseded']);
@@ -303,12 +304,21 @@ function launchInstructions(source, action, sources) {
   return `${lines.join('\n')}\n`;
 }
 
+function handoffDirectory(root) {
+  return path.join(root, '.keep', 'review-queue-handoffs');
+}
+
+// The launched session's instructions go in a file in the daemon's registry, and its
+// opening message, which must be one short line, only says how to read them. It names
+// a command rather than the file, because a launch placed on another node opens where
+// that path does not exist: there `keep review-queue handoff` is forwarded to the
+// daemon (bin/registry-commands.js), and on the daemon node it reads the file itself.
 function writeHandoff(root, itemId, requestId, message) {
-  const directory = path.join(root, '.keep', 'review-queue-handoffs');
+  const directory = handoffDirectory(root);
   fs.mkdirSync(directory, { recursive: true });
   const name = crypto.createHash('sha256').update(`${itemId}\0${requestId}`).digest('hex').slice(0, 24);
   const file = path.join(directory, `${name}.md`);
-  const pointer = `Your review queue instructions are in ${file}; read that file first.`;
+  const pointer = `Your review queue instructions: run \`keep review-queue handoff ${name}\` and read its output first.`;
   if (pointer.length > keep.OPEN_MESSAGE_LIMIT || /[\r\n]/.test(pointer)) {
     throw new QueueError(400, keep.OPEN_MESSAGE_ERROR);
   }
@@ -319,6 +329,19 @@ function writeHandoff(root, itemId, requestId, message) {
     if (existing !== message) throw new QueueError(409, 'request id already has different review context');
   }
   return pointer;
+}
+
+// The text `keep review-queue handoff <name>` prints. The name is checked here as well
+// as by the CLI, so no caller can make it name a file outside the handoff directory.
+function readHandoff(root, name) {
+  if (typeof name !== 'string' || !REVIEW_QUEUE_HANDOFF_NAME_RE.test(name)) {
+    throw new QueueError(400, 'a review queue handoff name is 24 lowercase hex digits');
+  }
+  try { return fs.readFileSync(path.join(handoffDirectory(root), `${name}.md`), 'utf8'); }
+  catch (error) {
+    if (error.code === 'ENOENT') throw new QueueError(404, `no review queue handoff named ${name}`);
+    throw error;
+  }
 }
 
 function findSource(id, options) {
@@ -791,6 +814,7 @@ module.exports = {
   findingEvidence,
   launchInstructions,
   writeHandoff,
+  readHandoff,
   snapshot,
   act,
   reconcile,

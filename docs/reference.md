@@ -451,6 +451,7 @@ keep watcher stats [--since when] [--json]                          # verdict co
 keep watcher live [on|off|<type,type>] [--force] [--json]           # which verdict types are delivered for real
 
 keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
+keep review-queue handoff <name>                         # a console review queue launch's instructions
 keep review-bundle <id> [--budget n] [--raw]             # evidence delta since last review
 keep review-note <id> --kind k --subject s -m "finding"  # attributed reviewer finding
 keep review-idea "<title>" -m "<body>" [--cards a,b,c]   # fleet-wide workflow suggestion
@@ -1860,6 +1861,14 @@ command is given. The daemon compacts a Claude session on a node on its current 
 (see Auto-compact). `keep verify <card>` is forwarded as it is and needs no session;
 like an open it may start a session for the check, or compact one before delivering
 it, so it runs under an open's bound and on a queue of its own.
+
+A console review queue launch (Discuss, Start) writes its session's instructions to
+`.keep/review-queue-handoffs/<name>.md` in the daemon's registry and opens the session
+with one line naming `keep review-queue handoff <name>`, which prints them. On the daemon
+node the command reads the file; on a node, where that path does not exist, it is
+forwarded, and only in that form: `<name>` must be the 24 hex digits the message gave,
+it needs no session, and the queue itself (`keep review-queue` with or without flags)
+stays on the daemon node.
 
 `keep artifact` from a node sends the files themselves, since the paths name files the
 daemon does not have. The node's CLI reads each one and posts it to the daemon's

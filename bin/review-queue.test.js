@@ -5,8 +5,17 @@ const fs = require('node:fs');
 const os = require('node:os');
 const path = require('node:path');
 const test = require('node:test');
+const { spawnSync } = require('node:child_process');
 const queue = require('./review-queue.js');
 const { launchReviewQueueSession, inspectReviewQueueLaunch, recoverReviewQueueLaunch } = require('./serve.js');
+
+// The opening message names the command that prints the instructions; this reads what
+// that command would print.
+const POINTER_RE = /^Your review queue instructions: run `keep review-queue handoff ([0-9a-f]{24})` and read its output first\.$/;
+function handoffText(root, message) {
+  const name = message.match(POINTER_RE)[1];
+  return queue.readHandoff(root, name);
+}
 
 function fixture() {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-queue-'));
@@ -98,6 +107,42 @@ test('defer is durable and hidden from needs-decision count only until it is due
   } finally { f.cleanup(); }
 });
 
+// A launch placed on another node opens where the daemon's registry path does not
+// exist, so the opening message names a command, which a node forwards to the daemon.
+test('the opening message names keep review-queue handoff, which prints the file from the registry', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-review-queue-handoff-'));
+  fs.mkdirSync(path.join(root, 'tasks'));
+  const cli = path.join(__dirname, 'keep.js');
+  const env = { ...process.env, KEEP_DIR: root, KEEP_NO_PUSH: '1' };
+  delete env.CLAUDE_CODE_SESSION_ID;
+  delete env.KEEP_DAEMON_URL;
+  const run = (args) => spawnSync(process.execPath, [cli, ...args], { encoding: 'utf8', env, cwd: root });
+  try {
+    const pointer = queue.writeHandoff(root, 'idea:idea-one', 'request-1', '# Instructions\nDo the thing.\n');
+    const name = pointer.match(POINTER_RE)[1];
+    assert.ok(!pointer.includes(root) && !pointer.includes('/'), 'no daemon path in the message');
+    assert.equal(queue.writeHandoff(root, 'idea:idea-one', 'request-1', '# Instructions\nDo the thing.\n'), pointer);
+    assert.throws(() => queue.writeHandoff(root, 'idea:idea-one', 'request-1', 'other'), (error) => error.status === 409);
+
+    const printed = run(['review-queue', 'handoff', name]);
+    assert.equal(printed.status, 0, printed.stderr);
+    assert.equal(printed.stdout, '# Instructions\nDo the thing.\n');
+
+    const missing = run(['review-queue', 'handoff', 'f'.repeat(24)]);
+    assert.equal(missing.status, 1);
+    assert.equal(missing.stdout, '');
+    assert.match(missing.stderr, new RegExp(`no review queue handoff named ${'f'.repeat(24)}`));
+
+    for (const args of [['../../etc/passwd'], [name.toUpperCase()], [name.slice(1)], [`${name}.md`], [], [name, 'extra']]) {
+      const refused = run(['review-queue', 'handoff', ...args]);
+      assert.equal(refused.status, 1, args.join(' '));
+      assert.match(refused.stderr, /usage: keep review-queue handoff <name>/, args.join(' '));
+    }
+    assert.throws(() => queue.readHandoff(root, '../x'), (error) => error.status === 400);
+    assert.throws(() => queue.readHandoff(root, 'a'.repeat(24)), (error) => error.status === 404);
+  } finally { fs.rmSync(root, { recursive: true, force: true }); }
+});
+
 test('discuss and start launch fresh conversations with distinct complete prompts', async () => {
   const f = fixture();
   const launches = [];
@@ -114,7 +159,7 @@ test('discuss and start launch fresh conversations with distinct complete prompt
     assert.deepEqual(discussed.item.sessions, [{ id: 'session-discuss', action: 'discuss', at: discussed.item.sessions[0].at }]);
     assert.equal(launches[0].fresh, true);
     assert.equal(launches[0].agent, 'claude');
-    const discussPrompt = fs.readFileSync(launches[0].message.match(/in (.*); read/)[1], 'utf8');
+    const discussPrompt = handoffText(f.root, launches[0].message);
     assert.match(discussPrompt, /Evaluate this item with Jesse/);
     assert.match(discussPrompt, /Do not implement a fix or change the parent card/);
     assert.match(discussPrompt, /bin\/store\.js:10/);
@@ -128,7 +173,7 @@ test('discuss and start launch fresh conversations with distinct complete prompt
       ...f.deps, randomUUID: () => 'session-start', launch,
     });
     assert.equal(started.item.status, 'in-progress');
-    const startPrompt = fs.readFileSync(launches[1].message.match(/in (.*); read/)[1], 'utf8');
+    const startPrompt = handoffText(f.root, launches[1].message);
     assert.match(startPrompt, /Begin work on this idea immediately/);
     assert.doesNotMatch(startPrompt, /Do not implement a fix/);
     assert.ok(startPrompt.length > launches[1].message.length, 'full context stays in the immutable handoff file');
@@ -138,7 +183,7 @@ test('discuss and start launch fresh conversations with distinct complete prompt
     });
     assert.equal(investigated.item.status, 'in-progress');
     assert.equal(launches[2].action, 'start', 'Investigation reuses the existing start transport');
-    const investigationPrompt = fs.readFileSync(launches[2].message.match(/in (.*); read/)[1], 'utf8');
+    const investigationPrompt = handoffText(f.root, launches[2].message);
     assert.match(investigationPrompt, /^# Review queue investigation:/);
     assert.match(investigationPrompt, /Verify the claim against the cited evidence and current repository state/);
     assert.match(investigationPrompt, /reviewer finding is a lead, not proof/);

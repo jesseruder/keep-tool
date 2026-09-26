@@ -431,6 +431,30 @@ test('a node forwards keep compact under its own session in its request forms, a
   assert.equal(calls.length, 2);
 });
 
+// A console review queue launch on a node opens with `keep review-queue handoff <name>`,
+// whose file is in the daemon's registry. That one read is forwarded, with or without a
+// session; the queue itself and every other form stay on the daemon node.
+test('a node forwards keep review-queue handoff <name> and nothing else of review-queue', async (t) => {
+  assert.ok(REGISTRY_COMMANDS.includes('review-queue'));
+  const name = '0123456789abcdef01234567';
+  assert.equal(argumentRefusal('review-queue', ['handoff', name], ME), null);
+  assert.equal(argumentRefusal('review-queue', ['handoff', name]), null, 'no session needed');
+  assert.equal(nodeSideRefusal('review-queue', ['handoff', name]), null);
+  const refusal = 'a node runs only keep review-queue handoff <name>; the rest runs on the daemon node';
+  for (const args of [[], ['--json'], ['--limit', '3'], ['handoff'], ['handoff', '../../x'], ['handoff', name.toUpperCase().replace(/[0-9]/g, 'A')],
+    ['handoff', `${name}.md`], ['handoff', name, '--json'], ['handoff', '--', name], ['bundle', name]]) {
+    assert.equal(argumentRefusal('review-queue', args, ME), refusal, args.join(' '));
+    assert.equal(nodeSideRefusal('review-queue', args), refusal, args.join(' '));
+  }
+  const { svc, root, calls } = service(t);
+  const read = await svc.handle(AWS1, body(root, { command: 'review-queue', args: ['handoff', name], session: null, agent: null, idempotencyKey: `${KEY}-rq` }));
+  assert.equal(read.status, 200, JSON.stringify(read.body));
+  assert.deepEqual(calls[0].args.slice(1), ['review-queue', 'handoff', name]);
+  const listed = await svc.handle(AWS1, body(root, { command: 'review-queue', args: ['--json'], idempotencyKey: `${KEY}-rq-list` }));
+  assert.deepEqual(listed, { status: 400, body: { error: refusal } });
+  assert.equal(calls.length, 1);
+});
+
 test('a node\'s keep tell runs under its own session, and a message file it names on the node is refused', async (t) => {
   assert.ok(REGISTRY_COMMANDS.includes('tell'));
   assert.equal(argumentRefusal('tell', ['#12', '-m', 'hi', '--wait', '5m', '--dry'], ME), null);

@@ -4212,6 +4212,7 @@ ${stepUsage()}
                          # ambiguous launches require --resolve-session <destination-id>, never a blind second launch
   keep force-restart <session-id> --pane <pane-id> [--recover]    # explicit interruption; never automatic cleanup
   keep review-queue [--limit n] [--min-score n] [--json]   # what deserves review now
+  keep review-queue handoff <name>                          # a console review queue launch's instructions
   keep review-bundle <id> [--budget n] [--session id] [--force]
   keep review-bundle <id> [<id>...] [--budget n] [--total-budget n] [--force]
   keep review-bundle --queue [--limit n] [--budget n] [--total-budget n] [--force]
