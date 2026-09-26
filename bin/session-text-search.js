@@ -62,6 +62,47 @@ function searchDatabase(handle, query, options = {}) {
   return [...bySession.values()];
 }
 
+// Who wrote a session's `#n`: the sessions whose typed messages or prose name it,
+// newest first, the session itself left out. FTS5 splits `#453` into the token
+// `453`, which also matches "453 ms", so every row the token finds is checked for
+// the literal `#453` standing alone before it counts.
+function searchMentions(handle, num, options = {}) {
+  const number = Number(num);
+  if (!Number.isInteger(number) || number < 1) return [];
+  const literal = new RegExp(`(?<![\\w#&/=])#${number}(?![\\w-])`);
+  const sessionLimit = options.sessionLimit || MENTION_LIMIT;
+  const bySession = new Map();
+  for (const source of hasArchive(handle) ? [LIVE, ARCHIVE] : [LIVE]) {
+    const rows = handle.prepare(`SELECT m.session_id AS sessionId, m.ts, m.role, m.kind, m.text,
+        ${source.title} AS title, s.card_id AS card, s.project, s.agent
+      FROM ${source.fts}
+      JOIN ${source.messages} m ON m.id = ${source.fts}.rowid
+      JOIN ${source.sessions} s ON s.id = m.session_id
+      WHERE ${source.fts} MATCH ? AND instr(m.text, ?) > 0 AND m.session_id <> ?
+        ${source.archive ? '' : "AND m.kind IN ('human', 'text') AND s.kind = 'interactive'"}
+      ORDER BY ${source.fts}.rowid DESC LIMIT ?`).all(`"${number}"`, `#${number}`, String(options.exclude || ''), MENTION_HIT_LIMIT);
+    for (const row of rows) {
+      const text = String(row.text || '');
+      const at = text.search(literal);
+      if (at < 0) continue;
+      const hit = bySession.get(row.sessionId);
+      if (hit) { hit.hits += 1; continue; }
+      if (bySession.size >= sessionLimit) continue;
+      const from = Math.max(0, at - 60);
+      bySession.set(row.sessionId, {
+        sessionId: row.sessionId, ts: row.ts, role: row.role, kind: row.kind, hits: 1,
+        title: row.title || '', card: row.card || '', project: row.project || '', agent: row.agent || '',
+        snippet: `${from ? '…' : ''}${text.slice(from, at + 100).replace(/\s+/g, ' ').trim()}${at + 100 < text.length ? '…' : ''}`,
+        ...(source.archive ? { archived: true } : {}),
+      });
+    }
+    if (bySession.size >= sessionLimit) break;
+  }
+  return [...bySession.values()];
+}
+const MENTION_LIMIT = 8;
+const MENTION_HIT_LIMIT = 400;
+
 const LIVE = { fts: 'messages_fts', messages: 'messages', sessions: 'sessions', title: 's.title', archive: false };
 const ARCHIVE = { fts: 'archive_fts', messages: 'archive_messages', sessions: 'archive_sessions', title: "''", archive: true };
 
@@ -168,7 +209,7 @@ function createSessionTextSearch(options = {}) {
     running = queued;
     queued = null;
     running.timer = setTimeout(() => failRunning(Object.assign(new Error('session search timed out'), { status: 504 })), timeoutMs);
-    ensure().postMessage({ id: running.id, query: running.query, sessions: running.sessions });
+    ensure().postMessage({ id: running.id, query: running.query, sessions: running.sessions, mentions: running.mentions });
   };
   return {
     search(query, sessions = []) {
@@ -176,6 +217,16 @@ function createSessionTextSearch(options = {}) {
       return new Promise((resolve, reject) => {
         if (queued) settle(queued, null, null);
         queued = { id: ++sequence, query: String(query), sessions, resolve, reject };
+        next();
+      });
+    },
+    // The sessions that mention `#num`, `exclude` (its own id) left out. It shares
+    // the queue, so give it an instance of its own beside the finder's.
+    mentions(num, exclude = '') {
+      if (!Number.isInteger(Number(num)) || Number(num) < 1) return Promise.resolve([]);
+      return new Promise((resolve, reject) => {
+        if (queued) settle(queued, null, null);
+        queued = { id: ++sequence, mentions: { num: Number(num), exclude: String(exclude || '') }, resolve, reject };
         next();
       });
     },
@@ -189,4 +240,4 @@ function createSessionTextSearch(options = {}) {
   };
 }
 
-module.exports = { ftsMatch, searchDatabase, createSessionTextSearch, OPEN, CLOSE, BUSY_TIMEOUT_MS };
+module.exports = { ftsMatch, searchDatabase, searchMentions, createSessionTextSearch, OPEN, CLOSE, BUSY_TIMEOUT_MS };

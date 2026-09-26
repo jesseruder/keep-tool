@@ -504,3 +504,40 @@ test('session text search answers from the search worker, and says when it was s
   assert.deepEqual(queries, ['websocket', 'stale', 'slow']);
   assert.equal(closed, 0);
 });
+
+test('terminal hover lookups: mentions, holds and commits, with git kept to projects the state names', async (t) => {
+  const mentionCalls = [];
+  const commitCalls = [];
+  const f = await fixture(t, {
+    createSessionTextSearch: () => ({
+      mentions(num, exclude) { mentionCalls.push([num, exclude]); return Promise.resolve(num === 9 ? null : [{ sessionId: 's2', snippet: '#453' }]); },
+      close() {},
+    }),
+    commitLookup: async (sha, options) => { commitCalls.push([sha, options.project, options.tasks.length]); return { commit: null, cards: [] }; },
+  });
+  const get = (url) => request(f.port, url, { headers: { 'x-keep': '1' } });
+  assert.equal((await get('/api/session-mentions?num=453')).status, 503);
+  f.ui.publish({ version: 1, generatedAt: 1, state: {
+    sessions: [{ id: 's1', num: 453, taskId: 'own', project: '/repo/a' }, { id: 's2', num: 12 }],
+    tasks: [{ id: 'own', fm: {}, body: 'I am #453' }, { id: 'other', fm: { title: 'Other', project: '/repo/b' }, body: 'ask #453' }],
+    panes: [], attention: [],
+  } });
+  const mentions = JSON.parse((await get('/api/session-mentions?num=453')).body);
+  assert.deepEqual(mentions.sessions, [{ sessionId: 's2', snippet: '#453', num: 12 }]);
+  assert.deepEqual(mentions.cards.map((card) => card.id), ['other'], 'the session\'s own card is left out');
+  assert.deepEqual(mentionCalls, [[453, 's1']]);
+  assert.equal(JSON.parse((await get('/api/session-mentions?num=9')).body).superseded, true);
+  assert.equal((await get('/api/session-mentions?num=x')).status, 400);
+
+  await get('/api/commit-info?sha=3229e2e&project=/repo/a');
+  await get('/api/commit-info?sha=3229e2e&project=/repo/b');
+  await get('/api/commit-info?sha=3229e2e&project=/etc');
+  assert.deepEqual(commitCalls, [['3229e2e', '/repo/a', 2], ['3229e2e', '/repo/b', 2], ['3229e2e', '', 2]]);
+
+  fs.mkdirSync(path.join(f.root, '.keep', 'holds'));
+  fs.writeFileSync(path.join(f.root, '.keep', 'holds', 'hold-a.json'), JSON.stringify({
+    id: 'hold-a', project: '~/p', scopes: ['device:box'], until: '2999-01-01T00:00', by: { sessionId: 's2', agent: 'claude' },
+  }));
+  const holds = JSON.parse((await get('/api/holds')).body).holds;
+  assert.deepEqual(holds.map((hold) => [hold.id, hold.num, hold.scopes]), [['hold-a', 12, ['device:box']]]);
+});

@@ -102,6 +102,18 @@ function createUiRequestServer(options = {}) {
     if (!textSearch) textSearch = (options.createSessionTextSearch || require('./session-text-search.js').createSessionTextSearch)();
     return textSearch;
   };
+  // A second worker for the hover cards' `#n` mentions, so a hover never supersedes
+  // a ⌘F query waiting in the finder's queue (or the other way round).
+  let mentionsSearch = null;
+  const mentionSearch = () => {
+    if (!mentionsSearch) mentionsSearch = (options.createSessionTextSearch || require('./session-text-search.js').createSessionTextSearch)();
+    return mentionsSearch;
+  };
+  let commitInfo = null;
+  const commitLookup = () => {
+    if (!commitInfo) commitInfo = (options.commitLookup || require('./terminal-ref-lookup.js').createCommitLookup({ root }));
+    return commitInfo;
+  };
 
   const authorized = (req) => keepConsole.authorized(req, { isLocal, token });
   const deny = (res) => json(res, 403, { error: 'unauthorized' });
@@ -360,6 +372,45 @@ function createUiRequestServer(options = {}) {
           return json(res, 200, results ? { ok: true, results } : { ok: true, superseded: true, results: [] });
         } catch (error) { return json(res, error.status || 500, { error: error.message }); }
       }
+      // The terminal hover cards (web/app/terminal-refs.js): a commit SHA, and who
+      // mentions a session's #n. Both read the full state's card bodies, which the
+      // console projection drops.
+      if (req.method === 'GET' && url.pathname === '/api/commit-info') {
+        if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
+        const tasks = current.state?.tasks || [];
+        // Only a project the state already names: the console must not point git at
+        // an arbitrary directory.
+        const asked = url.searchParams.get('project') || '';
+        const known = asked && ((current.state?.sessions || []).some((session) => session?.project === asked)
+          || tasks.some((task) => task?.fm?.project === asked));
+        try {
+          const info = await commitLookup()(url.searchParams.get('sha') || '', { project: known ? asked : '', tasks });
+          return json(res, 200, { ok: true, info });
+        } catch (error) { return json(res, 500, { error: error.message }); }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/holds') {
+        const numbers = new Map((current?.state?.sessions || []).map((session) => [session.id, session.num]));
+        try {
+          const holds = await require('./terminal-ref-lookup.js').readHolds(root, { numberOf: (id) => numbers.get(id) ?? null });
+          return json(res, 200, { ok: true, holds });
+        } catch (error) { return json(res, 500, { error: error.message }); }
+      }
+      if (req.method === 'GET' && url.pathname === '/api/session-mentions') {
+        if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
+        const num = Number(url.searchParams.get('num'));
+        if (!Number.isInteger(num) || num < 1) return json(res, 400, { error: 'num must be a session number' });
+        const own = (current.state?.sessions || []).find((session) => session?.num === num);
+        const lookup = require('./terminal-ref-lookup.js');
+        const cards = lookup.cardMentions(current.state?.tasks || [], lookup.sessionMentionPattern(num),
+          { exclude: (task) => Boolean(own?.taskId) && task.id === own.taskId });
+        try {
+          const sessions = await mentionSearch().mentions(num, own?.id || '');
+          if (sessions === null) return json(res, 200, { ok: true, superseded: true, sessions: [], cards });
+          const numbers = new Map((current.state?.sessions || []).map((session) => [session.id, session.num]));
+          return json(res, 200, { ok: true, cards,
+            sessions: sessions.map((hit) => ({ ...hit, num: numbers.get(hit.sessionId) ?? null })) });
+        } catch (error) { return json(res, error.status || 500, { error: error.message }); }
+      }
       if (req.method === 'GET' && url.pathname === '/api/dashboard-review-search') {
         if (!current) return json(res, 503, { error: 'dashboard state is still loading' }, { 'retry-after': '1' });
         try { return json(res, 200, reviewQueueSearch(current.state, url.searchParams.get('q') || ''), snapshotHeaders()); }
@@ -472,6 +523,7 @@ function createUiRequestServer(options = {}) {
       bridge.close();
       browserViews.close();
       textSearch?.close();
+      mentionsSearch?.close();
       server.close(callback);
     },
     snapshot: () => current,

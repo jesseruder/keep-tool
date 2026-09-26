@@ -13560,17 +13560,6 @@ function dashboardSummary(options, target, key, input, instruction, summaryOptio
   return summarize.getSummary(key, input, instruction, onChange, summaryOptions).text;
 }
 
-function consoleHolds(now) {
-  let holds = [];
-  try { holds = keep.activeHolds(null, now, { prune: false }); } catch { return []; }
-  return holds.map((hold) => ({
-    id: hold.id, project: hold.project, scopes: Array.isArray(hold.scopes) ? hold.scopes : [],
-    until: hold.until, reason: hold.reason || '', task: hold.task || null,
-    sessionId: hold.by?.sessionId || null, agent: hold.by?.agent || '',
-    num: hold.by?.sessionId ? sessionNumbers.numberFor(hold.by.sessionId, { root: keep.ROOT }) || null : null,
-  }));
-}
-
 function buildState(options = {}) {
   daemonMainLoopPolicy.assertBulkScanAllowed();
   const workerMode = options.dashboardWorker === true;
@@ -13949,9 +13938,6 @@ function buildState(options = {}) {
     reviewQueue: reviewQueue.snapshot({ loadTasks: () => allTasks, now }),
     // Secrets agents are waiting on: metadata only, never a value (bin/secret-requests.js).
     secretRequests: require('./secret-requests').consoleRequests(keep.ROOT, now),
-    // Live holds, so a hold id or scope a terminal prints can say who holds it until
-    // when. Read without pruning: a state build must not delete registry files.
-    holds: consoleHolds(now),
   };
   Object.assign(state, accounts.publicState(), {
     handoffs: require('./account-handoff').list(keep.ROOT),

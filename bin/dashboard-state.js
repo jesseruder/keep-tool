@@ -192,8 +192,6 @@ const CONSOLE_STATE_KEYS = [
   'secretRequests',
   // Sessions asking Owner to look at their browser tabs (bin/browser-view-requests.js).
   'browserViews',
-  // Live holds, for the terminal's hold-id and scope hover cards (serve.js consoleHolds).
-  'holds',
 ];
 
 // An exited session is a list row and a transcript link; the console never reads

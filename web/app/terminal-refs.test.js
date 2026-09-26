@@ -1,7 +1,8 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  describeCard, describeHolds, describeSession, findCardRefs, findHoldRefs, findRefs, findSessionRefs, holdsFor,
+  createRefCache, describeCard, describeCommit, describeHolds, describeSession, findCardRefs, findHoldRefs, findRefs, findSessionRefs,
+  findShaRefs, holdsFor, mentionsSection,
   installTerminalRefs, lineCells, refCardHTML,
 } from './terminal-refs.js';
 
@@ -28,7 +29,8 @@ test('card ids are three or more slug words outside paths and file names', () =>
   assert.deepEqual(keys(findCardRefs('keep claim keep-compact-is-refused-on-a-node now')), ['keep-compact-is-refused-on-a-node']);
   assert.deepEqual(keys(findCardRefs('on inc-grafana-sandbox-x-20260924. Then (fix-the-login-bug), done')),
     ['inc-grafana-sandbox-x-20260924', 'fix-the-login-bug']);
-  assert.deepEqual(keys(findCardRefs('re-run in-flight web/app/card-log-view.js a.b-c-d x@y-z-w https://a-b-c.dev/x-y-z --no-verify-sig')), []);
+  assert.deepEqual(keys(findCardRefs('web/app/card-log-view.js a.b-c-d x@y-z-w https://a-b-c.dev/x-y-z --no-verify-sig keep')), []);
+  assert.deepEqual(keys(findCardRefs('content-rating and task-2')), ['content-rating', 'task-2']);
 });
 
 test('hold ids and bracketed scopes find the holds that cover them', () => {
@@ -103,7 +105,7 @@ test('the card card shows status, session, next step and the latest check-in onc
 test('the hold card lists each hold with its holder and time left', () => {
   const now = Date.parse('2026-09-25T15:00');
   const info = describeHolds('scope:device:android-box', [
-    { id: 'hold-a', project: '~/keep-tool', scopes: ['device:android-box'], until: '2026-09-25T15:23', reason: 'grow root fs', num: 429 },
+    { id: 'hold-a', project: '~/keep-tool', scopes: ['device:android-box'], until: '2026-09-25T15:23', untilMs: now + 23 * 60e3, reason: 'grow root fs', num: 429 },
   ], { now });
   const html = refCardHTML(esc, info);
   assert.match(html, /device:android-box/);
@@ -178,4 +180,59 @@ test('a card that loads more redraws in place, and not after the pointer left', 
   assert.equal(doc.body.children.length, 0);
   finish();
   assert.equal(doc.body.children.length, 0);
+});
+
+test('SHAs are 7-40 hex with a digit and a letter, outside uuids, paths and longer hashes', () => {
+  assert.deepEqual(keys(findShaRefs('landed 3229e2e and f92d3c2eb8401, cited (caca843).')), ['3229e2e', 'f92d3c2eb8401', 'caca843']);
+  assert.deepEqual(keys(findShaRefs('deadbeef 1234567 facade0x b1ecee59-908c-413e a/3229e2e #abc1234 0x3229e2e')), []);
+  assert.deepEqual(keys(findShaRefs(`${'a1'.repeat(32)}`)), []);
+});
+
+test('the ref cache loads once, wakes every waiter, keeps answers for its ttl and forgets a superseded one', async () => {
+  let clock = 0;
+  const cache = createRefCache({ ttlMs: 1000, now: () => clock });
+  let loads = 0;
+  const woke = [];
+  const first = cache.get('k', () => { loads += 1; return 'v'; }, () => woke.push('a'));
+  assert.equal(first.status, 'loading');
+  cache.get('k', () => { loads += 1; return 'w'; }, () => woke.push('b'));
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(loads, 1);
+  assert.deepEqual(woke.sort(), ['a', 'b']);
+  assert.equal(cache.peek('k').value, 'v');
+  clock = 500;
+  assert.equal(cache.get('k', () => { loads += 1; return 'x'; }).value, 'v');
+  clock = 2000;
+  cache.get('k', () => { loads += 1; return 'y'; });
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(cache.peek('k').value, 'y');
+  cache.get('gone', () => undefined);
+  await new Promise((resolve) => setTimeout(resolve, 0));
+  assert.equal(cache.peek('gone'), null);
+});
+
+test('the commit card says where the commit is and which card and review name it', () => {
+  assert.match(refCardHTML(esc, describeCommit('3229e2e', { status: 'loading' })), /looking up the commit/);
+  assert.equal(describeCommit('3229e2e', { status: 'ready', value: null }), null);
+  const html = refCardHTML(esc, describeCommit('3229e2e', { status: 'ready', value: {
+    commit: { sha: '3229e2eb8401aa', subject: 'console: <hover>', author: 'Jesse', at: 1, repo: '/Users/j/keep-tool', branch: 'origin/master', landed: true },
+    cards: [{ id: 'c', title: 'Hover links', status: 'done' }], review: { verdict: 'clean', by: 'codex sol' },
+  } }, { rel: () => '1h' }), { openHint: false });
+  assert.match(html, /3229e2eb8/);
+  assert.match(html, /console: &lt;hover&gt;/);
+  assert.match(html, /keep-tool · Jesse · 1h ago/);
+  assert.match(html, /on master/);
+  assert.match(html, /clean · codex sol/);
+  assert.match(html, /Hover links \(done\)/);
+});
+
+test('the mentions section lists sessions then cards, or says there are none', () => {
+  assert.equal(mentionsSection({ status: 'loading' }).pending, 'looking for mentions…');
+  assert.deepEqual(mentionsSection({ status: 'ready', value: { sessions: [], cards: [] } }).items, ['no other session or card']);
+  const section = mentionsSection({ status: 'ready', value: {
+    sessions: [{ sessionId: 'abcdef123', num: 12, title: 'Fix login', ts: 5 }, { sessionId: 'fedcba987', title: '' , card: 'x-y' }],
+    cards: [{ id: 'c', title: 'Hover links', status: 'active' }],
+  } }, { rel: () => '3m' });
+  assert.deepEqual(section.items, ['#12 Fix login · 3m ago', 'fedcba98 x-y', 'card Hover links (active)']);
+  assert.match(refCardHTML(esc, { title: 't', sections: [section] }), /mentioned by.*#12 Fix login/s);
 });

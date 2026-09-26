@@ -2,7 +2,7 @@
 
 const fs = require('node:fs');
 const { parentPort, workerData } = require('node:worker_threads');
-const { searchDatabase, BUSY_TIMEOUT_MS } = require('./session-text-search.js');
+const { searchDatabase, searchMentions, BUSY_TIMEOUT_MS } = require('./session-text-search.js');
 
 // Opened read-only and never created here: turn-index's own open() makes the
 // database and migrates it. Until that has happened there is nothing to search.
@@ -17,10 +17,12 @@ function database() {
   return handle;
 }
 
-parentPort.on('message', ({ id, query, sessions }) => {
+parentPort.on('message', ({ id, query, sessions, mentions }) => {
   try {
     const db = database();
-    parentPort.postMessage({ id, results: db ? searchDatabase(db, query, { sessions }) : [] });
+    const results = !db ? [] : mentions ? searchMentions(db, mentions.num, { exclude: mentions.exclude })
+      : searchDatabase(db, query, { sessions });
+    parentPort.postMessage({ id, results });
   } catch (error) {
     // A handle that failed once (a migration mid-swap, a replaced file) is reopened next time.
     try { handle?.close(); } catch {}

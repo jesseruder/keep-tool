@@ -24,7 +24,10 @@ import { renderWatch, installWatchControls } from './watch.js';
 import { renderFleet } from './fleet.js';
 import { nodeStripHTML, nodeStatsHealthRowsHTML } from './node-stats.js';
 import { numLabel } from './session-number.js';
-import { describeCard, describeHolds, describeSession, findCardRefs, findHoldRefs, findSessionRefs, holdsFor } from './terminal-refs.js';
+import {
+  createRefCache, describeCard, describeCommit, describeHolds, describeSession, findCardRefs, findHoldRefs, findSessionRefs, findShaRefs,
+  holdsFor, mentionsSection,
+} from './terminal-refs.js';
 import { recentLogEntries } from './card-log.js';
 import { openReviewQueueNotification, renderReviewQueue, reviewQueueIdForNotification } from './review-queue.js';
 import { openSessionChooser, defaultModels } from './session-launcher.js';
@@ -819,54 +822,87 @@ function openSessionRef(session) {
   refresh();
 }
 const refProject = (path) => projectOf(path).name;
-const terminalRefs = {
-  esc,
-  kinds: [
-    {
-      find: findSessionRefs,
-      has: (num) => Boolean(sessionByNum(num)),
-      describe: (num) => describeSession(sessionByNum(num), {
-        tasks: data.tasks, rel, statusOf: sessionLabel, projectName: refProject,
-        nodeOf: (session) => sessionNode(ctx, session),
-      }),
-      open: (num) => openSessionRef(sessionByNum(num)),
+// Server lookups the cards wait on: who mentions a #n, and what a SHA is. A
+// superseded mentions search answers null and is asked again on the next hover.
+const refCache = createRefCache();
+const sessionRefKind = {
+  find: findSessionRefs,
+  has: (num) => Boolean(sessionByNum(num)),
+  describe(num, update) {
+    const info = describeSession(sessionByNum(num), {
+      tasks: data.tasks, rel, statusOf: sessionLabel, projectName: refProject,
+      nodeOf: (session) => sessionNode(ctx, session),
+    });
+    if (!info) return null;
+    const mentions = refCache.get(`mentions:${num}`, () => api.getSessionMentions(num).then((value) => value ?? undefined), update);
+    return { ...info, sections: [mentionsSection(mentions, { rel })] };
+  },
+  open: (num) => openSessionRef(sessionByNum(num)),
+};
+// A SHA is looked up in the repo of the terminal it was printed in, so each
+// terminal gets its own kind. Every SHA-shaped word is a link until a lookup has
+// said no repo or card knows it.
+function shaRefKind(pane) {
+  const project = () => entityForPane(pane).session?.project || paneMap().get(pane)?.meta?.project || '';
+  const cacheKey = (sha) => `sha:${sha}:${project()}`;
+  return {
+    find: findShaRefs,
+    has(sha) {
+      const entry = refCache.peek(cacheKey(sha));
+      return !(entry?.status === 'ready' && !entry.value);
     },
-    {
-      find: findCardRefs,
-      has: (id) => refLists().byCard.has(id),
-      describe(id, update) {
-        const task = refLists().byCard.get(id);
-        if (!task) return null;
-        // The console row has no log; the card's body loads on first hover and the
-        // card redraws when it lands.
-        let detail = null;
-        if (task._detailVersion) {
-          const entry = detailStore.peek('task', id, task._detailVersion);
-          if (entry.status === 'idle') detailStore.ensure('task', id, task._detailVersion).then(update, update);
-          const status = entry.status === 'idle' ? 'loading' : entry.status;
-          detail = { status, entry: entry.value?.body ? recentLogEntries(entry.value.body, 1)[0] : null };
-        }
-        return describeCard(task, { session: refLists().cardSession.get(id), projectName: refProject, statusOf: sessionLabel, rel, detail });
-      },
-      open(id) {
-        const session = refLists().cardSession.get(id);
-        if (session) openSessionRef(session);
-        else toast(`${refLists().byCard.get(id)?.fm?.title || id} has no session to open`);
-      },
-    },
-    {
-      find: findHoldRefs,
-      has: (key) => holdsFor(key, data.holds).length > 0,
-      describe: (key) => describeHolds(key, holdsFor(key, data.holds), {
-        sessionFor: (hold) => (data.sessions || []).find((session) => session.id === hold.sessionId) || null,
-      }),
-      // The holder's session: the one to talk to about the resource.
-      open(key) {
-        const [hold] = holdsFor(key, data.holds);
-        openSessionRef(hold && ((hold.num && sessionByNum(hold.num)) || (data.sessions || []).find((session) => session.id === hold.sessionId)));
-      },
-    },
-  ],
+    describe: (sha, update) => describeCommit(sha, refCache.get(cacheKey(sha), () => api.getCommitInfo(sha, project()), update), { rel }),
+  };
+}
+function terminalRefsFor(pane) {
+  return { esc, kinds: [sessionRefKind, cardRefKind, holdRefKind, shaRefKind(pane)] };
+}
+const cardRefKind = {
+  find: findCardRefs,
+  has: (id) => refLists().byCard.has(id),
+  describe(id, update) {
+    const task = refLists().byCard.get(id);
+    if (!task) return null;
+    // The console row has no log; the card's body loads on first hover and the
+    // card redraws when it lands.
+    let detail = null;
+    if (task._detailVersion) {
+      const entry = detailStore.peek('task', id, task._detailVersion);
+      if (entry.status === 'idle') detailStore.ensure('task', id, task._detailVersion).then(update, update);
+      const status = entry.status === 'idle' ? 'loading' : entry.status;
+      detail = { status, entry: entry.value?.body ? recentLogEntries(entry.value.body, 1)[0] : null };
+    }
+    return describeCard(task, { session: refLists().cardSession.get(id), projectName: refProject, statusOf: sessionLabel, rel, detail });
+  },
+  open(id) {
+    const session = refLists().cardSession.get(id);
+    if (session) openSessionRef(session);
+    else toast(`${refLists().byCard.get(id)?.fm?.title || id} has no session to open`);
+  },
+};
+// Holds are not in the published state (reading them there would block the
+// daemon), so the console asks the UI worker for them, at most every 30 seconds
+// while a terminal is asking. A hold newer than that shows up on the next pass.
+let liveHolds = [];
+let holdsAskedAt = 0;
+function currentHolds() {
+  if (Date.now() - holdsAskedAt > 30e3) {
+    holdsAskedAt = Date.now();
+    api.getHolds().then((holds) => { liveHolds = holds; }, () => {});
+  }
+  return liveHolds;
+}
+const holdRefKind = {
+  find: findHoldRefs,
+  has: (key) => holdsFor(key, currentHolds()).length > 0,
+  describe: (key) => describeHolds(key, holdsFor(key, currentHolds()), {
+    sessionFor: (hold) => (data.sessions || []).find((session) => session.id === hold.sessionId) || null,
+  }),
+  // The holder's session: the one to talk to about the resource.
+  open(key) {
+    const [hold] = holdsFor(key, currentHolds());
+    openSessionRef(hold && ((hold.num && sessionByNum(hold.num)) || (data.sessions || []).find((session) => session.id === hold.sessionId)));
+  },
 };
 function mount(container, pane, options = {}) {
   // Triage and Watch are mutually exclusive views of the same local terminal.
@@ -898,7 +934,7 @@ function mount(container, pane, options = {}) {
       // mounting xterm, so it needs the names this pane is known by.
       session: entity.session?.id || currentPane?.meta?.sessionId || '',
       title: entity.title,
-      terminalRefs,
+      terminalRefs: terminalRefsFor(pane),
       onFocus(terminal, element) {
         state.focused = true;
         document.querySelectorAll('.term.focused').forEach((term) => term.classList.remove('focused'));

@@ -79,3 +79,32 @@ test('a newer search supersedes one that has not started, and a stuck one is aba
   assert.deepEqual(await search.search('no'), []);
   search.close();
 });
+
+test('mentions of #n: the literal standing alone, newest first, never the session itself', () => {
+  const { searchMentions } = require('./session-text-search.js');
+  const handle = database();
+  const message = handle.prepare('INSERT INTO messages (session_id, ts, role, kind, text) VALUES (?, ?, ?, ?, ?)');
+  message.run('other', 10, 'assistant', 'text', 'Waiting on #453 to finish the land.');
+  message.run('other', 11, 'assistant', 'text', 'The build took 453 ms and #4530 is another session.');
+  message.run('live', 12, 'user', 'human', 'ask #453 whether the hold is free');
+  message.run('bg', 13, 'user', 'human', 'headless #453 mention');
+  message.run('live', 14, 'tool', 'tool_result', 'keep who: #453 holds android-box');
+  message.run('other', 15, 'assistant', 'text', 'see PR castle#453 and #453, too');
+  const hits = searchMentions(handle, 453, { exclude: 'live' });
+  assert.deepEqual(hits.map((hit) => [hit.sessionId, hit.hits]), [['other', 2]]);
+  assert.match(hits[0].snippet, /#453, too/);
+  assert.deepEqual(searchMentions(handle, 453).map((hit) => hit.sessionId), ['other', 'live']);
+  assert.deepEqual(searchMentions(handle, 0), []);
+});
+
+test('a mentions query rides the same worker queue and posts its number', async () => {
+  FakeWorker.made = [];
+  const search = createSessionTextSearch({ Worker: FakeWorker, workerFile: 'x' });
+  const pending = search.mentions(12, 'self');
+  await new Promise((resolve) => setImmediate(resolve));
+  assert.deepEqual(FakeWorker.made[0].posted.at(-1).mentions, { num: 12, exclude: 'self' });
+  FakeWorker.made[0].answer([{ sessionId: 'a' }]);
+  assert.deepEqual(await pending, [{ sessionId: 'a' }]);
+  assert.deepEqual(await search.mentions('x'), []);
+  search.close();
+});

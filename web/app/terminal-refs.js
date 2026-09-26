@@ -34,9 +34,10 @@ export function findSessionRefs(text) {
 }
 
 // A card id is a slug (bin/keep-core.js slugify): lowercase words joined by single
-// hyphens. Three words at least, so `in-flight` or `re-run` never reach the lookup,
-// and not part of a path or file name (`web/app/card-log.js`, `a.b-c-d`).
-const CARD_REF = /(?<![\w./@:-])[a-z0-9]+(?:-[a-z0-9]+){2,}(?![\w/@-]|\.\w)/g;
+// hyphens, not part of a path or file name (`web/app/card-log.js`, `a.b-c-d`). Two
+// words at least: a lone word is too often a card id by accident. `re-run` or
+// `in-flight` reach the lookup and stay text unless a card has that id.
+const CARD_REF = /(?<![\w./@:-])[a-z0-9]+(?:-[a-z0-9]+)+(?![\w/@-]|\.\w)/g;
 
 export function findCardRefs(text) {
   return [...String(text || '').matchAll(CARD_REF)].map((match) => ({ key: match[0], start: match.index, end: match.index + match[0].length }));
@@ -56,6 +57,44 @@ export function findHoldRefs(text) {
     refs.push({ key: `scope:${match[1]}`, start: match.index, end: match.index + match[0].length });
   }
   return refs;
+}
+
+// A commit SHA as git and agents abbreviate it: 7 to 40 hex digits with at least one
+// digit and one letter, so `deadbeef`, `1234567` and a hex word are left alone, and
+// not inside a uuid, path, URL or a longer hash.
+const SHA_REF = /(?<![\w/.:#@-])[0-9a-f]{7,40}(?![\w-])/g;
+
+export function findShaRefs(text) {
+  return [...String(text || '').matchAll(SHA_REF)]
+    .filter((match) => /[0-9]/.test(match[0]) && /[a-f]/.test(match[0]))
+    .map((match) => ({ key: match[0], start: match.index, end: match.index + match[0].length }));
+}
+
+// Lookups a hover card waits on, kept for `ttlMs` so moving the pointer back over
+// the same reference does not ask again. `get` answers the entry as it stands and
+// starts the load once; `update` runs when it lands.
+export function createRefCache({ ttlMs = 60e3, now = () => Date.now() } = {}) {
+  const entries = new Map();
+  return {
+    peek: (key) => entries.get(key) || null,
+    get(key, load, update = () => {}) {
+      const entry = entries.get(key);
+      if (entry && (entry.status === 'loading' || now() - entry.at < ttlMs)) {
+        if (entry.status === 'loading') entry.waiters.add(update);
+        return entry;
+      }
+      const fresh = { status: 'loading', value: entry?.value ?? null, at: now(), waiters: new Set([update]) };
+      entries.set(key, fresh);
+      Promise.resolve().then(load).then((value) => {
+        // A superseded lookup answers null-with-no-verdict: forget it, ask again next hover.
+        if (value === undefined) { entries.delete(key); return; }
+        Object.assign(fresh, { status: 'ready', value, at: now() });
+      }, () => Object.assign(fresh, { status: 'error', at: now() }))
+        .finally(() => { for (const waiter of fresh.waiters) waiter(); fresh.waiters.clear(); });
+      if (entries.size > 300) entries.delete(entries.keys().next().value);
+      return fresh;
+    },
+  };
 }
 
 export function holdsFor(key, holds = []) {
@@ -165,22 +204,65 @@ export function describeHolds(key, holds, { sessionFor = () => null, now = Date.
     rows: holds.map((hold) => {
       const session = sessionFor(hold);
       const who = hold.num ? `#${hold.num}` : session ? numLabel(session.num) : hold.sessionId?.slice(0, 8) || hold.agent || 'manual';
+      // untilMs is worked out where the hold was written; `until` is that machine's
+      // wall-clock time and means something else in a browser in another timezone.
       const until = String(hold.until || '').replace('T', ' ');
-      const left = timeLeft(Date.parse(hold.until) - now);
+      const left = timeLeft((Number.isFinite(hold.untilMs) ? hold.untilMs : Date.parse(hold.until)) - now);
       return [who, `until ${until}${left ? ` (${left})` : ''}${hold.reason ? ` · ${clip(hold.reason, 120)}` : ''}${holds.length > 1 ? ` · ${hold.scopes.join(', ')}` : ''}`];
     }),
   };
 }
 
+// A commit from /api/commit-info: its subject, where it is, and the cards and review
+// that name it. `entry` is a createRefCache entry.
+export function describeCommit(sha, entry, { rel } = {}) {
+  if (!entry || entry.status === 'loading') return { badge: sha.slice(0, 9), title: 'commit', pending: 'looking up the commit…' };
+  const info = entry.value;
+  if (entry.status === 'error') return { badge: sha.slice(0, 9), title: 'commit', pending: 'could not look up the commit' };
+  if (!info) return null;
+  const { commit, cards = [], review } = info;
+  const repo = commit?.repo ? commit.repo.split('/').filter(Boolean).pop() : '';
+  const branch = commit?.branch ? commit.branch.replace(/^origin\//, '') : '';
+  return {
+    badge: (commit?.sha || sha).slice(0, 9),
+    title: commit?.subject || `cited by ${cards.length} card${cards.length === 1 ? '' : 's'}`,
+    meta: [repo, commit?.author || '', ago(rel, commit?.at)],
+    rows: [
+      ['landed', commit?.landed === true ? `on ${branch}` : commit?.landed === false ? `not on ${branch}` : ''],
+      ['review', review ? `${review.verdict}${review.by ? ` · ${review.by}` : ''}` : ''],
+      ...cards.slice(0, 3).map((card, index) => [index ? '' : cards.length > 1 ? 'cards' : 'card',
+        `${card.title}${card.status ? ` (${card.status})` : ''}`]),
+    ],
+  };
+}
+
+// The "mentioned by" part of a session's card, from /api/session-mentions: the
+// sessions whose prose names its #n, and the cards whose logs do.
+export function mentionsSection(entry, { rel } = {}) {
+  if (!entry || entry.status === 'loading') return { label: 'mentioned by', items: [], pending: 'looking for mentions…' };
+  if (entry.status === 'error' || !entry.value) return null;
+  const { sessions = [], cards = [] } = entry.value;
+  const items = [
+    ...sessions.map((hit) => `${hit.num ? `#${hit.num}` : hit.sessionId.slice(0, 8)} ${hit.title || hit.card || ''}`.trim()
+      + (hit.ts && rel ? ` · ${ago(rel, hit.ts)}` : '')),
+    ...cards.map((card) => `card ${card.title}${card.status ? ` (${card.status})` : ''}`),
+  ];
+  return { label: 'mentioned by', items: items.length ? items : ['no other session or card'] };
+}
+
 export function refCardHTML(esc, info, { openHint = true } = {}) {
   if (!info) return '';
   const meta = (info.meta || []).filter(Boolean).map(esc).join(' · ');
+  const sections = (info.sections || []).filter(Boolean).map((section) => `<div class="sl-section"><div class="sl-key">${esc(section.label)}</div>`
+    + section.items.map((item) => `<div class="sl-item">${esc(item)}</div>`).join('')
+    + (section.pending ? `<div class="sl-hint">${esc(section.pending)}</div>` : '') + '</div>').join('');
   const rows = (info.rows || []).filter(([, value]) => value)
     .map(([label, value]) => `<div class="sl-row"><span class="sl-key">${esc(label)}</span><span>${esc(value)}</span></div>`).join('');
   return `<div class="sl-head">${info.badge ? `<span class="num-id">${esc(info.badge)}</span> ` : ''}<strong>${esc(info.title)}</strong></div>`
     + (meta ? `<div class="sl-meta">${meta}</div>` : '')
     + rows
     + (info.quote ? `<div class="sl-quote">${esc(info.quote)}</div>` : '')
+    + sections
     + (info.pending ? `<div class="sl-hint">${esc(info.pending)}</div>` : '')
     + (openHint ? `<div class="sl-hint">${/Mac/.test(globalThis.navigator?.platform || '') ? '⌘' : 'Ctrl'}-click to open</div>` : '');
 }

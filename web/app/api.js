@@ -234,6 +234,13 @@ export const getDashboardDetail = (kind, id) => request(`/api/dashboard-detail?k
 // Resolves null when a newer search (from any console) replaced this one.
 export const searchSessionText = (query) => request(`/api/session-text-search?q=${encodeURIComponent(query)}`)
   .then((body) => (body?.superseded ? null : body?.results || []));
+// The terminal hover cards' lookups (bin/terminal-ref-lookup.js). Both answer null
+// for nothing known or a lookup a newer hover replaced.
+export const getCommitInfo = (sha, project) => request(`/api/commit-info?sha=${encodeURIComponent(sha)}${project ? `&project=${encodeURIComponent(project)}` : ''}`)
+  .then((body) => body?.info || null);
+export const getSessionMentions = (num) => request(`/api/session-mentions?num=${encodeURIComponent(num)}`)
+  .then((body) => (body?.superseded ? null : { sessions: body?.sessions || [], cards: body?.cards || [] }));
+export const getHolds = () => request('/api/holds').then((body) => body?.holds || []);
 export const searchDashboardReviews = (query) => request(`/api/dashboard-review-search?q=${encodeURIComponent(query)}`);
 export const getPortableTransfers = () => freshRequest('/api/portable-transfers');
 export const getPortableTransferDraft = (sessionId) => request(`/api/portable-transfer-draft?session=${encodeURIComponent(sessionId)}`);
