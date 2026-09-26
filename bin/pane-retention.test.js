@@ -74,7 +74,7 @@ test('a pane with no agent is a shell; an unknown agent is not a candidate', () 
   assert.ok(result.remove.every((entry) => entry.agent === 'shell'));
 });
 
-test('panes on another node are never candidates', () => {
+test('a plan covers one node: another node\'s panes are not its candidates', () => {
   const local = exited(9, { agent: 'claude' }, { node: 'main' });
   const remote = exited(9, { agent: 'claude' }, { node: 'aws1' });
   const result = retention.plan([local, remote], { env, max: 0, now: NOW, guards: guards() });
@@ -373,4 +373,197 @@ test('keep pane gc refuses to run off the daemon node', async () => {
     connectHost: async () => client(undefined), root, isDaemonNode: () => true,
   });
   assert.deepEqual(requests, ['hello', 'list'], 'an unnamed host is taken at the env gate\'s word');
+});
+
+// A fleet listing as serve.js listHostPaneResult returns it: the daemon node's panes
+// bare, every other node's qualified with its host id kept beside it.
+function remote(node, daysAgo, meta, extra = {}) {
+  const pane = exited(daysAgo, meta, extra);
+  return { ...pane, node, id: `${pane.id}@${node}`, hostPaneId: pane.id };
+}
+
+test('planFleet plans each node apart, with its own cap', () => {
+  const local = [exited(9, undefined, { node: 'main' }), exited(1, undefined, { node: 'main' })];
+  const box = [remote('box', 9), remote('box', 2), remote('box', 1)];
+  const fleet = retention.planFleet({ panes: [...local, ...box], failure: null, nodes: { box: { ok: true } } },
+    { env, max: 2, now: NOW, guards: guards() });
+  assert.deepEqual(fleet.plans.map((result) => [result.node, result.exited]), [['main', 2], ['box', 3]]);
+  assert.deepEqual(removedIds(fleet.plans[0]), [local[0].id]);
+  assert.deepEqual(removedIds(fleet.plans[1]), [box[0].id], 'box is over its own cap of 2 by one, the aged one');
+  assert.deepEqual(fleet.skipped, []);
+});
+
+test('a pane with no node is the daemon node\'s, and a bare list plans as before', () => {
+  const panes = [exited(9), exited(8)];
+  const fleet = retention.planFleet(panes, { env, now: NOW, guards: guards() });
+  assert.deepEqual(fleet.plans.map((result) => result.node), ['main']);
+  assert.deepEqual(fleet.plans[0].decisions, retention.plan(panes, { env, now: NOW, guards: guards() }).decisions);
+  // Beside another node's panes, a node-less pane is still only the daemon node's.
+  const far = remote('box', 9);
+  const mixed = retention.planFleet([...panes, far], { env, now: NOW, guards: guards() });
+  assert.deepEqual(mixed.plans.map((result) => [result.node, removedIds(result)]),
+    [['main', panes.map((pane) => pane.id)], ['box', [far.id]]]);
+});
+
+test('the remove for a remote pane carries its qualified ref and a daemon-node one stays bare', async () => {
+  const local = exited(9, undefined, { node: 'main' });
+  const far = remote('box', 9);
+  const fleet = retention.planFleet({ panes: [local, far], nodes: { box: { ok: true } } }, { env, now: NOW, guards: guards() });
+  const sent = [];
+  await retention.applyFleet(fleet, async (type, params) => { sent.push([type, params]); });
+  assert.deepEqual(sent, [['remove', { pane: local.id }], ['remove', { pane: `${far.hostPaneId}@box` }]]);
+  // A ref is rebuilt from the host id, so a daemon-node pane listed under its own
+  // qualified name still goes out bare, and a remote one listed bare gains its node.
+  const odd = [{ ...exited(9), node: 'main' }, { ...exited(9), node: 'box' }];
+  odd[0].id = `${odd[0].id}@main`;
+  const again = [];
+  await retention.applyFleet(retention.planFleet(odd, { env, now: NOW, guards: guards() }),
+    async (type, params) => { again.push(params.pane); });
+  assert.deepEqual(again, [odd[0].id.replace(/@main$/, ''), `${odd[1].id}@box`]);
+});
+
+test('a node that did not answer is skipped, never planned from its memo, and named', async () => {
+  const local = exited(9, undefined, { node: 'main' });
+  // listHostPaneResult merges a silent node's last known panes into the list,
+  // marked stale in its status and named in missingNodes.
+  const memo = [remote('box', 20), remote('box', 19)];
+  const listing = { panes: [local, ...memo], failure: null, missingNodes: ['box'],
+    nodes: { box: { ok: false, reason: 'timeout', stale: true, panesAt: NOW - 60e3 } } };
+  const fleet = retention.planFleet(listing, { env, now: NOW, guards: guards() });
+  assert.deepEqual(fleet.plans.map((result) => result.node), ['main']);
+  assert.deepEqual(fleet.skipped, ['box']);
+  const sent = [];
+  const outcomes = await retention.applyFleet(fleet, async (type, params) => { sent.push(params.pane); });
+  assert.deepEqual(sent, [local.id]);
+  assert.equal(retention.describeFleet(fleet, outcomes), 'removed 1 of 1 exited (aged 1); box not listed this sweep');
+  // The status alone is enough: a node marked not ok is skipped even if missingNodes is absent.
+  const byStatus = retention.planFleet({ panes: memo, nodes: { box: { ok: false, reason: 'unreachable' } } },
+    { env, now: NOW, guards: guards() });
+  assert.deepEqual(byStatus.skipped, ['box']);
+  assert.deepEqual(byStatus.plans.map((result) => result.node), ['main']);
+});
+
+test('the guards apply to every node\'s plan', () => {
+  const heldBySession = remote('box', 9);
+  const heldByPane = remote('box', 9, { agent: 'shell' });
+  const free = remote('box', 9);
+  const g = guards({ handoffSessions: new Set([heldBySession.meta.sessionId]),
+    // Records name a remote pane by its qualified ref; readGuards keys it bare.
+    restartPanes: new Set([heldByPane.hostPaneId]) });
+  const fleet = retention.planFleet({ panes: [heldBySession, heldByPane, free], nodes: { box: { ok: true } } },
+    { env, now: NOW, guards: g });
+  const box = fleet.plans.find((result) => result.node === 'box');
+  assert.deepEqual(removedIds(box), [free.id]);
+  assert.deepEqual(box.kept.map((entry) => [entry.pane, entry.reason]).sort(),
+    [[heldBySession.id, 'handoff'], [heldByPane.id, 'restart']].sort());
+  const failed = retention.planFleet({ panes: [free], nodes: { box: { ok: true } } },
+    { env, now: NOW, guards: guards({ failures: [{ reader: 'queue', error: 'boom' }] }) });
+  assert.deepEqual(failed.plans.flatMap(removedIds), [], 'an unreadable guard stops every node');
+  assert.equal(retention.describeFleet(failed, []),
+    'box: removed 0 of 1 exited, kept 1 (unreadable 1); could not read queue (boom)');
+});
+
+test('readGuards keys a qualified pane ref by its host id', () => {
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-'));
+  const session = sid();
+  fs.mkdirSync(path.join(root, '.keep', 'handoff-queue'), { recursive: true });
+  fs.writeFileSync(path.join(root, '.keep', 'handoff-queue', `${session}.json`),
+    JSON.stringify({ sessionId: session, pane: 'abc123@box', status: 'queued' }));
+  const g = retention.readGuards(root, { compactSwaps: () => [], deliveries: () => [] });
+  assert.ok(g.queuedPanes.has('abc123'));
+});
+
+test('describeFleet reads as describe for one node and names each node otherwise', () => {
+  const panes = [exited(10), exited(9), exited(8), exited(3), exited(2)];
+  const g = guards({ handoffPanes: new Set([panes[1].id]), keepRunning: new Set([panes[2].meta.sessionId]) });
+  const single = retention.planFleet(panes, { env, max: 2, now: NOW, guards: g });
+  const result = retention.plan(panes, { env, max: 2, now: NOW, guards: g });
+  assert.equal(retention.describeFleet(single, [{ removed: single.plans[0].remove }]),
+    retention.describe(result, { removed: result.remove }));
+  assert.equal(retention.describeFleet(retention.planFleet([], { env, now: NOW, guards: guards() }), []),
+    'removed 0 of 0 exited');
+
+  // main: one exited pane, kept by policy; box: 38 exited, 30 aged, 8 over a cap of 8.
+  const local = [exited(2, undefined, { node: 'main' })];
+  const box = [];
+  for (let i = 0; i < 30; i += 1) box.push(remote('box', 40 - i));
+  for (let i = 0; i < 8; i += 1) box.push(remote('box', 6 - i * 0.5, { agent: 'shell' }));
+  const held = box.slice(0, 5);
+  const gg = guards({ handoffSessions: new Set([held[0].meta.sessionId]),
+    keepRunning: new Set(held.slice(1).map((pane) => pane.meta.sessionId)) });
+  const fleet = retention.planFleet({ panes: [...local, ...box], nodes: { box: { ok: true } } },
+    { env, max: 0, now: NOW, guards: gg });
+  assert.equal(fleet.plans[0].remove.length, 1, 'main has one pane over a zero cap');
+  const outcomes = [
+    { removed: [], refused: [], deferred: 1 },
+    { removed: fleet.plans[1].remove.slice(0, 25), refused: [], deferred: fleet.plans[1].remove.length - 25 },
+  ];
+  assert.equal(retention.describeFleet(fleet, outcomes),
+    'main: removed 0 of 1 exited, 1 deferred to the next sweep; '
+    + 'box: removed 25 of 38 exited (aged 25), kept 5 (handoff 1, keep-running 4), 8 deferred to the next sweep');
+});
+
+test('the sweep takes a batch per node and reads the listing\'s node flags', async () => {
+  const local = Array.from({ length: 3 }, (_, i) => exited(20 - i, undefined, { node: 'main' }));
+  const box = Array.from({ length: 3 }, (_, i) => remote('box', 20 - i));
+  const gone = [remote('far', 30)];
+  const listing = { panes: [...local, ...box, ...gone], failure: null, missingNodes: ['far'],
+    nodes: { box: { ok: true }, far: { ok: false, reason: 'timeout', stale: true, panesAt: NOW - 60e3 } } };
+  const h = harness({ panes: listing, env: { KEEP_PANE_RETENTION_BATCH: '2' } });
+  const outcome = await h.scheduler.tick();
+  assert.deepEqual(h.requests, [
+    ['remove', local[0].id], ['remove', local[1].id],
+    ['remove', `${box[0].hostPaneId}@box`], ['remove', `${box[1].hostPaneId}@box`],
+  ]);
+  assert.equal(outcome.detail, 'main: removed 2 of 3 exited (aged 2), 1 deferred to the next sweep; '
+    + 'box: removed 2 of 3 exited (aged 2), 1 deferred to the next sweep; far not listed this sweep');
+  assert.equal(h.rows[0][1].ok, true);
+  assert.deepEqual(h.lines, ['keep serve: pane retention removed 4 pane(s)\n']);
+});
+
+test('keep pane gc covers every configured node and sends each remove to its own host', async () => {
+  const { commands } = require('./commands/host.js');
+  const daemon = require('./nodes.js').daemonNode();
+  const local = exited(9);
+  const far = exited(9);
+  const requests = [];
+  const host = (node, panes) => ({
+    request: async (type, params) => {
+      requests.push([node, type, params && params.pane]);
+      if (type === 'hello') return { node };
+      if (type === 'list') return { panes };
+      return { pane: { id: params.pane } };
+    },
+    close() {},
+  });
+  const hosts = { [daemon]: host(daemon, [local]), box: host('box', [far]) };
+  const deps = {
+    connectHost: async (target) => {
+      if (target.node === 'gone') throw new Error('no route');
+      return hosts[target.node || daemon];
+    },
+    configuredNodes: () => [daemon, 'box', 'gone'],
+    root: fs.mkdtempSync(path.join(os.tmpdir(), 'pane-retention-')),
+    now: NOW, readers: { compactSwaps: () => [], deliveries: () => [] },
+  };
+  const printed = [];
+  const log = console.log;
+  const errWrite = process.stderr.write;
+  const errors = [];
+  console.log = (line) => printed.push(line);
+  process.stderr.write = (line) => { errors.push(String(line)); return true; };
+  try {
+    await commands.pane(['gc'], deps);
+  } finally {
+    console.log = log;
+    process.stderr.write = errWrite;
+  }
+  assert.deepEqual(requests.filter(([, type]) => type === 'remove'),
+    [[daemon, 'remove', local.id], ['box', 'remove', far.id]], 'each host is asked by its own bare id');
+  assert.deepEqual(printed.slice(0, 2), [
+    `remove ${local.id} claude exited ${local.exitedAt.slice(0, 10)} aged`,
+    `remove ${far.id}@box claude exited ${far.exitedAt.slice(0, 10)} aged`,
+  ]);
+  assert.equal(printed.at(-1), `${daemon}: removed 1 of 1 exited (aged 1); box: removed 1 of 1 exited (aged 1); gone not listed this sweep`);
+  assert.ok(errors.some((line) => /node gone is unreachable/.test(line)));
 });

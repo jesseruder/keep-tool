@@ -3515,9 +3515,14 @@ for agent panes nothing used to: one morning the host held 264 panes with 18 ali
 pane, dead ones included.
 
 `keep serve` now sweeps them, ten minutes after it starts and hourly after that. A
-pane is a candidate when it has exited, it is on this machine (another node's panes
-are that node's to keep), and it is a `claude`, `codex`, `pi` or shell pane — a
-pane launched with no agent counts as a shell. A candidate is removed when it exited
+pane is a candidate when it has exited and it is a `claude`, `codex`, `pi` or shell
+pane — a pane launched with no agent counts as a shell. The sweep covers every node,
+each on that node's own answer to the sweep's listing: a node's host runs no daemon,
+so nothing else removes its exited panes, and a node that did not answer in time is
+skipped that hour (the row says `<node> not listed this sweep`) rather than swept from
+its last remembered list. The limits, the cap and the batch below apply to each node
+separately, and with more than one node holding exited panes the health row gives
+each node its own clause, prefixed with its name. A candidate is removed when it exited
 more than `KEEP_PANE_RETENTION_DAYS` days ago (default 7), or when there are more
 than `KEEP_PANE_RETENTION_MAX` exited candidates (default 60), oldest first down to
 the cap. Nothing that exited within the last hour is removed, whichever limit asked:
@@ -3542,8 +3547,11 @@ naming the record. The `pane-retention` row reads like `removed 3 of 41 exited
 `keep pane gc --dry-run` prints the same decisions against the live pane list —
 `remove <pane> <agent> exited <date> <reason>` or `keep <pane> <reason>` — without
 removing anything; without `--dry-run` it removes them all at once, with no batch
-limit. `--days N` and `--max N` override the two limits for that run. It runs only
-on the daemon node, whose registry holds the records the guards read. Set
+limit. `--days N` and `--max N` override the two limits for that run. It lists every
+configured node's host (another node's panes print as `<id>@<node>`, and an
+unreachable node is named and skipped) and sends each remove to the host that holds
+the pane. It runs only on the daemon node, whose registry holds the records the
+guards read. Set
 `KEEP_PANE_RETENTION=0` to disable the sweep.
 
 ## Event loop stalls

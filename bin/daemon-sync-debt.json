@@ -7784,7 +7784,7 @@
     "bin/serve/schedulers.js::startSchedulers>hold callback[4]>execFile callback|bin/health.js::record|1",
     "bin/serve/schedulers.js::startSchedulers>inspect|bin/serve.js::listHostPanes|1",
     "bin/serve/schedulers.js::startSchedulers>listPanes|bin/serve.js::listHostPaneResult|1",
-    "bin/serve/schedulers.js::startSchedulers>listPanes[2]|bin/serve.js::listHostPanes|1",
+    "bin/serve/schedulers.js::startSchedulers>listPanes[2]|bin/serve.js::listHostPaneResult|1",
     "bin/serve/schedulers.js::startSchedulers>openSession|bin/serve.js::openSession|1",
     "bin/serve/schedulers.js::startSchedulers>paneAlive|bin/serve.js::listHostPanes|1",
     "bin/serve/schedulers.js::startSchedulers>receiptFor|bin/serve.js::deliveryReceiptFor|1",

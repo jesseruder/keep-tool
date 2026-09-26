@@ -452,9 +452,10 @@ commands.pane = async (argv, deps = {}) => {
     } else if (subcommand === 'gc') {
       const o = parseArgs(rest, { 'dry-run': 'bool', days: 'str', max: 'str' });
       if (o._.length) die('usage: keep pane gc [--dry-run] [--days N] [--max N]');
-      // The daemon's retention sweep, run now: the same plan, against this machine's
-      // own host socket, so another node's panes never appear. Only on the daemon
-      // node: the handoff records, restart entries and delivery journals the guards
+      // The daemon's retention sweep, run now: the same plan, node by node — this
+      // machine's panes from its own socket, every other configured node's from that
+      // node's host, and a node that cannot be listed skipped and named. Only on the
+      // daemon node: the handoff records, restart entries and delivery journals the guards
       // read live in the daemon's registry, and a node reading its own would see
       // none of them and could remove a pane a daemon-side handoff resumes into.
       if (!(deps.isDaemonNode || nodesApi.isDaemonNode)()) {
@@ -477,19 +478,40 @@ commands.pane = async (argv, deps = {}) => {
       const { panes } = await client.request('list');
       const root = deps.root || registryRoot();
       if (!root) die('keep pane gc needs the Keep registry: its guards are read from <keep>/.keep');
-      const result = retention.plan(panes, { ...limits, now: deps.now, guards: retention.readGuards(root, deps.readers) });
-      for (const failure of result.failures) process.stderr.write(`keep: could not read ${failure.reader}: ${failure.error}\n`);
+      // The daemon node's panes keep their bare ids; each other node's are listed
+      // from its own host and qualified, as the fleet listing publishes them.
+      const listing = { panes: [...panes], missingNodes: [] };
+      const daemon = nodesApi.daemonNode();
+      for (const name of (deps.configuredNodes || configuredNodes)().filter((node) => node !== daemon)) {
+        try {
+          const listed = (await (await clients.get(name)).request('list')).panes;
+          for (const pane of listed) {
+            listing.panes.push({ ...pane, node: name, id: nodesApi.formatPaneRef(name, pane.id), hostPaneId: pane.id });
+          }
+        } catch (error) {
+          process.stderr.write(`keep: node ${name} is unreachable: ${error.message}\n`);
+          listing.missingNodes.push(name);
+        }
+      }
+      const fleet = retention.planFleet(listing, { ...limits, now: deps.now, guards: retention.readGuards(root, deps.readers) });
+      for (const failure of fleet.failures) process.stderr.write(`keep: could not read ${failure.reader}: ${failure.error}\n`);
       const date = (entry) => new Date(entry.exitedMs).toISOString().slice(0, 10);
-      for (const entry of result.decisions) {
+      // Remote decisions print their qualified ref, so each line says its node.
+      for (const entry of fleet.plans.flatMap((result) => result.decisions)) {
         console.log(entry.action === 'remove'
           ? `remove ${entry.pane} ${entry.agent} exited ${date(entry)} ${entry.reason}`
           : `keep ${entry.pane} ${entry.reason}`);
       }
       if (o['dry-run']) return;
+      // Each remove goes to the host its ref names: a bare ref is this machine's.
+      const send = async (type, params) => {
+        const ref = nodesApi.parsePaneRef(params.pane);
+        return (await clients.get(ref.qualified ? ref.node : null)).request(type, { ...params, pane: ref.paneId });
+      };
       // A manual run is not held to the sweep's batch: the operator asked for all of it.
-      const outcome = await retention.apply(result, (type, params) => client.request(type, params), { batch: Infinity });
-      for (const entry of outcome.refused) process.stderr.write(`keep: could not remove ${entry.pane}: ${entry.error}\n`);
-      console.log(retention.describe(result, outcome));
+      const outcomes = await retention.applyFleet(fleet, send, { batch: Infinity });
+      for (const entry of outcomes.flatMap((outcome) => outcome.refused)) process.stderr.write(`keep: could not remove ${entry.pane}: ${entry.error}\n`);
+      console.log(retention.describeFleet(fleet, outcomes));
     } else if (subcommand === 'kill') {
       const o = parseArgs(rest, { signal: 'str' });
       if (o._.length !== 1) die('usage: keep pane kill <pane> [--signal SIG]');

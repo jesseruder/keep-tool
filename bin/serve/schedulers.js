@@ -616,12 +616,16 @@ function startSchedulers(ctx) {
     health.record('wt-gc', { disabled: true, detail: 'KEEP_WT_GC=0' });
   } else startWtGcScheduler({ onChange: broadcast });
   // Exited panes older than a week, or past the cap, leave the host's list: every
-  // state build resolves every pane, dead ones included. Only this node's panes,
-  // and never one a handoff, queued transfer, compaction swap, unsent delivery or
-  // keep-running preference still names. See bin/pane-retention.js.
+  // state build resolves every pane, dead ones included. Every node's panes, each
+  // node planned on its own answer to this listing (a node that did not answer is
+  // skipped, never swept from its remembered list), and never one a handoff, queued
+  // transfer, compaction swap, unsent delivery or keep-running preference still
+  // names. See bin/pane-retention.js.
   require('../pane-retention.js').startScheduler({
     root: keep.ROOT,
-    listPanes: () => listHostPanes({}, true),
+    // The whole result, not just its panes: missingNodes and the per-node status are
+    // what tell a fresh answer from a memo.
+    listPanes: () => listHostPaneResult({}, true),
     hostRequest,
     record: health.record,
     onChange: broadcast,
